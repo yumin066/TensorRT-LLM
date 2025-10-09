@@ -421,9 +421,9 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
                 SHAPE_CASE(90, 128, 16, 128)
                 SHAPE_CASE(90, 128, 32, 128)
                 SHAPE_CASE(90, 128, 64, 128)
-                SHAPE_CASE(90, 128, 128, 128)
-                SHAPE_CASE(90, 128, 256, 128)
-                SHAPE_CASE(90, 256, 128, 128)
+                //SHAPE_CASE(90, 128, 128, 128)
+                //SHAPE_CASE(90, 128, 256, 128)
+                //SHAPE_CASE(90, 256, 128, 128)
                 DEFAULT_CASE(90)
             }
         }

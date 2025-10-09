@@ -224,8 +224,8 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
     elif operation.gemm_kind == GemmKind.Grouped:
         if operation.act_type != operation.weight_type and (
                 operation.act_type != DataType.e4m3
-                or operation.weight_type != e2m1):
-            # Mixed MoE GEMM
+                or operation.weight_type != e2m1) and not getattr(operation, 'w4afp8_finalize', False):
+            # Mixed MoE GEMM (but not wint4afp8 with finalize flag)
             weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
@@ -254,6 +254,27 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
                 "1Sm",
                 "")  # Hack to WAR missing `PtrArrayTmaWarpSpecialized` type
 
+            # Handle double colons in type tags by creating aliases and using the short form
+            type_aliases = []
+
+            # Process act_tag
+            if "::" in act_tag:
+                short_act_tag = act_tag.split("::")[-1]
+                type_aliases.append(f"        using {short_act_tag} = {act_tag};")
+                act_tag = short_act_tag
+
+            # Process weight_tag
+            if "::" in weight_tag:
+                short_weight_tag = weight_tag.split("::")[-1]
+                type_aliases.append(f"        using {short_weight_tag} = {weight_tag};")
+                weight_tag = short_weight_tag
+
+            # Process out_tag
+            if "::" in out_tag:
+                short_out_tag = out_tag.split("::")[-1]
+                type_aliases.append(f"        using {short_out_tag} = {out_tag};")
+                out_tag = short_out_tag
+
             guard_map = {
                 e2m1: "defined(ENABLE_FP4)",
                 DataType.e4m3: "defined(ENABLE_FP8)",
@@ -264,6 +285,12 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             guard_weight = guard_map[
                 operation.
                 weight_type] if operation.weight_type in guard_map else "1"
+
+            # Add type aliases if needed
+            alias_code = ""
+            if type_aliases:
+                alias_code = "\n".join(type_aliases) + "\n"
+
             # TODO Revert this once compiler bug is fixed so we can use template instead of macro again
             #         instantiation = f"""
             #         template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<{arch_tag}, {act_tag}, {weight_tag}, {out_tag},
@@ -272,6 +299,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             # """
             instantiation = f"""
 #if {guard_act} && {guard_weight}
+{alias_code}
         INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_sched}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, {"true" if operation.dynamic_cga else "false"}, false, {"true" if operation.swap_ab else "false"});
 #endif"""
     return instantiation
@@ -629,11 +657,84 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     return operations
 
 
+def generate_sm90_wint4afp8_grouped_gemm_operations(is_arch_enabled, w4afp8_finalize=False):
+    """
+    Generate operations specifically for wint4afp8 (e4m3 + u4) with finalize fusion support.
+    This function is separate from generate_sm90_mixed_type_grouped_gemm_operations
+    to avoid affecting other mixed types like wfp4afp16.
+
+    Args:
+        is_arch_enabled: Whether the architecture is enabled
+        w4afp8_finalize: If True, wint4afp8 will use INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM logic
+    """
+    if not is_arch_enabled:
+        return []
+    arch = 90
+
+    # Only wint4afp8 combinations: e4m3 activations + u4 weights
+    supported_dtypes = [
+        (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.e4m3, DataType.u4, DataType.bf16, DataType.bf16, DataType.bf16),
+    ]
+
+    quant_ops = [TrtLlm_QuantOp.finegrained_scale_only]
+    epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
+
+    M_TILES = [128]
+    N_TILES = [16, 32, 64, 128]
+    K_TILES = [128, 256, 512]
+    cta_shapes_mnk = list(product(M_TILES, N_TILES, K_TILES))
+
+    warp_shape = [0, 0, 0]  # ignored except for naming
+    stages = 0  # auto
+
+    # Include both none and finalize fusion for wint4afp8
+    epi_fusions = [
+        TrtLlm_EpilogueFusion.epilogue_fusion_none,
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize
+    ]
+
+    swap_ab = [True, False]
+
+    cga_shapes = list(product([1, 2], [1, 2], [1]))
+
+    partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions, cta_shapes_mnk, cga_shapes, swap_ab)
+
+    operations = list()
+    for dtype_combo, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape, swap_ab in partial_args:
+        use_coop = cta_shape_mnk[0] >= 128
+        mainloop_schedules = [
+            KernelScheduleType.TmaWarpSpecializedCooperative,
+        ]
+
+        # Use None for epi_schedule to let the instantiation logic handle it
+        epi_schedule = None
+
+        for mainloop_schedule in mainloop_schedules:
+            #TODO
+            if (cta_shape_mnk[0] == 128 and cta_shape_mnk[1] == 128
+                    and mainloop_schedule == KernelScheduleType.TmaWarpSpecializedCooperative):
+                continue
+
+            # Add w4afp8_finalize flag to the operation
+            moe_gemm_operation = TrtLlm_GemmLauncher(
+                GemmKind.Grouped, arch, *dtype_combo, quant_op, epi_tag, cta_shape_mnk,
+                warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule, epi_fusion, swap_ab=swap_ab
+            )
+            # Add custom attribute to indicate this should use finalize logic
+            moe_gemm_operation.w4afp8_finalize = w4afp8_finalize
+            operations.append(moe_gemm_operation)
+
+    return operations
+
+
 def generate_sm90_operations(is_arch_enabled):
     operations = generate_sm90_mixed_gemm_operations()
     operations.extend(generate_sm90_grouped_gemm_operations(is_arch_enabled))
     operations.extend(
         generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled))
+    operations.extend(
+        generate_sm90_wint4afp8_grouped_gemm_operations(is_arch_enabled, w4afp8_finalize=True))
     return operations
 
 
@@ -936,7 +1037,9 @@ if __name__ == "__main__":
                 output_dir, GemmKindNames[gemm_kind], str(arch),
                 f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}_group{i}.generated.cu"
             )
-            inl_file = [moe_mixed_gemm_inl] if is_mixed else inl_map[key[:2]]
+            # Check if any operation in the group has w4afp8_finalize flag
+            has_w4afp8_finalize = any(getattr(op, 'w4afp8_finalize', False) for op in op_sub_group)
+            inl_file = [moe_mixed_gemm_inl] if is_mixed and not has_w4afp8_finalize else inl_map[key[:2]]
             write_file(inl_file, op_sub_group, out_file)
             file_list.append(out_file)
 

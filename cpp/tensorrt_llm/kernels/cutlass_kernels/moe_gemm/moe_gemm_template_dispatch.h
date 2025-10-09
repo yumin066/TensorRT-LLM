@@ -742,11 +742,11 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 
         if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType,
                           EpilogueTag>()
-            && !use_w4_groupwise)
+            && !use_wfp4a16)
         {
             // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small
             // numbers of tokens SM80 is faster. We check here to see which is selected
-            if (inputs.gemm_config.sm_version >= 90)
+            if (inputs.gemm_config.sm_version >= 90 && (!use_w4afp8 || hopper_inputs.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE))
             {
                 // Check the major version of the SM matches
                 TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version / 10 == sm_ / 10,
