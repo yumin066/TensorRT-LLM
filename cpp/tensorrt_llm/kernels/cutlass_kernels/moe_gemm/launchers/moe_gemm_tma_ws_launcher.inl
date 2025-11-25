@@ -34,6 +34,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 
 #include "cutlass_extensions/epilogue/fusion/sm90_visitor_scatter.hpp"
+#include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -47,6 +48,7 @@
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 // #include <cutlass/arch/arch.h>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -78,6 +80,16 @@ ReturnType construct_if_true(Args&&... args)
         return ReturnType{};
     }
 }
+
+template<typename Mainloop, bool Condition>
+struct safe_stride_scale {
+    using type = void*;  // Default type when condition is false
+};
+
+template<typename Mainloop>
+struct safe_stride_scale<Mainloop, true> {
+    using type = typename Mainloop::StrideScale;  // Only access when true
+};
 
 template <bool FLAG, class GemmGrouped, bool A>
 auto deduce_layout_sf()
@@ -463,13 +475,28 @@ using namespace cutlass::epilogue;
             using LayoutB = TmaWarpSpecializedGroupedGemmInput::LayoutB;                                                                                                                                                                                                                                                    \
             using StrideA = typename TmaWarpSpecializedGroupedGemmInput::StrideA;                                                                                                                                                                                                                                           \
             using StrideB = typename TmaWarpSpecializedGroupedGemmInput::StrideB;                                                                                                                                                                                                                                           \
-            using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder</**/                                                                                                                                                                                                                           \
-                ArchTag, TensorOp,                                                           /**/                                                                                                                                                                                                                           \
-                SwappedMainloopElementA, LayoutA*, SwappedAlignmentA,                        /**/                                                                                                                                                                                                                           \
-                SwappedMainloopElementB, LayoutB*, SwappedAlignmentB,                        /**/                                                                                                                                                                                                                           \
-                ElementAccumulator,                                                          /**/                                                                                                                                                                                                                           \
-                MmaTileShape, ClusterShape,                                                  /**/                                                                                                                                                                                                                           \
-                StageCountAutoCarveout, KernelSchedule>::CollectiveOp;                                                                                                                                                                                                                                                      \
+            /* Scale configuration */ \
+            constexpr bool IsMixedInput = std::is_same_v<MainloopElementWeight, cutlass::uint4b_t> && std::is_same_v<MainloopElementAct, cutlass::float_e4m3_t>; \
+            constexpr int group_size = cutlass::gemm::collective::detail::int4_group_size; \
+            constexpr int PackedScalesNum = get<2>(MmaTileShape{}) / group_size; \
+            using ElementScale = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA; \
+            using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>; \
+            using LayoutScale = cutlass::layout::RowMajor; \
+            using CollectiveMainloop = typename std::conditional_t<IsMixedInput && SwapAB, \
+                cutlass::gemm::collective::CollectiveBuilderMixedInput<ArchTag, TensorOp, \
+                    cute::tuple<SwappedMainloopElementA, ElementScalePacked>, LayoutA*, SwappedAlignmentA, \
+                    SwappedMainloopElementB, LayoutB*, SwappedAlignmentB, \
+                    ElementAccumulator, MmaTileShape, ClusterShape, \
+                    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>( \
+                        sizeof(typename CollectiveEpilogue::SharedStorage))>, \
+                    KernelSchedule>, \
+                cutlass::gemm::collective::CollectiveBuilder</**/                                                                                                                                                                                                                           \
+                    ArchTag, TensorOp,                                                           /**/                                                                                                                                                                                                                           \
+                    SwappedMainloopElementA, LayoutA*, SwappedAlignmentA,                        /**/                                                                                                                                                                                                                           \
+                    SwappedMainloopElementB, LayoutB*, SwappedAlignmentB,                        /**/                                                                                                                                                                                                                           \
+                    ElementAccumulator,                                                          /**/                                                                                                                                                                                                                           \
+                    MmaTileShape, ClusterShape,                                                  /**/                                                                                                                                                                                                                           \
+                    StageCountAutoCarveout, KernelSchedule>>::CollectiveOp;                                                                                                                                                                                                                                                      \
                                                                                                                                                                                                                                                                                                                             \
             using GemmKernel = cutlass::gemm::kernel::GemmUniversal<TmaWarpSpecializedGroupedGemmInput::ProblemShape,                                                                                                                                                                                                       \
                 CollectiveMainloop, CollectiveEpilogue, void, void>;                                                                                                                                                                                                                                                        \
@@ -531,8 +558,19 @@ using namespace cutlass::epilogue;
             TLLM_CHECK(tma_ws_input.ptr_act);                                                                                                                                                                                                                                                                               \
             TLLM_CHECK(tma_ws_input.ptr_weight);                                                                                                                                                                                                                                                                            \
                                                                                                                                                                                                                                                                                                                             \
+            /* Use SFINAE to safely access StrideScale only when it exists */ \
+            using SafeStrideS = typename safe_stride_scale<CollectiveMainloop, (IsMixedInput && SwapAB)>::type; \
             MainloopArguments const mainloop_args = [&]                                                                                                                                                                                                                                                                     \
             {                                                                                                                                                                                                                                                                                                               \
+                if constexpr (IsMixedInput && SwapAB) { \
+                    return construct_if_true<(IsMixedInput && SwapAB), MainloopArguments>(                                                                                                                                                                                                                                  \
+                            reinterpret_cast<ElementWeight const**>(tma_ws_input.ptr_weight),                                                                                                                                                                                                                               \
+                            reinterpret_cast<StrideA*>(tma_ws_input.stride_weight),                                                                                                                                                                                                                                         \
+                            reinterpret_cast<ElementAct const**>(tma_ws_input.ptr_act),                                                                                                                                                                                                                                     \
+                            reinterpret_cast<StrideB*>(tma_ws_input.stride_act),                                                                                                                                                                                                                                            \
+                            reinterpret_cast<ElementScalePacked const**>(tma_ws_input.int4_groupwise_params.ptr_s_a),                                                                                                                                                                                                       \
+                            reinterpret_cast<SafeStrideS*>(tma_ws_input.int4_groupwise_params.stride_s_a), group_size);                                                                                                                                                                                 \
+                } \
                 if constexpr (IsBlockScaled)                                                                                                                                                                                                                                                                                \
                 {                                                                                                                                                                                                                                                                                                           \
                     if constexpr (SwapAB)                                                                                                                                                                                                                                                                                   \

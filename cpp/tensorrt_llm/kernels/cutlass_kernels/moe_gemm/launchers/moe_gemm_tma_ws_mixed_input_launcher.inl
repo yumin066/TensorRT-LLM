@@ -201,12 +201,12 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
             reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
         hw_info};
 
-    assert(group_size == int(inputs.groupwise_quant_group_size));
     if (workspace_size != nullptr)
     {
         *workspace_size = gemm.get_workspace_size(arguments);
         return;
     }
+    assert(group_size == int(inputs.groupwise_quant_group_size));
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
     {

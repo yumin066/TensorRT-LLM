@@ -1590,7 +1590,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
     void const* prequant_scales, cudaStream_t stream)
 {
-#ifdef ENABLE_FP4
+#if 0
     TLLM_CHECK_WITH_INFO(
         (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) || !use_per_expert_act_scale,
         "Per-expert act scale for FC1 is only supported for NVFP4 activations");
@@ -2291,7 +2291,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
     bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, cudaStream_t stream)
 {
 
-#ifdef ENABLE_FP4
+#if 0
     constexpr int64_t min_num_tokens_alignment = std::is_same_v<T, __nv_fp4_e2m1>
         ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
         : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
@@ -4147,7 +4147,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     size_t output_size1 = inter_size * num_expanded_tokens * dtype_bytes;
 
     size_t input_size2 = inter_size * num_expanded_tokens * dtype_bytes;
-    size_t output_size2 = hidden_size * output_bytes;
+    size_t output_size2 = hidden_size * num_expanded_tokens * output_bytes;
 
     size_t input_size = mGemmToProfile == GemmToProfile::GEMM_1 ? input_size1 : input_size2;
     size_t output_size = mGemmToProfile == GemmToProfile::GEMM_1 ? output_size1 : output_size2;
