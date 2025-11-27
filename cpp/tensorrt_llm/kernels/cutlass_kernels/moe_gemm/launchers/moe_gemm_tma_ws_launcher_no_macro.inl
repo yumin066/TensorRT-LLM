@@ -486,13 +486,15 @@ using namespace cutlass::epilogue;
             constexpr bool IsMixedInput = std::is_same_v<MainloopElementWeight, cutlass::uint4b_t> && std::is_same_v<MainloopElementAct, cutlass::float_e4m3_t>;
             constexpr int group_size = cutlass::gemm::collective::detail::int4_group_size;
             constexpr int PackedScalesNum = get<2>(MmaTileShape{}) / group_size;
+            using LayoutAct_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+            using LayoutWeight_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
             using ElementScale = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA;
             using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
             using LayoutScale = cutlass::layout::RowMajor;
             using CollectiveMainloop = typename std::conditional_t<IsMixedInput && SwapAB,
                 cutlass::gemm::collective::CollectiveBuilderMixedInput<ArchTag, TensorOp,
-                    cute::tuple<SwappedMainloopElementA, ElementScalePacked>, LayoutA*, SwappedAlignmentA,
-                    SwappedMainloopElementB, LayoutB*, SwappedAlignmentB,
+                    cute::tuple<MainloopElementWeight, ElementScalePacked>, LayoutWeight_Transpose*, AlignmentWeight,
+                    MainloopElementAct, LayoutAct_Transpose*, AlignmentAct,
                     ElementAccumulator, MmaTileShape, ClusterShape,
                     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
                         sizeof(typename CollectiveEpilogue::SharedStorage))>,
