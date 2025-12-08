@@ -3647,7 +3647,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     else
     {
         bool fused_prologue_result = false;
-        if (!use_w4_groupwise)
+        if (!use_wfp4a16)
         {
             // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for W4AFP8
             fused_prologue_result = fusedBuildExpertMapsSortFirstToken(token_selected_experts,
