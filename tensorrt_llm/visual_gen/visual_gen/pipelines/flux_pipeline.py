@@ -60,6 +60,147 @@ else:
 
 
 class ditFluxPipeline(FluxPipeline, ditBasePipeline):
+    def __init__(
+        self,
+        scheduler,
+        vae,
+        text_encoder,
+        tokenizer,
+        text_encoder_2,
+        tokenizer_2,
+        transformer,
+        image_encoder=None,
+        feature_extractor=None,
+    ):
+        from diffusers.image_processor import VaeImageProcessor
+        from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+
+        # Bypass FluxPipeline.__init__ and directly use DiffusionPipeline.__init__
+        # because FluxPipeline.__init__ accesses vae.config.block_out_channels, which fails on DC-AE
+        DiffusionPipeline.__init__(self)
+
+        # Detect if using DC-AE (AutoencoderDC)
+        # DC-AE uses encoder_block_out_channels instead of block_out_channels
+        # Note: attributes must be set after DiffusionPipeline.__init__
+        _is_dc_ae = False
+        if vae is not None and not hasattr(vae.config, "block_out_channels"):
+            if hasattr(vae.config, "encoder_block_out_channels"):
+                _is_dc_ae = True
+        self._is_dc_ae = _is_dc_ae
+
+        self.register_modules(
+            vae=vae,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            transformer=transformer,
+            scheduler=scheduler,
+            image_encoder=image_encoder,
+            feature_extractor=feature_extractor,
+        )
+
+        # Calculate vae_scale_factor
+        if self._is_dc_ae:
+            # DC-AE uses encoder_block_out_channels
+            self.vae_scale_factor = 2 ** (len(vae.config.encoder_block_out_channels) - 1)
+            # DC-Gen uses 1x1 patch, no need to multiply by 2
+            self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        else:
+            # Standard VAE uses block_out_channels
+            self.vae_scale_factor = (
+                2 ** (len(vae.config.block_out_channels) - 1) if vae is not None else 8
+            )
+            # Standard FLUX uses 2x2 patch
+            self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+
+        self.tokenizer_max_length = (
+            self.tokenizer.model_max_length
+            if hasattr(self, "tokenizer") and self.tokenizer is not None
+            else 77
+        )
+        self.default_sample_size = 128
+
+    @staticmethod
+    def _pack_latents_dc_ae(latents, batch_size, num_channels_latents, height, width):
+        """DC-Gen uses 1x1 patch packing."""
+        latents = latents.view(batch_size, num_channels_latents, height, width)
+        latents = latents.permute(0, 2, 3, 1)
+        latents = latents.reshape(batch_size, height * width, num_channels_latents)
+        return latents
+
+    @staticmethod
+    def _unpack_latents_dc_ae(latents, height, width, vae_scale_factor):
+        """DC-Gen uses 1x1 patch unpacking."""
+        batch_size, num_patches, channels = latents.shape
+        height = int(height) // vae_scale_factor
+        width = int(width) // vae_scale_factor
+        latents = latents.view(batch_size, height, width, channels)
+        latents = latents.permute(0, 3, 1, 2)
+        latents = latents.reshape(batch_size, channels, height, width)
+        return latents
+
+    def prepare_latents(
+        self,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
+    ):
+        from diffusers.utils.torch_utils import randn_tensor
+
+        if getattr(self, "_is_dc_ae", False):
+            # DC-Gen: consistent with the original DC-Gen-FLUX implementation
+            # VAE applies 8x compression on images but we must also account for packing which requires
+            # latent height and width to be divisible by 2.
+            height = int(height) // (self.vae_scale_factor)
+            width = int(width) // (self.vae_scale_factor)
+        else:
+            # Standard FLUX: 2x2 patch packing
+            height = 2 * (int(height) // (self.vae_scale_factor * 2))
+            width = 2 * (int(width) // (self.vae_scale_factor * 2))
+
+        shape = (batch_size, num_channels_latents, height, width)
+
+        if latents is not None:
+            if getattr(self, "_is_dc_ae", False):
+                # Original DC-Gen uses height // 2, width // 2
+                latent_image_ids = self._prepare_latent_image_ids(
+                    batch_size, height // 2, width // 2, device, dtype
+                )
+            else:
+                latent_image_ids = self._prepare_latent_image_ids(
+                    batch_size, height // 2, width // 2, device, dtype
+                )
+            return latents.to(device=device, dtype=dtype), latent_image_ids
+
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        if getattr(self, "_is_dc_ae", False):
+            latents = self._pack_latents_dc_ae(
+                latents, batch_size, num_channels_latents, height, width
+            )
+            latent_image_ids = self._prepare_latent_image_ids(
+                batch_size, height, width, device, dtype
+            )
+        else:
+            latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+            latent_image_ids = self._prepare_latent_image_ids(
+                batch_size, height // 2, width // 2, device, dtype
+            )
+
+        return latents, latent_image_ids
+
     def _after_load(self, pretrained_model_name_or_path, *args, **kwargs) -> None:
         """Post-processing hook after load model checkpoints in 'from_pretrained' method."""
         if not isinstance(self.transformer, ditFluxTransformer2DModel):
@@ -244,7 +385,11 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
             torch.cuda.empty_cache()
 
         # 4. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels // 4
+        # DC-Gen uses 1x1 patch, standard FLUX uses 2x2 patch (hence divide by 4)
+        if getattr(self, "_is_dc_ae", False):
+            num_channels_latents = self.transformer.config.in_channels
+        else:
+            num_channels_latents = self.transformer.config.in_channels // 4
         latents, latent_image_ids = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
