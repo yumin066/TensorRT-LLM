@@ -327,7 +327,11 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
             )
         )
 
-        device = self._execution_device
+        # Skip component traversal if no CPU offload is enabled
+        if hasattr(self, "_all_hooks") and len(self._all_hooks) > 0:
+            device = self._execution_device
+        else:
+            device = torch.device("cuda", torch.cuda.current_device())
 
         lora_scale = (
             self.joint_attention_kwargs.get("scale", None)
@@ -571,8 +575,9 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
             image = self.run_vae_decode(latents, height, width)
             image = self.image_processor.postprocess(image, output_type=output_type)
 
-        # Offload all models
-        self.maybe_free_model_hooks()
+        # Offload all models (skip if no CPU offload is enabled)
+        if hasattr(self, "_all_hooks") and len(self._all_hooks) > 0:
+            self.maybe_free_model_hooks()
 
         if not return_dict:
             return (image,)
