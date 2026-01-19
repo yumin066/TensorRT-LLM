@@ -55,7 +55,11 @@ try:
     import transformer_engine  # noqa: F401
     import transformer_engine.pytorch.cpp_extensions as ext
     import transformer_engine_torch as tex
-    from transformer_engine.pytorch import MXFP8Quantizer
+    # TE 2.8+ changed the import path for MXFP8Quantizer
+    try:
+        from transformer_engine.pytorch import MXFP8Quantizer
+    except ImportError:
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
         Float8BlockQuantizer,
         Float8BlockwiseQTensor,
@@ -64,7 +68,10 @@ try:
         Float8CurrentScalingQuantizer,
         Float8Tensor,
     )
+    # TE 2.8+ requires workspace for general_gemm
+    from transformer_engine.pytorch.module.base import get_workspace as te_get_workspace
 except ImportError as e:
+    te_get_workspace = None
     logger.warning(f"Transformer_engine is not installed: {e}")
 
 
@@ -252,7 +259,7 @@ class TeFp8BlockLinear(BaseLinear):
                 is_2D_scaled=True,
                 quantizer=w_quantizer_cur,
             )
-            output, *_ = ext.general_gemm(A=w_fp8_te, B=x_fp8_te, out_dtype=torch.bfloat16, bias=bias)
+            output, *_ = ext.general_gemm(A=w_fp8_te, B=x_fp8_te, workspace=te_get_workspace(), out_dtype=torch.bfloat16, bias=bias)
 
         if output.dim() != len(origin_shape):
             output_shape = list(origin_shape)
@@ -278,7 +285,8 @@ class TeMXFP8Blockwise32Linear(BaseLinear):
         output, *_ = ext.general_gemm(
             weight,
             inp_fp8,
-            outp_type,
+            te_get_workspace(),
+            out_dtype=outp_type,
             quantization_params=None,
             bias=bias,
             use_split_accumulator=False,
@@ -362,10 +370,10 @@ class TeFp8PerTensorLinear(BaseLinear):
         if hasgelu:
             gelu_in = torch.randn((input.shape[0], weight.shape[1]), dtype=torch.bfloat16, device="cuda")
             output, *_ = ext.general_gemm(
-                A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias, gelu=True, gelu_in=gelu_in
+                A=w_fp8_te, B=input_fp8_te, workspace=te_get_workspace(), out_dtype=torch.bfloat16, bias=bias, gelu=True, gelu_in=gelu_in
             )
         else:
-            output, *_ = ext.general_gemm(A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias)
+            output, *_ = ext.general_gemm(A=w_fp8_te, B=input_fp8_te, workspace=te_get_workspace(), out_dtype=torch.bfloat16, bias=bias)
 
         if output.dim() != len(origin_shape):
             output_shape = list(origin_shape)

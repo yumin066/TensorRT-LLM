@@ -42,7 +42,11 @@ except ImportError:
 try:
     import transformer_engine.pytorch.cpp_extensions as ext  # noqa: F401
     import transformer_engine_torch as tex
-    from transformer_engine.pytorch import MXFP8Quantizer
+    # TE 2.8+ changed the import path for MXFP8Quantizer
+    try:
+        from transformer_engine.pytorch import MXFP8Quantizer
+    except ImportError:
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 except ImportError:
     MXFP8Quantizer = None
     logger.warning("Transformer_engine is not installed")
