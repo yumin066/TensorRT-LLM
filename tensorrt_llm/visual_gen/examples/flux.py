@@ -104,6 +104,7 @@ def run_inference(pipe, args, enable_autotuner: bool = False):
             guidance_scale=args.guidance_scale,
             height=args.height,
             width=args.width,
+            output_type=args.image_output_type,
             num_inference_steps=num_inference_steps,
             max_sequence_length=args.max_sequence_length,
         ).images[0]

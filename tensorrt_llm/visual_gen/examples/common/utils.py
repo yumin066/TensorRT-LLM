@@ -380,7 +380,14 @@ def _save_output_single(output, output_path: str, output_type: str, fps: int):
     if output_type == "video":
         export_to_video(output, output_path, fps=fps)
     else:  # image
-        output.save(output_path)
+        if isinstance(output, np.ndarray):
+            img_uint8 = (output * 255).round().astype(np.uint8)
+            Image.fromarray(img_uint8).save(output_path)
+        elif isinstance(output, torch.Tensor):
+            from torchvision.utils import save_image
+            save_image(output, output_path)
+        else:
+            output.save(output_path)
 
 
 def log_args_and_timing(args, elapsed_time: float):

@@ -211,6 +211,13 @@ class BaseArgumentParser:
         self.parser.add_argument("--shift", type=int, default=5, help="Inference shift")
         self.parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
         self.parser.add_argument("--num_warmup_steps", type=int, default=1, help="Number of warmup steps")
+        self.parser.add_argument(
+            "--image_output_type",
+            type=str,
+            default="pil",
+            choices=["pil", "np", "pt", "latent"],
+            help="Image output type: pil (PIL Image), np (numpy array), pt (torch tensor), latent (skip VAE decode)",
+        )
 
         # Sparse attention args
         self.parser.add_argument(
