@@ -51,6 +51,7 @@ class BaseArgumentParser:
                 "flash-attn4",
                 "te",
                 "te-fp8",
+                "cudnn-flash",
             ],
             help="Attention type",
         )

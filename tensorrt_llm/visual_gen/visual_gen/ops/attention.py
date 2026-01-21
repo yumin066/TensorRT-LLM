@@ -112,6 +112,32 @@ class BaseAttn:
             raise NotImplementedError(f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}")
         return out
 
+    def _permute_qkv_layout(self, q, k, v, src_layout, dst_layout):
+        if src_layout == "HND" and dst_layout == "NHD":
+            # [B, H, S, D] -> [B, S, H, D]
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+        elif src_layout == "NHD" and dst_layout == "HND":
+            # [B, S, H, D] -> [B, H, S, D]
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+        else:
+            raise NotImplementedError(f"Unsupported tensor layout permutation: {src_layout} -> {dst_layout}")
+        return q, k, v
+
+    def _permute_output_layout(self, out, src_layout, dst_layout):
+        if src_layout == "HND" and dst_layout == "NHD":
+            # [B, S, H, D] -> [B, H, S, D]
+            out = out.permute(0, 2, 1, 3)
+        elif src_layout == "NHD" and dst_layout == "HND":
+            # [B, H, S, D] -> [B, S, H, D]
+            out = out.permute(0, 2, 1, 3)
+        else:
+            raise NotImplementedError(f"Unsupported tensor layout permutation: {src_layout} -> {dst_layout}")
+        return out
+
     def register_tunable_params(
         self, value: Any, param_range: Optional[List[Any]], name: Optional[str], description: Optional[str]
     ):
@@ -200,6 +226,81 @@ class DefaultAttn(BaseAttn):
 
         if tensor_layout == "NHD":
             output = self._convert_output_layout(output, src_layout="HND", dst_layout="NHD")
+        return output
+
+
+@AttentionOpManager.register_attn("cudnn-flash")
+class CudnnFlashAttn(BaseAttn):
+    """cuDNN Flash Attention implementation using PyTorch's SDPA with cuDNN backend."""
+
+    def __call__(
+        self,
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+        return_lse=False,
+        tensor_layout="HND",
+    ):
+        """
+        cuDNN Flash Attention using torch.nn.functional.scaled_dot_product_attention
+        with cuDNN backend explicitly enabled.
+
+        This requires PyTorch 2.0+ and a compatible GPU (SM80+).
+        """
+        if tensor_layout not in ["HND", "NHD"]:
+            raise NotImplementedError("Tensor layout not supported for CudnnFlashAttn")
+        if return_lse:
+            raise NotImplementedError("Return LSE is not supported for CudnnFlashAttn")
+        if get_dit_parallel_config().ring_size() > 1:
+            raise NotImplementedError("cuDNN Flash Attention not implemented for ring parallel")
+
+        logger.debug("Using CudnnFlashAttn")
+
+        if tensor_layout == "NHD":
+            # PyTorch SDPA only requires D dimension to be contiguous (stride[-1]==1)
+            # permute() without contiguous() should work:
+            # - Original NHD [B,S,H,D]: stride (S*H*D, H*D, D, 1)
+            # - After permute [B,H,S,D]: stride (S*H*D, D, H*D, 1) -> D stride=1 ✓
+            query, key, value = self._permute_qkv_layout(
+                query, key, value, src_layout="NHD", dst_layout="HND"
+            )
+
+        # cuDNN Flash Attention requires FP16 or BF16
+        origin_dtype = query.dtype
+        if query.dtype not in [torch.float16, torch.bfloat16]:
+            logger.debug(f"CudnnFlashAttn: query.dtype: {query.dtype}, converting to bfloat16")
+            query = query.to(torch.bfloat16)
+            key = key.to(torch.bfloat16)
+            value = value.to(torch.bfloat16)
+
+        # Use sdp_kernel context manager to force cuDNN backend
+        # Available backends: flash_attention, mem_efficient_attention, math, cudnn_attention
+        with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.CUDNN_ATTENTION]):
+            output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+
+        if tensor_layout == "NHD":
+            # Output also only needs D dimension contiguous for downstream ops
+            output = self._permute_output_layout(
+                output, src_layout="HND", dst_layout="NHD"
+            )
+
+        if output.dtype != origin_dtype:
+            output = output.to(origin_dtype)
+
         return output
 
 
