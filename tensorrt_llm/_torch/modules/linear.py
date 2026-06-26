@@ -30,8 +30,9 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, Fp8BlockScaleQuantizedTensor,
+                     get_model_extra_attrs, replace_parameter_and_save_metadata,
+                     unswizzle_sf)
 
 
 class WeightMode(str, enum.Enum):
@@ -75,6 +76,30 @@ class WeightMode(str, enum.Enum):
             },
         }
         return _SHARD_KEY_TO_INDEX_MAP[self]
+
+
+def prepare_fp8_block_scale_quantized_input(
+        input: torch.Tensor,
+        module: Optional["Linear"] = None) -> Fp8BlockScaleQuantizedTensor:
+    original_shape = input.shape
+    if input.dim() > 2:
+        input = input.reshape(-1, input.shape[-1])
+
+    if input.dtype == torch.float8_e4m3fn:
+        if module is None or getattr(module, "input_scale", None) is None:
+            raise RuntimeError(
+                "FP8 block-scale pre-quantization requires a Linear module "
+                "with input_scale when the source tensor is already FP8.")
+        input = input.to(torch.bfloat16) * module.input_scale
+    if input.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "FP8 block-scale pre-quantization expects BF16 input; got "
+            f"{input.dtype}.")
+
+    act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+        input, use_ue8m0=False)
+    return Fp8BlockScaleQuantizedTensor(act_input_fp8, act_input_sf,
+                                        original_shape, "cuda")
 
 
 @dataclass(kw_only=True)
@@ -1090,24 +1115,39 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
+    def apply(self, module: Linear, input: Union[torch.Tensor,
+                                                 Fp8BlockScaleQuantizedTensor],
               bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
-        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
-        # GEMM ops require 2D matrices
-        original_shape = input.shape
-        if input.dim() > 2:
-            input = input.reshape(-1, input.shape[-1])
+        prequantized_input = isinstance(input, Fp8BlockScaleQuantizedTensor)
+        if prequantized_input and not (is_sm_100f() and
+                                       (module.use_cute_dsl_blockscaling_mm
+                                        or module.disable_deep_gemm)):
+            raise RuntimeError(
+                "Pre-quantized FP8 block-scale input is only supported by "
+                "the SM100 CuteDSL block-scaling GEMM path.")
 
-        if input.dtype == torch.float8_e4m3fn:
-            input = input.to(torch.bfloat16) * module.input_scale
-        assert input.dtype == torch.bfloat16
+        if prequantized_input:
+            original_shape = input.original_shape
+            act_input_fp8 = input.fp8_tensor
+            act_input_sf = input.scaling_factor
+        else:
+            # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+            # GEMM ops require 2D matrices
+            original_shape = input.shape
+            if input.dim() > 2:
+                input = input.reshape(-1, input.shape[-1])
+
+            if input.dtype == torch.float8_e4m3fn:
+                input = input.to(torch.bfloat16) * module.input_scale
+            assert input.dtype == torch.bfloat16
 
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
+                if not prequantized_input:
+                    act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                        input, use_ue8m0=False)
                 output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
@@ -3032,6 +3072,11 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
+        if (isinstance(input, Fp8BlockScaleQuantizedTensor)
+                and self.lora is not None and bool(lora_params)):
+            raise RuntimeError(
+                "LoRA is not supported with pre-quantized FP8 block-scale "
+                "Linear input.")
         output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
             lora_result = self.lora(input, lora_params, layer_idx)
@@ -3066,7 +3111,8 @@ class Linear(nn.Module):
 
     def forward(
         self,
-        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        input: Union[torch.Tensor, Fp4QuantizedTensor,
+                     Fp8BlockScaleQuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,

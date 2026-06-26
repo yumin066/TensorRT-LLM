@@ -156,6 +156,18 @@ class Fp4QuantizedTensor:
         return self.fp4_tensor.shape
 
 
+@dataclass
+class Fp8BlockScaleQuantizedTensor:
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    original_shape: torch.Size
+    backend: str
+
+    @property
+    def shape(self):
+        return self.original_shape
+
+
 def compute_swizzled_sf_shape(row: int, col: int):
     padded_row = pad_up(row, 128)
     padded_col = pad_up(col, 4)

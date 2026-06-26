@@ -4,10 +4,17 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
-from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ...modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+    prepare_fp8_block_scale_quantized_input,
+)
 from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
@@ -139,6 +146,13 @@ class Attention(nn.Module):
             and self.quant_config is not None
             and getattr(self.quant_config, "layer_quant_mode", None) is not None
             and self.quant_config.layer_quant_mode.has_nvfp4()
+            and not self.force_dynamic_quantization
+        )
+        self._maybe_share_fp8_block_scale_qkv_quantize = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and self.quant_config is not None
+            and getattr(self.quant_config, "layer_quant_mode", None) is not None
+            and self.quant_config.layer_quant_mode.has_fp8_block_scales()
             and not self.force_dynamic_quantization
         )
 
@@ -337,6 +351,20 @@ class Attention(nn.Module):
                 reduce_output=False,
             )
 
+    def _can_share_fp8_block_scale_qkv_quantize(self) -> bool:
+        if not self._maybe_share_fp8_block_scale_qkv_quantize:
+            return False
+        if not is_sm_100f():
+            return False
+        linears = (self.to_q, self.to_k, self.to_v)
+        return all(
+            getattr(linear, "_weights_created", False)
+            and linear.has_fp8_block_scales
+            and (linear.use_cute_dsl_blockscaling_mm or linear.disable_deep_gemm)
+            and linear.lora is None
+            for linear in linears
+        )
+
     def get_qkv(
         self,
         hidden_states: torch.Tensor,
@@ -349,9 +377,15 @@ class Attention(nn.Module):
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
             )
-            q = self.to_q(hidden_states)
-            k = self.to_k(kv_source)
-            v = self.to_v(kv_source)
+            if encoder_hidden_states is None and self._can_share_fp8_block_scale_qkv_quantize():
+                qkv_input = prepare_fp8_block_scale_quantized_input(hidden_states, self.to_q)
+                q = self.to_q(qkv_input)
+                k = self.to_k(qkv_input)
+                v = self.to_v(qkv_input)
+            else:
+                q = self.to_q(hidden_states)
+                k = self.to_k(kv_source)
+                v = self.to_v(kv_source)
         return q, k, v
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
