@@ -459,7 +459,7 @@ class QwenEmbedLayer3DRope(QwenEmbedRope):
 
         max_vid_index = max(max_vid_index, condition_index)
         max_txt_seq_len_int = int(max_txt_seq_len)
-        txt_freqs = self.pos_freqs.to(device)[
+        txt_freqs = self._pos_freqs_for_device(device)[
             max_vid_index : max_vid_index + max_txt_seq_len_int, ...
         ]
         vid_freqs = torch.cat(vid_freqs, dim=0)
@@ -619,39 +619,58 @@ class QwenJointAttention(Attention):
         img_k: torch.Tensor,
         img_v: torch.Tensor,
         attention_mask: torch.Tensor,
+        txt_seq_lens: Optional[list[int]] = None,
     ) -> torch.Tensor:
         seq_txt = txt_q.shape[1]
         seq_img = img_q.shape[1]
-        mask_bool = attention_mask.to(torch.bool)
         expected_mask_len = seq_txt + seq_img
-        if mask_bool.shape[1] != expected_mask_len:
+        if attention_mask.shape[1] != expected_mask_len:
             raise ValueError(
                 "QwenJointAttention attention_mask length mismatch: "
-                f"expected {expected_mask_len}, got {mask_bool.shape[1]}."
+                f"expected {expected_mask_len}, got {attention_mask.shape[1]}."
             )
-        if not torch.all(mask_bool[:, seq_txt:]):
-            raise ValueError("QwenJointAttention requires all image tokens to be unmasked.")
+        mask_bool = None
+        if txt_seq_lens is None:
+            mask_bool = attention_mask.to(torch.bool)
+            if not torch.all(mask_bool[:, seq_txt:]):
+                raise ValueError("QwenJointAttention requires all image tokens to be unmasked.")
+        elif len(txt_seq_lens) != txt_q.shape[0]:
+            raise ValueError(
+                "QwenJointAttention txt_seq_lens batch mismatch: "
+                f"expected {txt_q.shape[0]}, got {len(txt_seq_lens)}."
+            )
 
         outputs = []
-        for batch_idx in range(mask_bool.shape[0]):
-            txt_indices = torch.nonzero(mask_bool[batch_idx, :seq_txt], as_tuple=False).flatten()
+        for batch_idx in range(txt_q.shape[0]):
             batch_slice = slice(batch_idx, batch_idx + 1)
-            compact_q = torch.cat([txt_q[batch_slice, txt_indices], img_q[batch_slice]], dim=1)
-            compact_k = torch.cat([txt_k[batch_slice, txt_indices], img_k[batch_slice]], dim=1)
-            compact_v = torch.cat([txt_v[batch_slice, txt_indices], img_v[batch_slice]], dim=1)
+            if txt_seq_lens is None:
+                txt_indices = torch.nonzero(
+                    mask_bool[batch_idx, :seq_txt], as_tuple=False
+                ).flatten()
+                compact_q = torch.cat([txt_q[batch_slice, txt_indices], img_q[batch_slice]], dim=1)
+                compact_k = torch.cat([txt_k[batch_slice, txt_indices], img_k[batch_slice]], dim=1)
+                compact_v = torch.cat([txt_v[batch_slice, txt_indices], img_v[batch_slice]], dim=1)
+                valid_txt = txt_indices.numel()
+            else:
+                valid_txt = min(int(txt_seq_lens[batch_idx]), seq_txt)
+                compact_q = torch.cat([txt_q[batch_slice, :valid_txt], img_q[batch_slice]], dim=1)
+                compact_k = torch.cat([txt_k[batch_slice, :valid_txt], img_k[batch_slice]], dim=1)
+                compact_v = torch.cat([txt_v[batch_slice, :valid_txt], img_v[batch_slice]], dim=1)
             compact_out = self._attn_impl(
                 compact_q.flatten(2),
                 compact_k.flatten(2),
                 compact_v.flatten(2),
             )
 
-            valid_txt = txt_indices.numel()
             output = torch.zeros(
                 (1, expected_mask_len, compact_out.shape[-1]),
                 device=compact_out.device,
                 dtype=compact_out.dtype,
             )
-            output[:, txt_indices] = compact_out[:, :valid_txt]
+            if txt_seq_lens is None:
+                output[:, txt_indices] = compact_out[:, :valid_txt]
+            else:
+                output[:, :valid_txt] = compact_out[:, :valid_txt]
             output[:, seq_txt:] = compact_out[:, valid_txt:]
             outputs.append(output)
 
@@ -664,6 +683,7 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        txt_seq_lens: Optional[list[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_txt = encoder_hidden_states.shape[1]
 
@@ -724,7 +744,7 @@ class QwenJointAttention(Attention):
             )
         elif self.attn_backend == "TRTLLM":
             out = self._trtllm_masked_attention(
-                txt_q, txt_k, txt_v, img_q, img_k, img_v, attention_mask
+                txt_q, txt_k, txt_v, img_q, img_k, img_v, attention_mask, txt_seq_lens
             )
         else:
             out = F.scaled_dot_product_attention(
@@ -836,6 +856,7 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        txt_seq_lens: Optional[list[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_mod_params = self.img_mod(temb)
         txt_mod_params = self.txt_mod(temb)
@@ -854,6 +875,7 @@ class QwenImageTransformerBlock(nn.Module):
             image_rotary_emb=image_rotary_emb,
             attention_mask=attention_mask,
             timestep=timestep,
+            txt_seq_lens=txt_seq_lens,
         )
 
         # Residual.
@@ -979,6 +1001,17 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             bias=True,
             **linear_kwargs,
         )
+
+    def register_cuda_graph_extra_key_fns(self, runner) -> None:
+        super().register_cuda_graph_extra_key_fns(runner)
+
+        def _txt_seq_lens_key(*args, **kwargs) -> Optional[Tuple[int, ...]]:
+            txt_seq_lens = kwargs.get("txt_seq_lens")
+            if txt_seq_lens is None:
+                return None
+            return tuple(int(length) for length in txt_seq_lens)
+
+        runner.register_extra_key_fn("qwen_txt_seq_lens", _txt_seq_lens_key)
 
     @property
     def device(self) -> torch.device:
@@ -1146,7 +1179,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         Args:
             timestep: Normalized scheduler timestep tensor in [0, 1].
         """
-        del kwargs, txt_seq_lens  # Only kept for diffusers API compat.
+        del kwargs
         missing = []
         if timestep is None:
             missing.append("timestep")
@@ -1193,6 +1226,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 image_rotary_emb=image_rotary_emb,
                 attention_mask=block_attention_mask,
                 timestep=timestep,
+                txt_seq_lens=txt_seq_lens,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)

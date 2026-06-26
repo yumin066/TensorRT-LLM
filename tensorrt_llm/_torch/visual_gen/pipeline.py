@@ -174,9 +174,13 @@ class BasePipeline(nn.Module):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
-        if self.pipeline_config.torch_compile.enable:
+        if (
+            self.pipeline_config.torch_compile.enable
+            and not self._supports_cuda_graph_with_torch_compile()
+        ):
             logger.warning(
-                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
+                "CUDA graphs with torch.compile are not enabled for "
+                f"{self.__class__.__name__}. Using torch.compile only."
             )
             return
 
@@ -201,6 +205,10 @@ class BasePipeline(nn.Module):
             logger.info(f"CUDA graph runner: wrapping {name}.forward")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    def _supports_cuda_graph_with_torch_compile(self) -> bool:
+        """Return whether this pipeline supports CUDA graphs wrapping torch.compile."""
+        return False
 
     @property
     def rank(self):

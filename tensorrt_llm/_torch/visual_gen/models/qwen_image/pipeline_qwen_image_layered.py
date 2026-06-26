@@ -597,7 +597,9 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
         do_true_cfg = true_cfg_scale > 1.0 and has_neg
         logger.info("Encoding layered prompt...")
         prompt_embeds, prompt_embeds_mask = self._encode_prompt(prompt, device, max_sequence_length)
+        prompt_embeds_lens = self._prompt_lengths_from_mask(prompt_embeds_mask)
         neg_prompt_embeds = neg_prompt_embeds_mask = None
+        neg_prompt_embeds_lens = None
         if do_true_cfg:
             if isinstance(negative_prompt, str):
                 negative_prompt = [negative_prompt] * batch_size
@@ -613,6 +615,7 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
                 device,
                 max_sequence_length,
             )
+            neg_prompt_embeds_lens = self._prompt_lengths_from_mask(neg_prompt_embeds_mask)
 
         num_channels_latents = self.transformer.in_channels // 4
         latents, image_latents = self._prepare_layered_latents(
@@ -667,6 +670,7 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
                 encoder_hidden_states_mask=prompt_embeds_mask,
                 encoder_hidden_states=prompt_embeds,
                 img_shapes=img_shapes,
+                txt_seq_lens=prompt_embeds_lens,
                 additional_t_cond=additional_t_cond,
                 return_dict=False,
             )[0]
@@ -679,6 +683,7 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
                     encoder_hidden_states_mask=neg_prompt_embeds_mask,
                     encoder_hidden_states=neg_prompt_embeds,
                     img_shapes=img_shapes,
+                    txt_seq_lens=neg_prompt_embeds_lens,
                     additional_t_cond=additional_t_cond,
                     return_dict=False,
                 )[0]

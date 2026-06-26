@@ -117,6 +117,10 @@ class QwenImagePipeline(BasePipeline):
         # updates ``self.vae_scale_factor``.
         return (self.vae_scale_factor * 2, self.vae_scale_factor * 2)
 
+    def _supports_cuda_graph_with_torch_compile(self) -> bool:
+        """Qwen-Image pipelines support CUDA graphs wrapping torch.compile."""
+        return True
+
     # ------------------------------------------------------------------
     # Component initialisation.
     # ------------------------------------------------------------------
@@ -256,6 +260,11 @@ class QwenImagePipeline(BasePipeline):
         valid_lengths = bool_mask.sum(dim=1)
         selected = hidden_states[bool_mask]
         return torch.split(selected, valid_lengths.tolist(), dim=0)
+
+    @staticmethod
+    def _prompt_lengths_from_mask(prompt_embeds_mask: torch.Tensor) -> list[int]:
+        """Return prompt lengths before transformer CUDA graph capture."""
+        return [int(length) for length in prompt_embeds_mask.to(torch.bool).sum(dim=1).tolist()]
 
     def _encode_prompt(
         self,
@@ -446,13 +455,16 @@ class QwenImagePipeline(BasePipeline):
         # Text encoding.
         logger.info("Encoding prompt...")
         prompt_embeds, prompt_embeds_mask = self._encode_prompt(prompt, device, max_sequence_length)
+        prompt_embeds_lens = self._prompt_lengths_from_mask(prompt_embeds_mask)
         neg_prompt_embeds = neg_prompt_embeds_mask = None
+        neg_prompt_embeds_lens = None
         if do_true_cfg:
             if isinstance(negative_prompt, str):
                 negative_prompt = [negative_prompt] * batch_size
             neg_prompt_embeds, neg_prompt_embeds_mask = self._encode_prompt(
                 negative_prompt, device, max_sequence_length
             )
+            neg_prompt_embeds_lens = self._prompt_lengths_from_mask(neg_prompt_embeds_mask)
 
         # Latents.
         num_channels_latents = self.transformer.in_channels // 4  # 16
@@ -506,6 +518,7 @@ class QwenImagePipeline(BasePipeline):
                 encoder_hidden_states_mask=prompt_embeds_mask,
                 encoder_hidden_states=prompt_embeds,
                 img_shapes=img_shapes,
+                txt_seq_lens=prompt_embeds_lens,
                 return_dict=False,
             )[0]
 
@@ -516,6 +529,7 @@ class QwenImagePipeline(BasePipeline):
                     encoder_hidden_states_mask=neg_prompt_embeds_mask,
                     encoder_hidden_states=neg_prompt_embeds,
                     img_shapes=img_shapes,
+                    txt_seq_lens=neg_prompt_embeds_lens,
                     return_dict=False,
                 )[0]
                 comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
