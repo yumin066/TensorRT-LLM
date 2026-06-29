@@ -1,0 +1,11 @@
+pipeline_config:
+  workflow: retake
+  text_encoder_path: google/gemma-3-12b-it
+  retake_distilled: true
+  retake_offload_mode: cpu
+  retake_prompt_cache_size: 16
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1

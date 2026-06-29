@@ -601,13 +601,18 @@ def _load_component_weights(
         "text_encoder_path": "google/gemma-3-12b-it",
         "spatial_upsampler_path": None,
         "distilled_lora_path": None,
+        "workflow": "generation",
+        "retake_distilled": True,
+        "retake_offload_mode": "none",
+        "retake_prompt_cache_size": 16,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
         "superset of knobs for one-stage and two-stage. Pipeline will "
         "run two-stage if both ``spatial_upsampler_path`` and "
         "``distilled_lora_path`` are not ``None``, either set by the "
-        "user or auto-discovered from the checkpoint."
+        "user or auto-discovered from the checkpoint. Set "
+        "``workflow='retake'`` to use the optional LTX-2 retake workflow."
     ),
 )
 class LTX2Pipeline(BasePipeline):
@@ -621,6 +626,17 @@ class LTX2Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
+        workflow = config.extra_attrs.get("workflow", "generation")
+        if workflow == "retake":
+            from .pipeline_ltx2_retake import LTX2RetakePipeline
+
+            return LTX2RetakePipeline
+        if workflow != "generation":
+            raise ValueError(
+                f"Unsupported LTX-2 workflow {workflow!r}. "
+                "Supported values are 'generation' and 'retake'."
+            )
+
         if getattr(config, "cache_backend", None) == "cache_dit":
             logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
             return cls

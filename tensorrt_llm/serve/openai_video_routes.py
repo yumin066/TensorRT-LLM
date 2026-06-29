@@ -146,13 +146,20 @@ class _VideoRoutesMixin:
                 saved_paths = output.save(tensor_paths, format=request.format)
                 target = saved_paths[0]
                 latency = time.perf_counter() - sync_video_start
+                metrics = output.metrics
                 logger.info(
                     f"Video {video_id} serialized as tensor: latency={latency:.3f}s "
                     f"generation={getattr(output.metrics, 'generation', 0.0):.3f}s"
                 )
+                headers = build_visual_gen_timing_headers(metrics)
                 if request.response_format == "b64_json":
                     return _b64_json_video_response(video_id, request.format, target)
-                return FileResponse(str(target), media_type=media_type, filename=target.name)
+                return FileResponse(
+                    str(target),
+                    media_type=media_type,
+                    filename=target.name,
+                    headers=headers,
+                )
 
             # Encoder formats: one file per item; ship the first item as
             # the route's primary download (OpenAI sync video API does

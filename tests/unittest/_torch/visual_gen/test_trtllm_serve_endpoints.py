@@ -1583,6 +1583,8 @@ class TestVideoTensorResponse:
         # The content-disposition header carries the on-disk filename.
         disp = resp.headers.get("content-disposition", "")
         assert ext in disp, disp
+        assert SERVER_TIMING_HEADER in resp.headers
+        assert "generation;dur=" in resp.headers[SERVER_TIMING_HEADER]
         # And the payload itself round-trips.
         if fmt == "safetensors":
             from safetensors.torch import load as load_safetensors
