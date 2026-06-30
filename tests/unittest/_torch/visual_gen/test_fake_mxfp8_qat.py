@@ -3,6 +3,8 @@
 
 """Tests for offline fake MXFP8 VisualGen QAT helpers."""
 
+import os
+
 import pytest
 import torch
 import torch.nn as nn
@@ -23,6 +25,7 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required for runtime quantization parity tests.",
 )
+REAL_QWEN_LINEAR_TUPLE_ENV = "QWEN_IMAGE_LAYERED_MXFP8_REAL_LINEAR_TUPLE"
 
 pytestmark = pytest.mark.skipif(
     not hasattr(torch, "float8_e4m3fn"),
@@ -172,6 +175,16 @@ def _pad_last_dim_to_multiple(tensor: torch.Tensor, multiple: int) -> torch.Tens
     if pad_cols == 0:
         return tensor
     return torch.nn.functional.pad(tensor, (0, pad_cols))
+
+
+def _load_real_qwen_linear_tuple() -> dict[str, object]:
+    tuple_path = os.environ.get(REAL_QWEN_LINEAR_TUPLE_ENV)
+    if not tuple_path:
+        pytest.skip(f"{REAL_QWEN_LINEAR_TUPLE_ENV} is not set.")
+    payload = torch.load(tuple_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Real Qwen Linear tuple must be a dict: {tuple_path}")
+    return payload
 
 
 def test_normalize_qwen_module_name_removes_orig_mod_segments():
@@ -360,6 +373,105 @@ def test_fake_mxfp8_linear_matches_runtime_fp8_block_scales_linear(activation_sh
         rtol=1.5e-1,
         atol=1.5e-1,
     )
+
+
+@requires_cuda
+def test_fake_mxfp8_linear_matches_runtime_fp8_block_scales_linear_real_qwen_activation():
+    try:
+        _ = torch.ops.trtllm.fp8_quantize_1x128
+        _ = torch.ops.trtllm.fp8_block_scaling_gemm
+    except (AttributeError, RuntimeError) as exc:
+        pytest.skip(f"FP8 block-scale runtime ops are not available: {exc}")
+
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    sm_version = get_sm_version()
+    if sm_version != 90:
+        pytest.skip(
+            f"This parity test targets the SM90 FP8 block-scale Linear path, got SM{sm_version}."
+        )
+
+    payload = _load_real_qwen_linear_tuple()
+    module_name = payload.get("module_name")
+    if not isinstance(module_name, str):
+        raise ValueError("Real Qwen Linear tuple requires a string module_name.")
+    if not module_name.startswith("transformer_blocks."):
+        raise ValueError(f"Expected a transformer block Linear, got {module_name!r}.")
+
+    activation = payload.get("activation")
+    weight = payload.get("weight")
+    bias = payload.get("bias")
+    if not isinstance(activation, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        raise ValueError("Real Qwen Linear tuple requires activation and weight tensors.")
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        raise ValueError("Real Qwen Linear tuple bias must be a tensor or None.")
+    if activation.ndim == 0 or weight.ndim != 2:
+        raise ValueError(
+            "Real Qwen Linear tuple requires activation with a feature dimension and 2D weight."
+        )
+    if activation.shape[-1] != weight.shape[1]:
+        raise ValueError(
+            "Real Qwen Linear tuple activation/weight shape mismatch: "
+            f"activation={tuple(activation.shape)}, weight={tuple(weight.shape)}."
+        )
+
+    device = torch.device("cuda")
+    activation = activation.to(device=device, dtype=torch.bfloat16)
+    weight = weight.to(device=device, dtype=torch.bfloat16)
+    bias = None if bias is None else bias.to(device=device, dtype=torch.bfloat16)
+
+    reference = nn.Linear(
+        int(weight.shape[1]),
+        int(weight.shape[0]),
+        bias=bias is not None,
+        dtype=torch.bfloat16,
+    ).to(device)
+    with torch.no_grad():
+        reference.weight.copy_(weight)
+        if bias is not None:
+            reference.bias.copy_(bias)
+    fake_linear = FakeMxfp8Linear(reference, module_name=module_name)
+
+    qweight, weight_scale = quantize_fp8_blockwise(weight)
+    runtime_linear = Linear(
+        int(weight.shape[1]),
+        int(weight.shape[0]),
+        bias=bias is not None,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    ).to(device)
+    weight_dict = {
+        "weight": qweight,
+        "weight_scale": weight_scale,
+    }
+    if bias is not None:
+        weight_dict["bias"] = bias
+    runtime_linear.load_weights([weight_dict])
+    runtime_linear.post_load_weights()
+
+    runtime_output = runtime_linear(activation)
+    fake_output = fake_linear(activation)
+
+    assert runtime_output.shape == fake_output.shape
+    output_error = (runtime_output.float() - fake_output.float()).abs()
+    close_fraction = torch.isclose(
+        runtime_output.float(),
+        fake_output.float(),
+        rtol=1.5e-1,
+        atol=1.5e-1,
+    ).float()
+    # Real Qwen weights exercise a much wider output range than the synthetic
+    # cases above. The runtime FP8 GEMM and fake dequantized BF16 matmul should
+    # agree statistically, while a small tail can differ due to accumulation
+    # and kernel implementation details.
+    assert close_fraction.mean().item() >= 0.98
+    assert output_error.mean().item() <= 0.25
+    assert output_error.quantile(0.99).item() <= 8.0
+    assert output_error.max().item() <= 0.05 * runtime_output.float().abs().max().item()
 
 
 @requires_cuda
