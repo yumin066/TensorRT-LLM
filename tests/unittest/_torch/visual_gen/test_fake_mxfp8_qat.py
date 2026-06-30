@@ -167,6 +167,13 @@ def _flat_rows(shape: tuple[int, ...]) -> int:
     return rows
 
 
+def _pad_last_dim_to_multiple(tensor: torch.Tensor, multiple: int) -> torch.Tensor:
+    pad_cols = (-tensor.shape[-1]) % multiple
+    if pad_cols == 0:
+        return tensor
+    return torch.nn.functional.pad(tensor, (0, pad_cols))
+
+
 def test_normalize_qwen_module_name_removes_orig_mod_segments():
     assert (
         normalize_qwen_module_name("transformer_blocks.0._orig_mod.attn.to_q")
@@ -388,15 +395,22 @@ def test_fake_mxfp8_activation_quantize_matches_runtime_1x128_helper(
         )
 
     fake, fake_scales = fake_mxfp8_activation_quantize(activation)
+    flat_activation = activation.reshape(-1, activation_shape[-1])
+    runtime_activation = _pad_last_dim_to_multiple(flat_activation, 16)
     qactivation, runtime_scales = fp8_quantize_1x128_sf_transpose(
-        activation.reshape(-1, activation_shape[-1]),
+        runtime_activation,
         use_ue8m0=False,
     )
-    runtime_dequant = _dequantize_activation_1x128(
-        qactivation,
-        runtime_scales,
-        tuple(activation_shape),
-    ).to(activation.dtype)
+    runtime_shape = tuple(activation_shape[:-1]) + (runtime_activation.shape[-1],)
+    runtime_dequant = (
+        _dequantize_activation_1x128(
+            qactivation,
+            runtime_scales,
+            runtime_shape,
+        )[..., : activation_shape[-1]]
+        .contiguous()
+        .to(activation.dtype)
+    )
 
     torch.testing.assert_close(fake_scales, runtime_scales, rtol=1.0e-5, atol=1.0e-5)
     torch.testing.assert_close(fake, runtime_dequant, rtol=1.0e-5, atol=1.0e-5)
