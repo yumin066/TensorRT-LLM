@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8 import (
+    FP8_E4M3_MAX,
     MXFP8_BLOCK_SIZE,
     QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES,
     FakeMxfp8Linear,
@@ -16,6 +17,11 @@ from tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8 import (
     inject_fake_mxfp8_linears,
     normalize_qwen_module_name,
     select_qwen_image_block_linears,
+)
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for runtime quantization parity tests.",
 )
 
 pytestmark = pytest.mark.skipif(
@@ -66,6 +72,57 @@ class _TinyQwenTransformer(nn.Module):
 def _is_power_of_two(tensor: torch.Tensor) -> torch.Tensor:
     log2 = torch.log2(tensor)
     return torch.isclose(log2, log2.round())
+
+
+def _dequantize_blockwise_weight(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    block_size: int = MXFP8_BLOCK_SIZE,
+) -> torch.Tensor:
+    out_features, in_features = qweight.shape
+    num_blocks_out, num_blocks_in = scales.shape
+    pad_out = num_blocks_out * block_size - out_features
+    pad_in = num_blocks_in * block_size - in_features
+    if pad_out or pad_in:
+        padded = torch.nn.functional.pad(qweight, (0, pad_in, 0, pad_out))
+    else:
+        padded = qweight
+
+    blocks = (
+        padded.to(torch.float32)
+        .reshape(num_blocks_out, block_size, num_blocks_in, block_size)
+        .permute(0, 2, 1, 3)
+    )
+    dequantized = (
+        (blocks * scales[:, :, None, None])
+        .permute(0, 2, 1, 3)
+        .reshape(
+            num_blocks_out * block_size,
+            num_blocks_in * block_size,
+        )
+    )
+    return dequantized[:out_features, :in_features].contiguous()
+
+
+def _boundary_weight(shape: tuple[int, int], device: torch.device) -> torch.Tensor:
+    values = torch.tensor(
+        [
+            -4.0 * FP8_E4M3_MAX,
+            -FP8_E4M3_MAX,
+            -1.0,
+            -1.0e-7,
+            0.0,
+            1.0e-7,
+            1.0,
+            FP8_E4M3_MAX,
+            4.0 * FP8_E4M3_MAX,
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    total = shape[0] * shape[1]
+    repeats = (total + values.numel() - 1) // values.numel()
+    return values.repeat(repeats)[:total].reshape(shape)
 
 
 def test_normalize_qwen_module_name_removes_orig_mod_segments():
@@ -138,6 +195,52 @@ def test_fake_mxfp8_weight_quantize_handles_padded_edges_and_scale_modes():
 
     _, power_scales = fake_mxfp8_weight_quantize(weight, scale_mode="e8m0_power2")
     assert torch.all(_is_power_of_two(power_scales))
+
+
+@requires_cuda
+@pytest.mark.parametrize("shape", [(128, 128), (256, 384), (129, 257)])
+@pytest.mark.parametrize(
+    "scale_mode, use_e8m0_scales",
+    [
+        ("fp32_block_scale", False),
+        ("e8m0_power2", True),
+    ],
+)
+@pytest.mark.parametrize("case", ["zero", "tiny", "boundary", "random"])
+def test_fake_mxfp8_weight_quantize_matches_runtime_blockwise_helper(
+    shape,
+    scale_mode,
+    use_e8m0_scales,
+    case,
+):
+    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise
+
+    device = torch.device("cuda")
+    torch.manual_seed(1234)
+    if case == "zero":
+        weight = torch.zeros(shape, dtype=torch.float32, device=device)
+    elif case == "tiny":
+        weight = torch.linspace(
+            -1.0e-8,
+            1.0e-8,
+            steps=shape[0] * shape[1],
+            device=device,
+        ).reshape(shape)
+    elif case == "boundary":
+        weight = _boundary_weight(shape, device)
+    else:
+        weight = torch.randn(shape, dtype=torch.float32, device=device) * 3.0
+
+    fake, fake_scales = fake_mxfp8_weight_quantize(weight, scale_mode=scale_mode)
+    qweight, runtime_scales = quantize_fp8_blockwise(
+        weight,
+        block_size=MXFP8_BLOCK_SIZE,
+        use_e8m0_scales=use_e8m0_scales,
+    )
+    runtime_dequant = _dequantize_blockwise_weight(qweight, runtime_scales)
+
+    torch.testing.assert_close(fake_scales, runtime_scales, rtol=1.0e-5, atol=1.0e-5)
+    torch.testing.assert_close(fake, runtime_dequant, rtol=1.0e-5, atol=1.0e-5)
 
 
 def test_fake_mxfp8_activation_quantize_uses_token_block_scales():

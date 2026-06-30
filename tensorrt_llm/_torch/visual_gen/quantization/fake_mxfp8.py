@@ -105,9 +105,10 @@ def _check_matrix(matrix: torch.Tensor, *, tensor_name: str, block_size: int) ->
 
 
 def _dequant_scales(amax: torch.Tensor, scale_mode: Mxfp8ScaleMode) -> torch.Tensor:
-    scale = (amax / FP8_E4M3_MAX).clamp_min(_SCALE_EPS)
     if scale_mode == "e8m0_power2":
+        scale = amax.clamp_min(1.0e-4) / FP8_E4M3_MAX
         return torch.exp2(torch.ceil(torch.log2(scale)))
+    scale = (amax / FP8_E4M3_MAX).clamp_min(_SCALE_EPS)
     return scale
 
 
