@@ -104,6 +104,28 @@ def _dequantize_blockwise_weight(
     return dequantized[:out_features, :in_features].contiguous()
 
 
+def _dequantize_activation_1x128(
+    qactivation: torch.Tensor,
+    scales: torch.Tensor,
+    original_shape: tuple[int, ...],
+    block_size: int = MXFP8_BLOCK_SIZE,
+) -> torch.Tensor:
+    in_features = original_shape[-1]
+    flat = qactivation.reshape(-1, in_features)
+    rows, cols = flat.shape
+    num_blocks = scales.shape[-1]
+    padded_cols = num_blocks * block_size
+    pad_cols = padded_cols - cols
+    if pad_cols:
+        flat = torch.nn.functional.pad(flat, (0, pad_cols))
+
+    dequantized = flat.to(torch.float32).reshape(rows, num_blocks, block_size) * scales.reshape(
+        rows, num_blocks, 1
+    )
+    dequantized = dequantized.reshape(rows, padded_cols)[:, :cols]
+    return dequantized.reshape(original_shape).contiguous()
+
+
 def _boundary_weight(shape: tuple[int, int], device: torch.device) -> torch.Tensor:
     values = torch.tensor(
         [
@@ -136,6 +158,13 @@ def _deterministic_tensor(
         .reshape(shape)
         .mul(scale)
     )
+
+
+def _flat_rows(shape: tuple[int, ...]) -> int:
+    rows = 1
+    for dim in shape[:-1]:
+        rows *= dim
+    return rows
 
 
 def test_normalize_qwen_module_name_removes_orig_mod_segments():
@@ -324,6 +353,51 @@ def test_fake_mxfp8_linear_matches_runtime_fp8_block_scales_linear(activation_sh
         rtol=1.5e-1,
         atol=1.5e-1,
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("activation_shape", [(5, 128), (2, 3, 257)])
+@pytest.mark.parametrize("case", ["zero", "tiny", "boundary", "random"])
+def test_fake_mxfp8_activation_quantize_matches_runtime_1x128_helper(
+    activation_shape,
+    case,
+):
+    try:
+        _ = torch.ops.trtllm.fp8_quantize_1x128
+    except (AttributeError, RuntimeError) as exc:
+        pytest.skip(f"FP8 1x128 activation quantization op is not available: {exc}")
+
+    device = torch.device("cuda")
+    torch.manual_seed(4321)
+    if case == "zero":
+        activation = torch.zeros(activation_shape, dtype=torch.bfloat16, device=device)
+    elif case == "tiny":
+        activation = _deterministic_tensor(activation_shape, device, scale=1.0e-8).to(
+            torch.bfloat16
+        )
+    elif case == "boundary":
+        flat_shape = (_flat_rows(activation_shape), activation_shape[-1])
+        activation = (
+            _boundary_weight(flat_shape, device).reshape(activation_shape).to(torch.bfloat16)
+        )
+    else:
+        activation = (torch.randn(activation_shape, dtype=torch.float32, device=device) * 3.0).to(
+            torch.bfloat16
+        )
+
+    fake, fake_scales = fake_mxfp8_activation_quantize(activation)
+    qactivation, runtime_scales = torch.ops.trtllm.fp8_quantize_1x128(
+        activation.reshape(-1, activation_shape[-1]),
+        use_ue8m0=False,
+    )
+    runtime_dequant = _dequantize_activation_1x128(
+        qactivation,
+        runtime_scales,
+        tuple(activation_shape),
+    ).to(activation.dtype)
+
+    torch.testing.assert_close(fake_scales, runtime_scales, rtol=1.0e-5, atol=1.0e-5)
+    torch.testing.assert_close(fake, runtime_dequant, rtol=1.0e-5, atol=1.0e-5)
 
 
 def test_fake_mxfp8_activation_quantize_uses_token_block_scales():
