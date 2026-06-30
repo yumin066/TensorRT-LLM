@@ -125,6 +125,19 @@ def _boundary_weight(shape: tuple[int, int], device: torch.device) -> torch.Tens
     return values.repeat(repeats)[:total].reshape(shape)
 
 
+def _deterministic_tensor(
+    shape: tuple[int, ...], device: torch.device, scale: float
+) -> torch.Tensor:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return (
+        torch.linspace(-1.0, 1.0, steps=numel, dtype=torch.float32, device=device)
+        .reshape(shape)
+        .mul(scale)
+    )
+
+
 def test_normalize_qwen_module_name_removes_orig_mod_segments():
     assert (
         normalize_qwen_module_name("transformer_blocks.0._orig_mod.attn.to_q")
@@ -241,6 +254,76 @@ def test_fake_mxfp8_weight_quantize_matches_runtime_blockwise_helper(
 
     torch.testing.assert_close(fake_scales, runtime_scales, rtol=1.0e-5, atol=1.0e-5)
     torch.testing.assert_close(fake, runtime_dequant, rtol=1.0e-5, atol=1.0e-5)
+
+
+@requires_cuda
+@pytest.mark.parametrize("activation_shape", [(7, 256), (2, 5, 256)])
+def test_fake_mxfp8_linear_matches_runtime_fp8_block_scales_linear(activation_shape):
+    try:
+        _ = torch.ops.trtllm.fp8_quantize_1x128
+        _ = torch.ops.trtllm.fp8_block_scaling_gemm
+    except (AttributeError, RuntimeError) as exc:
+        pytest.skip(f"FP8 block-scale runtime ops are not available: {exc}")
+
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    sm_version = get_sm_version()
+    if sm_version != 90:
+        pytest.skip(
+            f"This parity test targets the SM90 FP8 block-scale Linear path, got SM{sm_version}."
+        )
+
+    device = torch.device("cuda")
+    in_features = 256
+    out_features = 256
+    weight = _deterministic_tensor((out_features, in_features), device, scale=0.25)
+    bias = _deterministic_tensor((out_features,), device, scale=0.05).to(torch.bfloat16)
+    activation = _deterministic_tensor(activation_shape, device, scale=0.5).to(torch.bfloat16)
+
+    reference = nn.Linear(in_features, out_features, bias=True, dtype=torch.bfloat16).to(device)
+    with torch.no_grad():
+        reference.weight.copy_(weight.to(torch.bfloat16))
+        reference.bias.copy_(bias)
+    fake_linear = FakeMxfp8Linear(reference)
+
+    qweight, weight_scale = quantize_fp8_blockwise(weight.to(torch.bfloat16))
+    runtime_linear = Linear(
+        in_features,
+        out_features,
+        bias=True,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    ).to(device)
+    runtime_linear.load_weights(
+        [
+            {
+                "weight": qweight,
+                "weight_scale": weight_scale,
+                "bias": bias,
+            }
+        ]
+    )
+    runtime_linear.post_load_weights()
+
+    assert runtime_linear.has_fp8_block_scales
+    assert runtime_linear.weight.dtype == torch.float8_e4m3fn
+    assert runtime_linear.weight_scale.dtype == torch.float32
+    assert runtime_linear.weight_scale.numel() > 0
+
+    runtime_output = runtime_linear(activation)
+    fake_output = fake_linear(activation)
+
+    assert runtime_output.shape == fake_output.shape
+    torch.testing.assert_close(
+        runtime_output.float(),
+        fake_output.float(),
+        rtol=1.5e-1,
+        atol=1.5e-1,
+    )
 
 
 def test_fake_mxfp8_activation_quantize_uses_token_block_scales():
