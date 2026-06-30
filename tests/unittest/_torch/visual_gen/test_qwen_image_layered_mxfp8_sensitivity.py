@@ -68,16 +68,31 @@ def _module(name: str, state: str) -> dict:
     }
 
 
-def _write_manifest(path: Path, variant: str, *, force_bf16_name: str | None = None) -> None:
+def _write_manifest(
+    path: Path,
+    variant: str,
+    *,
+    force_bf16_name: str | None = None,
+    missing_scale_name: str | None = None,
+) -> None:
     rows = []
     for name in LINEAR_NAMES:
         state = "bf16" if name == force_bf16_name else _observed_state(variant, name)
-        rows.append(_module(name, state))
+        row = _module(name, state)
+        if name == missing_scale_name:
+            row["weight_scale_dtype"] = None
+            row["weight_scale_shape"] = None
+        rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rows), encoding="utf-8")
 
 
-def _write_summary(tmp_path: Path, *, omit_variant: str | None = None) -> Path:
+def _write_summary(
+    tmp_path: Path,
+    *,
+    omit_variant: str | None = None,
+    relative_manifest_paths: bool = False,
+) -> Path:
     recipes = {
         "bf16": "bf16",
         "k12": "fp8_block_scales_edge_bf16_12",
@@ -96,7 +111,8 @@ def _write_summary(tmp_path: Path, *, omit_variant: str | None = None) -> Path:
     for variant, recipe in recipes.items():
         if variant == omit_variant:
             continue
-        manifest_path = tmp_path / variant / "linear_manifest.json"
+        manifest_relpath = Path("qwen_image_layered") / recipe / "linear_manifest.json"
+        manifest_path = tmp_path / manifest_relpath
         _write_manifest(manifest_path, variant)
         rows.append(
             {
@@ -110,7 +126,9 @@ def _write_summary(tmp_path: Path, *, omit_variant: str | None = None) -> Path:
                 "ssim_vs_bf16": 1.0 if variant == "bf16" else 0.9,
                 "composite_psnr_vs_bf16": metrics[variant] + 1.0,
                 "composite_ssim_vs_bf16": 1.0 if variant == "bf16" else 0.91,
-                "linear_manifest_path": str(manifest_path),
+                "linear_manifest_path": (
+                    str(manifest_relpath) if relative_manifest_paths else str(manifest_path)
+                ),
                 "linear_quant_counts": {},
             }
         )
@@ -159,6 +177,27 @@ def test_generate_sensitivity_summary_records_observed_coverage_and_recommendati
     assert "| k0 | fp8_block_scales_edge_bf16_0 | 24.0000" in markdown
 
 
+def test_generate_sensitivity_summary_supports_self_contained_relative_bundle(tmp_path):
+    summary_path = _write_summary(tmp_path, relative_manifest_paths=True)
+    provenance_path = tmp_path / "provenance.json"
+    provenance_path.write_text(
+        json.dumps({"container_image": "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20"}),
+        encoding="utf-8",
+    )
+
+    summary = generate_sensitivity_summary(
+        summary_json=summary_path,
+        model="qwen_image_layered",
+        provenance_json=provenance_path,
+    )
+
+    assert summary["provenance"]["container_image"].endswith("1.3.0rc20")
+    expected_manifest = (
+        tmp_path / "qwen_image_layered" / "fp8_block_scales_edge_bf16_0" / "linear_manifest.json"
+    )
+    assert summary["observed_coverage"]["k0"]["linear_manifest_path"] == str(expected_manifest)
+
+
 def test_missing_required_k0_fails(tmp_path):
     summary_path = _write_summary(tmp_path, omit_variant="k0")
 
@@ -171,7 +210,9 @@ def test_missing_required_k0_fails(tmp_path):
 
 def test_expected_observed_transformer_mismatch_fails(tmp_path):
     summary_path = _write_summary(tmp_path)
-    k0_manifest = tmp_path / "k0" / "linear_manifest.json"
+    k0_manifest = (
+        tmp_path / "qwen_image_layered" / "fp8_block_scales_edge_bf16_0" / "linear_manifest.json"
+    )
     _write_manifest(
         k0_manifest,
         "k0",
@@ -179,6 +220,24 @@ def test_expected_observed_transformer_mismatch_fails(tmp_path):
     )
 
     with pytest.raises(ValueError, match="Observed Linear coverage validation failed"):
+        generate_sensitivity_summary(
+            summary_json=summary_path,
+            model="qwen_image_layered",
+        )
+
+
+def test_missing_mxfp8_weight_scale_fails(tmp_path):
+    summary_path = _write_summary(tmp_path)
+    k0_manifest = (
+        tmp_path / "qwen_image_layered" / "fp8_block_scales_edge_bf16_0" / "linear_manifest.json"
+    )
+    _write_manifest(
+        k0_manifest,
+        "k0",
+        missing_scale_name="transformer_blocks.12.attn.to_q",
+    )
+
+    with pytest.raises(ValueError, match="missing_mxfp8_weight_scale"):
         generate_sensitivity_summary(
             summary_json=summary_path,
             model="qwen_image_layered",

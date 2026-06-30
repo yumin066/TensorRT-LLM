@@ -62,6 +62,7 @@ import argparse
 import datetime
 import json
 import math
+import re
 import subprocess
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
@@ -77,6 +78,10 @@ from tensorrt_llm.visual_gen.output import VisualGenOutput
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
 REFERENCE_VARIANT = "bf16"
+LINEAR_BLOCK_RE = re.compile(r"(?:^|\.)transformer_blocks\.(\d+)(?:\.|$)")
+LINEAR_TRANSFORMER_BLOCKS = 60
+LINEAR_NON_BACKBONE_IGNORE = ("img_in", "txt_in", "norm_out", "proj_out")
+LINEAR_BLOCK_SCALE_ALGO = "FP8_BLOCK_SCALES"
 SUPPORTED_VARIANT_NAMES = frozenset(
     {
         REFERENCE_VARIANT,
@@ -235,6 +240,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use an in-process single-worker pipeline for generated artifacts and save "
             "transformer input/output tuples for BF16 teacher distillation."
+        ),
+    )
+    parser.add_argument(
+        "--emit-linear-manifests",
+        action="store_true",
+        help=(
+            "Use the in-process single-worker pipeline and save observed Linear module "
+            "quantization manifests for each generated variant."
         ),
     )
     parser.add_argument(
@@ -443,6 +456,224 @@ def git_commit(project_root: Path) -> str | None:
     return result.stdout.strip()
 
 
+def linear_block_index(name: str) -> int | None:
+    match = LINEAR_BLOCK_RE.search(name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _module_matches_prefix(name: str, prefix: str) -> bool:
+    return name == prefix or name.startswith(prefix + ".")
+
+
+def linear_role(name: str) -> str:
+    if any(_module_matches_prefix(name, entry) for entry in LINEAR_NON_BACKBONE_IGNORE):
+        return "non_backbone"
+    if linear_block_index(name) is not None:
+        return "transformer_block"
+    return "other"
+
+
+def _variant_k_edge_bf16(variant: LayeredVariant) -> int | None:
+    value = variant.metadata.get("k_edge_bf16")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    if variant.name.startswith("k") and variant.name[1:].isdigit():
+        return int(variant.name[1:])
+    return None
+
+
+def _linear_preserved_reason(name: str, variant: LayeredVariant) -> str | None:
+    if variant.name == REFERENCE_VARIANT:
+        return "bf16_reference"
+    ignore = list(LINEAR_NON_BACKBONE_IGNORE)
+    k_edge_bf16 = _variant_k_edge_bf16(variant)
+    if k_edge_bf16 is not None:
+        ignore.extend(f"transformer_blocks.{idx}" for idx in range(k_edge_bf16))
+        ignore.extend(
+            f"transformer_blocks.{idx}"
+            for idx in range(
+                LINEAR_TRANSFORMER_BLOCKS - k_edge_bf16,
+                LINEAR_TRANSFORMER_BLOCKS,
+            )
+        )
+    for entry in ignore:
+        if _module_matches_prefix(name, entry):
+            return entry
+    return None
+
+
+def _shape_of(value: Any) -> list[int] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    return [int(dim) for dim in shape]
+
+
+def _dtype_of(value: Any) -> str | None:
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return None
+    return str(dtype)
+
+
+def _quant_method_name(module: Any) -> str:
+    quant_method = getattr(module, "quant_method", None)
+    if quant_method is None:
+        quant_method = getattr(module, "linear_method", None)
+    if quant_method is None:
+        return "None"
+    return quant_method.__class__.__name__
+
+
+def _quant_algo_name(module: Any, quant_method_name: str) -> str:
+    quant_config = getattr(module, "quant_config", None)
+    quant_algo = getattr(quant_config, "quant_algo", None)
+    if quant_algo is None and "FP8BlockScales" in quant_method_name:
+        return LINEAR_BLOCK_SCALE_ALGO
+    if quant_algo is None:
+        return "None"
+    name = getattr(quant_algo, "name", None)
+    if isinstance(name, str):
+        return name
+    return str(quant_algo).split(".")[-1]
+
+
+def is_linear_manifest_module(module: Any) -> bool:
+    return module.__class__.__name__ == "Linear" and hasattr(module, "weight")
+
+
+def linear_manifest_record(name: str, module: Any, variant: LayeredVariant) -> dict[str, Any]:
+    quant_method = _quant_method_name(module)
+    role = linear_role(name)
+    weight = getattr(module, "weight", None)
+    bias = getattr(module, "bias", None)
+    weight_scale = getattr(module, "weight_scale", None)
+    return {
+        "name": name,
+        "class": module.__class__.__name__,
+        "block_index": linear_block_index(name),
+        "role": role,
+        "is_backbone_block": role == "transformer_block",
+        "preserved_reason": _linear_preserved_reason(name, variant),
+        "quant_method": quant_method,
+        "quant_algo": _quant_algo_name(module, quant_method),
+        "weight_dtype": _dtype_of(weight),
+        "weight_shape": _shape_of(weight),
+        "weight_scale_dtype": _dtype_of(weight_scale),
+        "weight_scale_shape": _shape_of(weight_scale),
+        "bias_dtype": _dtype_of(bias),
+        "bias_shape": _shape_of(bias),
+        "in_features": getattr(module, "in_features", None),
+        "out_features": getattr(module, "out_features", None),
+        "tp_mode": str(getattr(module, "tp_mode", None)),
+        "disable_deep_gemm": bool(getattr(module, "disable_deep_gemm", False)),
+        "use_cute_dsl_blockscaling_mm": bool(
+            getattr(module, "use_cute_dsl_blockscaling_mm", False)
+        ),
+    }
+
+
+def collect_linear_manifest(
+    named_modules: Iterator[tuple[str, Any]],
+    variant: LayeredVariant,
+) -> list[dict[str, Any]]:
+    records = [
+        linear_manifest_record(name, module, variant)
+        for name, module in named_modules
+        if is_linear_manifest_module(module)
+    ]
+    return sorted(records, key=lambda record: record["name"])
+
+
+def write_linear_manifest(
+    path: Path,
+    named_modules: Iterator[tuple[str, Any]],
+    variant: LayeredVariant,
+) -> list[dict[str, Any]]:
+    records = collect_linear_manifest(named_modules, variant)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return records
+
+
+def linear_quant_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        key = f"{record['weight_dtype']}|{record['quant_algo']}"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _linear_manifest_metadata(output_root: Path, variant: LayeredVariant) -> dict[str, Any]:
+    path = output_root / "linear_manifests" / variant.name / "linear_manifest.json"
+    if not path.exists():
+        return {}
+    records = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(records, list):
+        raise ValueError(f"Linear manifest must contain a list: {path}")
+    return {
+        "linear_manifest_path": str(path),
+        "linear_quant_counts": linear_quant_counts(records),
+    }
+
+
+def load_single_worker_pipeline(
+    variant: LayeredVariant,
+    *,
+    manifest_dir: Path,
+    purpose: str,
+) -> Any:
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen import VisualGenArgs
+
+    args = VisualGenArgs.from_yaml(
+        resolve_path(variant.visual_gen_args, manifest_dir),
+        model=variant.model,
+    )
+    if args.parallel_config.n_workers != 1:
+        raise ValueError(
+            f"{purpose} uses an in-process pipeline and requires "
+            f"parallel_config.n_workers == 1, got {args.parallel_config.n_workers}"
+        )
+
+    loader = PipelineLoader(args, device="cuda:0")
+    return loader.load(skip_warmup=args.compilation_config.skip_warmup)
+
+
+def cleanup_pipeline(pipeline: Any) -> None:
+    cleanup = getattr(pipeline, "cleanup", None)
+    if cleanup is not None:
+        cleanup()
+
+
+def write_linear_manifest_with_local_pipeline(
+    variant: LayeredVariant,
+    *,
+    manifest_dir: Path,
+    linear_manifest_path: Path,
+) -> None:
+    pipeline = load_single_worker_pipeline(
+        variant,
+        manifest_dir=manifest_dir,
+        purpose="Linear manifest emission",
+    )
+    try:
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            raise ValueError("Pipeline does not expose a transformer for Linear manifest emission")
+        write_linear_manifest(
+            linear_manifest_path,
+            transformer.named_modules(),
+            variant,
+        )
+    finally:
+        cleanup_pipeline(pipeline)
+
+
 def _tensor_to_cpu(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
@@ -588,23 +819,27 @@ def generate_with_local_pipeline(
     manifest_dir: Path,
     artifact_format: str,
     capture_root: Path | None,
+    linear_manifest_path: Path | None,
 ) -> Path:
-    from tensorrt_llm._torch.visual_gen import DiffusionRequest, PipelineLoader
-    from tensorrt_llm.visual_gen import VisualGenArgs
+    from tensorrt_llm._torch.visual_gen import DiffusionRequest
 
-    args = VisualGenArgs.from_yaml(
-        resolve_path(variant.visual_gen_args, manifest_dir),
-        model=variant.model,
+    pipeline = load_single_worker_pipeline(
+        variant,
+        manifest_dir=manifest_dir,
+        purpose="Transformer tuple capture and Linear manifest emission",
     )
-    if args.parallel_config.n_workers != 1:
-        raise ValueError(
-            "Transformer tuple capture uses an in-process pipeline and requires "
-            f"parallel_config.n_workers == 1, got {args.parallel_config.n_workers}"
-        )
-
-    loader = PipelineLoader(args, device="cuda:0")
-    pipeline = loader.load(skip_warmup=args.compilation_config.skip_warmup)
     try:
+        if linear_manifest_path is not None:
+            transformer = getattr(pipeline, "transformer", None)
+            if transformer is None:
+                raise ValueError(
+                    "Pipeline does not expose a transformer for Linear manifest emission"
+                )
+            write_linear_manifest(
+                linear_manifest_path,
+                transformer.named_modules(),
+                variant,
+            )
         sample_for_generation = sample.model_copy(
             update={"image": str(resolve_path(sample.image, manifest_dir))}
         )
@@ -638,9 +873,7 @@ def generate_with_local_pipeline(
             raise ValueError("Expected VisualGenOutput.save to return a single path")
         return saved
     finally:
-        cleanup = getattr(pipeline, "cleanup", None)
-        if cleanup is not None:
-            cleanup()
+        cleanup_pipeline(pipeline)
 
 
 def resolve_or_generate_artifact(
@@ -653,6 +886,7 @@ def resolve_or_generate_artifact(
     load_existing: bool,
     overwrite: bool,
     capture_transformer_tuples_enabled: bool,
+    emit_linear_manifests: bool,
 ) -> Path:
     explicit = variant.artifact_paths.get(sample.id)
     if explicit is not None:
@@ -665,7 +899,19 @@ def resolve_or_generate_artifact(
             artifact_format,
         )
 
+    linear_manifest_path = None
+    if emit_linear_manifests:
+        linear_manifest_path = (
+            output_root / "linear_manifests" / variant.name / "linear_manifest.json"
+        )
+
     if artifact_path.exists() and not overwrite:
+        if linear_manifest_path is not None and not linear_manifest_path.exists():
+            write_linear_manifest_with_local_pipeline(
+                variant,
+                manifest_dir=manifest_dir,
+                linear_manifest_path=linear_manifest_path,
+            )
         return artifact_path
     if load_existing:
         raise FileNotFoundError(f"Missing required artifact: {artifact_path}")
@@ -679,7 +925,7 @@ def resolve_or_generate_artifact(
     capture_root = None
     if capture_transformer_tuples_enabled and variant.name == REFERENCE_VARIANT:
         capture_root = output_root / "teacher_tuples" / variant.name / sample.id
-    if capture_transformer_tuples_enabled:
+    if capture_transformer_tuples_enabled or emit_linear_manifests:
         return generate_with_local_pipeline(
             sample,
             variant,
@@ -687,6 +933,7 @@ def resolve_or_generate_artifact(
             manifest_dir=manifest_dir,
             artifact_format=artifact_format,
             capture_root=capture_root,
+            linear_manifest_path=linear_manifest_path,
         )
     return generate_with_visual_gen(
         sample,
@@ -744,6 +991,7 @@ def evaluate_manifest(
     capture_transformer_tuples_enabled: bool,
     save_audit_pngs: bool,
     only_variants: list[str] | None = None,
+    emit_linear_manifests: bool = False,
 ) -> dict[str, JsonMetadataValue]:
     manifest_dir = manifest_path.resolve().parent
     output_root = resolve_path(manifest.output_root, manifest_dir)
@@ -766,6 +1014,7 @@ def evaluate_manifest(
                 load_existing=load_existing,
                 overwrite=overwrite,
                 capture_transformer_tuples_enabled=capture_transformer_tuples_enabled,
+                emit_linear_manifests=emit_linear_manifests,
             )
             stack = load_layer_stack(artifact_path)
             validate_stack_against_sample(
@@ -843,6 +1092,7 @@ def evaluate_manifest(
                     sample_id: str(path)
                     for sample_id, path in artifact_records[variant.name].items()
                 },
+                **_linear_manifest_metadata(output_root, variant),
             }
             for variant in selected_variants
         },
@@ -873,6 +1123,7 @@ def main() -> None:
         capture_transformer_tuples_enabled=args.capture_transformer_tuples,
         save_audit_pngs=args.save_audit_pngs,
         only_variants=args.only_variants,
+        emit_linear_manifests=args.emit_linear_manifests,
     )
     print(json.dumps(_jsonify_nonfinite(metrics["aggregates"]), indent=2, sort_keys=True))
 
