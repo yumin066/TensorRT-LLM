@@ -81,6 +81,9 @@ SUPPORTED_VARIANT_NAMES = frozenset(
     {
         REFERENCE_VARIANT,
         "k12",
+        "k8",
+        "k4",
+        "k0",
         "all_layer_dynamic_mxfp8",
         "qat_all_layer_mxfp8",
     }
