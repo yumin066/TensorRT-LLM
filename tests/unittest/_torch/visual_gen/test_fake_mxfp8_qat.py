@@ -367,6 +367,8 @@ def test_fake_mxfp8_activation_quantize_matches_runtime_1x128_helper(
     except (AttributeError, RuntimeError) as exc:
         pytest.skip(f"FP8 1x128 activation quantization op is not available: {exc}")
 
+    from tensorrt_llm.quantization.utils.fp8_utils import fp8_quantize_1x128_sf_transpose
+
     device = torch.device("cuda")
     torch.manual_seed(4321)
     if case == "zero":
@@ -386,7 +388,7 @@ def test_fake_mxfp8_activation_quantize_matches_runtime_1x128_helper(
         )
 
     fake, fake_scales = fake_mxfp8_activation_quantize(activation)
-    qactivation, runtime_scales = torch.ops.trtllm.fp8_quantize_1x128(
+    qactivation, runtime_scales = fp8_quantize_1x128_sf_transpose(
         activation.reshape(-1, activation_shape[-1]),
         use_ue8m0=False,
     )
