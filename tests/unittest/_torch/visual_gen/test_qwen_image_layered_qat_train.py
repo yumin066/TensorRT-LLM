@@ -258,6 +258,18 @@ def test_config_accepts_optimizer_foreach_override(tmp_path):
     assert config.optimizer.foreach is False
 
 
+def test_config_accepts_sgd_optimizer(tmp_path):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            optimizer={"name": "sgd", "learning_rate": 1.0e-3, "foreach": False},
+        )
+    )
+
+    assert config.optimizer.name == "sgd"
+    assert config.optimizer.foreach is False
+
+
 def test_config_rejects_partial_unfreeze_without_sensitivity(tmp_path):
     with pytest.raises(ValidationError, match="disabled"):
         QwenImageLayeredQatConfig(
@@ -722,6 +734,41 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
     assert provenance["best_checkpoint_path"] == str(result.best_checkpoint_path)
     assert provenance["last_checkpoint_path"] == str(result.last_checkpoint_path)
     assert provenance["best_validation_step"] == result.best_validation_step
+
+
+def test_train_qat_sgd_optimizer_keeps_state_empty(tmp_path, monkeypatch):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    created_optimizers = []
+    original_sgd = torch.optim.SGD
+
+    def _spy_sgd(*args, **kwargs):
+        optimizer = original_sgd(*args, **kwargs)
+        created_optimizers.append(optimizer)
+        return optimizer
+
+    monkeypatch.setattr(torch.optim, "SGD", _spy_sgd)
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            optimizer={"name": "sgd", "learning_rate": 1.0e-3, "foreach": False},
+        )
+    )
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=_TinyQwenTransformer(),
+        linear_cls=nn.Linear,
+    )
+
+    assert created_optimizers
+    assert isinstance(created_optimizers[0], original_sgd)
+    assert created_optimizers[0].state == {}
+    checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["config"]["optimizer"]["name"] == "sgd"
 
 
 def test_train_qat_best_checkpoint_is_not_overwritten_by_later_last_checkpoint(

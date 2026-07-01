@@ -51,6 +51,7 @@ OPTIONAL_TARGET_KEYS = (
 )
 
 RecipeName = Literal["lora_adapter", "partial_unfreeze"]
+OptimizerName = Literal["adamw", "sgd"]
 ScheduleName = Literal["smoke", "pilot", "formal", "fallback"]
 TrainingFrameworkName = Literal["native_pytorch"]
 AttentionQuantRecipe = Literal["none", "sage_attention", "cute_dsl", "fa4", "qk16pv8"]
@@ -87,7 +88,10 @@ _DIFFERENTIABLE_OPTIONAL_LOSSES = {
 class OptimizerConfig(StrictBaseModel):
     """Optimizer settings for the native PyTorch loop."""
 
-    name: Literal["adamw"] = Field(default="adamw", description="Optimizer implementation.")
+    name: OptimizerName = Field(
+        default="adamw",
+        description="Optimizer implementation. SGD is state-free when momentum is zero.",
+    )
     learning_rate: PositiveFloat = Field(default=1.0e-4, description="Optimizer learning rate.")
     weight_decay: NonNegativeFloat = Field(default=0.0, description="AdamW weight decay.")
     betas: tuple[float, float] = Field(
@@ -693,14 +697,7 @@ def train_qwen_image_layered_qat(
         ]
         if not trainable_parameters:
             raise ValueError("QAT training has no trainable parameters")
-        optimizer = torch.optim.AdamW(
-            trainable_parameters,
-            lr=float(config.optimizer.learning_rate),
-            betas=config.optimizer.betas,
-            eps=float(config.optimizer.eps),
-            weight_decay=float(config.optimizer.weight_decay),
-            foreach=config.optimizer.foreach,
-        )
+        optimizer = _build_optimizer(trainable_parameters, config.optimizer)
 
         train_indices, validation_indices = _split_dataset_indices(
             dataset, config.validation_fraction
@@ -831,6 +828,30 @@ def train_qwen_image_layered_qat(
     finally:
         if loaded is not None:
             loaded.cleanup()
+
+
+def _build_optimizer(
+    trainable_parameters: list[nn.Parameter],
+    config: OptimizerConfig,
+) -> torch.optim.Optimizer:
+    if config.name == "adamw":
+        return torch.optim.AdamW(
+            trainable_parameters,
+            lr=float(config.learning_rate),
+            betas=config.betas,
+            eps=float(config.eps),
+            weight_decay=float(config.weight_decay),
+            foreach=config.foreach,
+        )
+    if config.name == "sgd":
+        return torch.optim.SGD(
+            trainable_parameters,
+            lr=float(config.learning_rate),
+            momentum=0.0,
+            weight_decay=float(config.weight_decay),
+            foreach=config.foreach,
+        )
+    raise ValueError(f"unsupported optimizer: {config.name}")
 
 
 def _resolve_tuple_paths(manifest_path: Path) -> list[Path]:
