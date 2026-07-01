@@ -84,6 +84,21 @@ def test_quality_gate_rejects_bad_loader_contract():
     assert any("static_mxfp8_target_count=839" in failure for failure in report["failures"])
 
 
+def test_quality_gate_rejects_missing_loader_coverage_by_default():
+    report = gate.evaluate_quality_gate(_metrics())
+
+    assert report["status"] == "failed"
+    assert report["loader_coverage"]["status"] == "missing"
+    assert any("loader coverage JSON is required" in failure for failure in report["failures"])
+
+
+def test_quality_gate_can_explicitly_skip_loader_coverage_for_diagnostics():
+    report = gate.evaluate_quality_gate(_metrics(), require_coverage=False)
+
+    assert report["status"] == "passed"
+    assert report["loader_coverage"]["status"] == "skipped"
+
+
 def test_quality_gate_rejects_844_slash_844_wording():
     metrics = _metrics()
     metrics["variants"]["qat_all_layer_mxfp8"]["note"] = "not allowed: 844/844 MXFP8"

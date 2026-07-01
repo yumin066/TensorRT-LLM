@@ -30,6 +30,7 @@ def evaluate_quality_gate(
     metrics: dict[str, Any],
     *,
     coverage: dict[str, Any] | None = None,
+    require_coverage: bool = True,
     psnr_threshold: float = DEFAULT_PSNR_THRESHOLD,
     dynamic_variant: str = DYNAMIC_VARIANT,
     qat_variant: str = QAT_VARIANT,
@@ -91,7 +92,7 @@ def evaluate_quality_gate(
             sample_report["k12_ssim"] = k12.get("ssim")
         per_sample.append(sample_report)
 
-    coverage_report = _evaluate_loader_coverage(coverage) if coverage is not None else None
+    coverage_report = _coverage_report(coverage, require_coverage=require_coverage)
     if coverage_report is not None:
         failures.extend(coverage_report["failures"])
 
@@ -184,6 +185,34 @@ def _evaluate_loader_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _coverage_report(
+    coverage: dict[str, Any] | None,
+    *,
+    require_coverage: bool,
+) -> dict[str, Any]:
+    if coverage is not None:
+        return _evaluate_loader_coverage(coverage)
+    if not require_coverage:
+        return {
+            "status": "skipped",
+            "target_count": None,
+            "static_mxfp8_target_count": None,
+            "bf16_exclusion_count": None,
+            "total_linear_count": None,
+            "pipeline_quant_algo": None,
+            "failures": [],
+        }
+    return {
+        "status": "missing",
+        "target_count": None,
+        "static_mxfp8_target_count": None,
+        "bf16_exclusion_count": None,
+        "total_linear_count": None,
+        "pipeline_quant_algo": None,
+        "failures": ["loader coverage JSON is required for a QAT quality gate"],
+    }
+
+
 def _metric_to_float(value: Any, *, field: str) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -212,7 +241,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics", required=True, help="Quality metrics JSON path.")
     parser.add_argument("--output-json", required=True, help="Gate result JSON path.")
-    parser.add_argument("--coverage-json", help="Optional task10 loader coverage JSON path.")
+    parser.add_argument("--coverage-json", help="Task10 loader coverage JSON path.")
+    parser.add_argument(
+        "--skip-coverage-check",
+        action="store_true",
+        help="Explicitly skip loader coverage enforcement for diagnostics only.",
+    )
     parser.add_argument(
         "--psnr-threshold",
         type=float,
@@ -228,6 +262,7 @@ def main() -> None:
     report = evaluate_quality_gate(
         load_json(args.metrics),
         coverage=coverage,
+        require_coverage=not args.skip_coverage_check,
         psnr_threshold=args.psnr_threshold,
     )
     output_path = Path(args.output_json)
