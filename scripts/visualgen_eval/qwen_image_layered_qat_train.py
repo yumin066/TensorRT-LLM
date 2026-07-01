@@ -660,6 +660,19 @@ def train_qwen_image_layered_qat(
     _validate_loss_payloads(config.loss, dataset)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = output_dir / "checkpoint_best.pt"
+    last_checkpoint_path = output_dir / "checkpoint_last.pt"
+    preexisting_checkpoints = [
+        checkpoint_path
+        for checkpoint_path in (best_checkpoint_path, last_checkpoint_path)
+        if checkpoint_path.exists()
+    ]
+    if preexisting_checkpoints:
+        formatted_paths = ", ".join(str(path) for path in preexisting_checkpoints)
+        raise RuntimeError(f"checkpoint output already exists: {formatted_paths}")
+    metrics_path = output_dir / "metrics.json"
+    metrics_jsonl_path = output_dir / "metrics.jsonl"
+    provenance_path = output_dir / "provenance.json"
 
     loaded: LoadedTransformer | None = None
     if transformer is None:
@@ -696,11 +709,7 @@ def train_qwen_image_layered_qat(
         best_validation_loss = float("inf")
         best_validation_step: int | None = None
         stale_validation_count = 0
-        best_checkpoint_path = output_dir / "checkpoint_best.pt"
-        last_checkpoint_path = output_dir / "checkpoint_last.pt"
-        metrics_path = output_dir / "metrics.json"
-        metrics_jsonl_path = output_dir / "metrics.jsonl"
-        provenance_path = output_dir / "provenance.json"
+        wrote_best_checkpoint = False
 
         step = 0
         with metrics_jsonl_path.open("w", encoding="utf-8") as metrics_jsonl:
@@ -709,13 +718,16 @@ def train_qwen_image_layered_qat(
                 optimizer.zero_grad(set_to_none=True)
                 output = _forward_sample(trained_model, sample, device)
                 loss, loss_components = _compute_loss(output, sample, config.loss, device)
+                loss_value = float(loss.detach().cpu())
+                if not math.isfinite(loss_value):
+                    raise RuntimeError(f"non-finite training loss at step {step}: {loss_value}")
                 loss.backward()
                 optimizer.step()
 
                 train_record = {
                     "phase": "train",
                     "step": step,
-                    "loss": float(loss.detach().cpu()),
+                    "loss": loss_value,
                     "loss_components": _loss_components_to_float(loss_components),
                     "sample_index": int(train_indices[(step - 1) % len(train_indices)]),
                 }
@@ -728,17 +740,21 @@ def train_qwen_image_layered_qat(
                     validation_metrics = _validate(
                         trained_model, dataset, validation_indices, config.loss, device
                     )
+                    validation_loss = float(validation_metrics.loss)
+                    if not math.isfinite(validation_loss):
+                        raise RuntimeError(
+                            f"non-finite validation loss at step {step}: {validation_loss}"
+                        )
                     validation_record = {
                         "phase": "validation",
                         "step": step,
-                        "loss": validation_metrics.loss,
+                        "loss": validation_loss,
                         "loss_components": validation_metrics.loss_components,
                         "quality_metrics": validation_metrics.quality_metrics,
                         "sample_count": len(validation_indices),
                     }
                     metrics.append(validation_record)
                     metrics_jsonl.write(json.dumps(validation_record, sort_keys=True) + "\n")
-                    validation_loss = validation_metrics.loss
                     if validation_loss < best_validation_loss - 1.0e-8:
                         best_validation_loss = validation_loss
                         best_validation_step = step
@@ -754,6 +770,7 @@ def train_qwen_image_layered_qat(
                             best_checkpoint_path,
                             last_checkpoint_path,
                         )
+                        wrote_best_checkpoint = True
                     else:
                         stale_validation_count += 1
                     if stale_validation_count >= int(config.early_stop_patience):
@@ -771,8 +788,8 @@ def train_qwen_image_layered_qat(
                         last_checkpoint_path,
                     )
 
-        if not best_checkpoint_path.exists():
-            raise RuntimeError("QAT training completed without a best validation checkpoint")
+        if not wrote_best_checkpoint:
+            raise RuntimeError("QAT training completed without a finite best validation checkpoint")
         _save_checkpoint(
             last_checkpoint_path,
             trained_model,

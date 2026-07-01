@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -796,6 +797,89 @@ def test_train_qat_best_checkpoint_is_not_overwritten_by_later_last_checkpoint(
     assert provenance["last_checkpoint_path"] == str(result.last_checkpoint_path)
     assert provenance["best_validation_loss"] == 1.0
     assert provenance["best_validation_step"] == 2
+
+
+def test_train_qat_rejects_preexisting_best_checkpoint_before_non_finite_validation(
+    tmp_path, monkeypatch
+):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(**_base_config(tmp_path, tuple_manifest=str(manifest_path)))
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    stale_checkpoint_path = output_dir / "checkpoint_best.pt"
+    stale_checkpoint_path.write_bytes(b"stale checkpoint")
+
+    def _non_finite_validate(*_args, **_kwargs):
+        return qat_train.ValidationMetrics(
+            loss=math.nan,
+            loss_components={"latent_reconstruction": math.nan},
+            quality_metrics={},
+        )
+
+    monkeypatch.setattr(qat_train, "_validate", _non_finite_validate)
+
+    with pytest.raises(RuntimeError, match="checkpoint output already exists"):
+        train_qwen_image_layered_qat(
+            config,
+            transformer=_TinyQwenTransformer(),
+            linear_cls=nn.Linear,
+        )
+
+    assert stale_checkpoint_path.read_bytes() == b"stale checkpoint"
+
+
+def test_train_qat_rejects_non_finite_training_loss(tmp_path, monkeypatch):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(**_base_config(tmp_path, tuple_manifest=str(manifest_path)))
+
+    def _non_finite_loss(*_args, **_kwargs):
+        loss = torch.tensor(float("nan"), requires_grad=True)
+        return loss, {"latent_reconstruction": loss}
+
+    monkeypatch.setattr(qat_train, "_compute_loss", _non_finite_loss)
+
+    with pytest.raises(RuntimeError, match="non-finite training loss at step 1"):
+        train_qwen_image_layered_qat(
+            config,
+            transformer=_TinyQwenTransformer(),
+            linear_cls=nn.Linear,
+        )
+
+    assert not (tmp_path / "out" / "checkpoint_best.pt").exists()
+
+
+def test_train_qat_rejects_non_finite_validation_loss_without_best_checkpoint(
+    tmp_path, monkeypatch
+):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(**_base_config(tmp_path, tuple_manifest=str(manifest_path)))
+
+    def _non_finite_validate(*_args, **_kwargs):
+        return qat_train.ValidationMetrics(
+            loss=math.inf,
+            loss_components={"latent_reconstruction": math.inf},
+            quality_metrics={},
+        )
+
+    monkeypatch.setattr(qat_train, "_validate", _non_finite_validate)
+
+    with pytest.raises(RuntimeError, match="non-finite validation loss at step 1"):
+        train_qwen_image_layered_qat(
+            config,
+            transformer=_TinyQwenTransformer(),
+            linear_cls=nn.Linear,
+        )
+
+    assert not (tmp_path / "out" / "checkpoint_best.pt").exists()
 
 
 def test_train_qat_activation_checkpointing_preserves_parameter_names(tmp_path):
