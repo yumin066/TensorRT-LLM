@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 from pydantic import ValidationError
 
+from scripts.visualgen_eval import qwen_image_layered_qat_train as qat_train
 from scripts.visualgen_eval.qwen_image_layered_qat_train import (
     Mxfp8LoraAdapterLinear,
     QwenImageLayeredQatConfig,
@@ -324,6 +326,99 @@ def test_load_bf16_transformer_rejects_visual_gen_args_before_loader(tmp_path, y
         load_bf16_qwen_transformer(config)
 
 
+@pytest.mark.parametrize(
+    ("resolved_config", "message"),
+    [
+        (
+            SimpleNamespace(
+                quant_config=SimpleNamespace(quant_algo="FP8_BLOCK_SCALES"),
+                quant_config_dict=None,
+                dynamic_weight_quant=False,
+                force_dynamic_quantization=False,
+                model_configs={},
+            ),
+            "quant_config.quant_algo",
+        ),
+        (
+            SimpleNamespace(
+                quant_config=SimpleNamespace(quant_algo=None),
+                quant_config_dict={"transformer_blocks.0.attn.to_q": object()},
+                dynamic_weight_quant=False,
+                force_dynamic_quantization=False,
+                model_configs={},
+            ),
+            "quant_config_dict",
+        ),
+        (
+            SimpleNamespace(
+                quant_config=SimpleNamespace(quant_algo=None),
+                quant_config_dict=None,
+                dynamic_weight_quant=True,
+                force_dynamic_quantization=False,
+                model_configs={},
+            ),
+            "dynamic_weight_quant",
+        ),
+        (
+            SimpleNamespace(
+                quant_config=SimpleNamespace(quant_algo=None),
+                quant_config_dict=None,
+                dynamic_weight_quant=False,
+                force_dynamic_quantization=True,
+                model_configs={},
+            ),
+            "dynamic activation quantization",
+        ),
+        (
+            SimpleNamespace(
+                quant_config=SimpleNamespace(quant_algo=None),
+                quant_config_dict=None,
+                dynamic_weight_quant=False,
+                force_dynamic_quantization=False,
+                model_configs={
+                    "transformer": SimpleNamespace(
+                        quant_config=SimpleNamespace(quant_algo="FP8_BLOCK_SCALES"),
+                        quant_config_dict=None,
+                        dynamic_weight_quant=False,
+                        force_dynamic_quantization=False,
+                    )
+                },
+            ),
+            "resolved VisualGen model config transformer",
+        ),
+    ],
+)
+def test_load_bf16_transformer_rejects_embedded_quant_before_loader(
+    tmp_path,
+    monkeypatch,
+    resolved_config,
+    message,
+):
+    visual_gen_args_path = tmp_path / "visual_gen.yaml"
+    visual_gen_args_path.write_text("{}", encoding="utf-8")
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            model="dummy-model",
+            visual_gen_args=str(visual_gen_args_path),
+        )
+    )
+
+    def _from_pretrained(model, args):
+        assert model == "dummy-model"
+        assert args.model == "dummy-model"
+        return resolved_config
+
+    monkeypatch.setattr(
+        qat_train.DiffusionPipelineConfig,
+        "from_pretrained",
+        staticmethod(_from_pretrained),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_bf16_qwen_transformer(config)
+
+
 def test_tuple_dataset_rejects_empty_manifest(tmp_path):
     manifest_path = tmp_path / "tuples.json"
     manifest_path.write_text(json.dumps({"tuples": []}), encoding="utf-8")
@@ -457,7 +552,7 @@ def test_prepare_qat_model_partial_unfreeze_requires_sensitivity_target(tmp_path
     assert not model.transformer_blocks[0].attn.to_k.weight.requires_grad
 
 
-def test_train_qat_rejects_enabled_optional_loss_without_evaluator(tmp_path):
+def test_train_qat_rejects_enabled_optional_loss_without_target(tmp_path):
     tuple_path = tmp_path / "tuple.pt"
     _write_tuple(tuple_path)
     manifest_path = tmp_path / "tuples.json"
@@ -478,7 +573,31 @@ def test_train_qat_rejects_enabled_optional_loss_without_evaluator(tmp_path):
         )
 
 
-def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata(tmp_path):
+def test_train_qat_rejects_enabled_perceptual_loss_without_evaluator(tmp_path):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(
+        tuple_path,
+        optional_targets={"perceptual_target": torch.rand(1, 4, 8, 8)},
+    )
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            loss={"latent_weight": 1.0, "perceptual_weight": 1.0},
+        )
+    )
+
+    with pytest.raises(ValueError, match="concrete perceptual evaluator"):
+        train_qwen_image_layered_qat(
+            config,
+            transformer=_TinyQwenTransformer(),
+            linear_cls=nn.Linear,
+        )
+
+
+def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_losses(tmp_path):
     teacher = _TinyQwenTransformer()
     hidden_states = torch.randn(1, 2, 128)
     encoder_hidden_states = torch.randn(1, 3, 128)
@@ -494,7 +613,9 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata(tmp_path):
             txt_seq_lens=txt_seq_lens,
             return_dict=False,
         )[0].to(torch.bfloat16)
+    layered_rgba_target = torch.rand(1, 2, 4, 8, 4)
     composite_target = torch.rand(1, 4, 8, 8)
+    alpha_mask_target = torch.rand(1, 1, 16, 16)
     tuple_path = tmp_path / "tuple.pt"
     torch.save(
         {
@@ -508,14 +629,27 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata(tmp_path):
                 "return_dict": False,
             },
             "target_output": target_output,
+            "layered_rgba_target": layered_rgba_target,
             "composite_target": composite_target,
             "composite_prediction": composite_target.clone(),
+            "alpha_mask_target": alpha_mask_target,
         },
         tuple_path,
     )
     manifest_path = tmp_path / "tuples.json"
     _write_manifest(manifest_path, [tuple_path])
-    config = QwenImageLayeredQatConfig(**_base_config(tmp_path, tuple_manifest=str(manifest_path)))
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            loss={
+                "latent_weight": 1.0,
+                "layered_rgba_weight": 1.0,
+                "composite_weight": 1.0,
+                "alpha_mask_weight": 1.0,
+            },
+        )
+    )
 
     result = train_qwen_image_layered_qat(
         config,
@@ -533,8 +667,17 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata(tmp_path):
     validation_records = [record for record in metrics if record["phase"] == "validation"]
     assert validation_records
     assert "latent_reconstruction" in validation_records[-1]["loss_components"]
+    assert "layered_rgba_reconstruction" in validation_records[-1]["loss_components"]
+    assert "composite_reconstruction" in validation_records[-1]["loss_components"]
+    assert "alpha_mask_reconstruction" in validation_records[-1]["loss_components"]
+    assert validation_records[-1]["loss_components"]["composite_reconstruction"] > 0.0
+    assert "layered_rgba_psnr" in validation_records[-1]["quality_metrics"]
+    assert "layered_rgba_ssim" in validation_records[-1]["quality_metrics"]
     assert "composite_psnr" in validation_records[-1]["quality_metrics"]
     assert "composite_ssim" in validation_records[-1]["quality_metrics"]
+    assert validation_records[-1]["quality_metrics"]["composite_psnr"] < 120.0
+    assert "alpha_mask_psnr" in validation_records[-1]["quality_metrics"]
+    assert "alpha_mask_ssim" in validation_records[-1]["quality_metrics"]
     assert result.provenance_path.exists()
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
     assert provenance["tuple_count"] == 1

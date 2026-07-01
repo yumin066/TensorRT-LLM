@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import yaml
 from pydantic import Field, NonNegativeFloat, PositiveFloat, PositiveInt, model_validator
 
+from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8 import (
     MXFP8_BLOCK_SIZE,
@@ -75,6 +76,11 @@ _OPTIONAL_LOSS_TARGETS = {
     "composite": "composite_target",
     "alpha_mask": "alpha_mask_target",
     "perceptual": "perceptual_target",
+}
+_DIFFERENTIABLE_OPTIONAL_LOSSES = {
+    "layered_rgba": "layered_rgba_weight",
+    "composite": "composite_weight",
+    "alpha_mask": "alpha_mask_weight",
 }
 
 
@@ -440,6 +446,7 @@ def load_bf16_qwen_transformer(config: QwenImageLayeredQatConfig) -> LoadedTrans
 
     args = VisualGenArgs.from_yaml(config.visual_gen_args, model=config.model)
     _validate_visual_gen_args_for_linear_qat(args)
+    _validate_resolved_pipeline_config_for_linear_qat(args, config.model)
 
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
@@ -497,6 +504,48 @@ def _visual_gen_quant_config_enables_linear_quantization(quant_config: object) -
             return True
         return False
     return getattr(quant_config, "quant_algo", None) is not None
+
+
+def _validate_resolved_pipeline_config_for_linear_qat(args: VisualGenArgs, model: str) -> None:
+    pipeline_config = DiffusionPipelineConfig.from_pretrained(model, args=args)
+    _validate_quant_fields_for_linear_qat(pipeline_config, "resolved VisualGen pipeline config")
+    model_configs = getattr(pipeline_config, "model_configs", None)
+    if isinstance(model_configs, Mapping):
+        for component_name, model_config in model_configs.items():
+            _validate_quant_fields_for_linear_qat(
+                model_config,
+                f"resolved VisualGen model config {component_name}",
+            )
+
+
+def _validate_quant_fields_for_linear_qat(config_object: object, source_name: str) -> None:
+    quant_reason = _resolved_quantization_reason(config_object)
+    if quant_reason is not None:
+        raise ValueError(
+            "QAT training must load a BF16 transformer; "
+            f"{source_name} enables Linear quantization through {quant_reason}"
+        )
+
+
+def _resolved_quantization_reason(config_object: object) -> str | None:
+    quant_config = getattr(config_object, "quant_config", None)
+    if _visual_gen_quant_config_enables_linear_quantization(quant_config):
+        return "quant_config.quant_algo"
+    quant_config_dict = getattr(config_object, "quant_config_dict", None)
+    if isinstance(quant_config_dict, Mapping):
+        if quant_config_dict:
+            return "quant_config_dict"
+    elif quant_config_dict:
+        return "quant_config_dict"
+    if bool(getattr(config_object, "dynamic_weight_quant", False)):
+        return "dynamic_weight_quant"
+    if bool(getattr(config_object, "force_dynamic_quantization", False)):
+        return "dynamic activation quantization"
+    if bool(getattr(config_object, "dynamic_activation_quant", False)):
+        return "dynamic activation quantization"
+    if bool(getattr(config_object, "dynamic_activation_quantization", False)):
+        return "dynamic activation quantization"
+    return None
 
 
 def prepare_qat_model(
@@ -1075,13 +1124,8 @@ def _validate_loss_payloads(
                     f"latent reconstruction loss requires target_output: {sample.path}"
                 )
 
-    optional_components = {
-        "layered_rgba": loss_config.layered_rgba_weight,
-        "composite": loss_config.composite_weight,
-        "alpha_mask": loss_config.alpha_mask_weight,
-        "perceptual": loss_config.perceptual_weight,
-    }
-    for component_name, weight in optional_components.items():
+    for component_name, weight_name in _DIFFERENTIABLE_OPTIONAL_LOSSES.items():
+        weight = getattr(loss_config, weight_name)
         if weight == 0.0:
             continue
         target_key = _OPTIONAL_LOSS_TARGETS[component_name]
@@ -1095,9 +1139,22 @@ def _validate_loss_payloads(
                 f"{component_name} loss requires optional tensor {target_key}; "
                 f"missing in {missing_targets[:3]}"
             )
+
+    if loss_config.perceptual_weight > 0.0:
+        target_key = _OPTIONAL_LOSS_TARGETS["perceptual"]
+        missing_targets = [
+            str(sample.path)
+            for sample in dataset.samples
+            if target_key not in sample.optional_targets
+        ]
+        if missing_targets:
+            raise ValueError(
+                f"perceptual loss requires optional tensor {target_key}; "
+                f"missing in {missing_targets[:3]}"
+            )
         raise ValueError(
-            f"{component_name} loss requires a reconstruction evaluator hook; "
-            "the current trainer supports latent reconstruction loss only"
+            "perceptual loss requires a concrete perceptual evaluator; "
+            "the current trainer supports differentiable tensor reconstruction losses only"
         )
 
 
@@ -1124,7 +1181,63 @@ def _compute_loss(
         loss_components["latent_reconstruction"] = latent_loss
         total_loss = total_loss + latent_loss * float(loss_config.latent_weight)
 
+    for component_name, weight_name in _DIFFERENTIABLE_OPTIONAL_LOSSES.items():
+        weight = getattr(loss_config, weight_name)
+        if weight == 0.0:
+            continue
+        target_key = _OPTIONAL_LOSS_TARGETS[component_name]
+        target = sample.optional_targets[target_key].to(device=device)
+        prediction = _derive_optional_reconstruction(output, target, component_name, sample.path)
+        reconstruction_loss = F.mse_loss(prediction.float(), target.float())
+        loss_components[f"{component_name}_reconstruction"] = reconstruction_loss
+        total_loss = total_loss + reconstruction_loss * float(weight)
+
     return total_loss, loss_components
+
+
+def _derive_optional_reconstruction(
+    output: torch.Tensor,
+    target: torch.Tensor,
+    component_name: str,
+    sample_path: Path,
+) -> torch.Tensor:
+    if target.numel() == 0:
+        raise ValueError(f"{component_name} target must not be empty: {sample_path}")
+    if not torch.is_floating_point(target):
+        raise ValueError(f"{component_name} target must be floating point: {sample_path}")
+    if output.numel() == 0:
+        raise ValueError(
+            f"transformer output must not be empty for {component_name}: {sample_path}"
+        )
+    output_float = output.float()
+    target_float = target.float()
+    if output_float.shape == target_float.shape:
+        return output_float
+    if output_float.numel() == target_float.numel():
+        return output_float.reshape_as(target_float)
+
+    output_batch = int(output_float.shape[0]) if output_float.ndim > 0 else 1
+    target_batch = int(target_float.shape[0]) if target_float.ndim > 0 else 1
+    if output_batch == target_batch and target_float.ndim > 0:
+        flat_output = output_float.reshape(output_batch, -1)
+        target_width = int(target_float.numel() // target_batch)
+        return _resize_flat_features(flat_output, target_width).reshape_as(target_float)
+
+    flat_output = output_float.reshape(1, -1)
+    return _resize_flat_features(flat_output, int(target_float.numel())).reshape_as(target_float)
+
+
+def _resize_flat_features(flat_output: torch.Tensor, target_width: int) -> torch.Tensor:
+    if target_width <= 0:
+        raise ValueError("target reconstruction width must be positive")
+    if flat_output.shape[-1] == target_width:
+        return flat_output
+    return F.interpolate(
+        flat_output.unsqueeze(1),
+        size=target_width,
+        mode="linear",
+        align_corners=False,
+    ).squeeze(1)
 
 
 def _loss_components_to_float(
@@ -1153,7 +1266,7 @@ def _validate(
             losses.append(float(loss.detach().cpu()))
             for name, value in _loss_components_to_float(loss_components).items():
                 component_totals[name] = component_totals.get(name, 0.0) + value
-            for name, value in _optional_quality_metrics(sample).items():
+            for name, value in _optional_quality_metrics(output, sample).items():
                 quality_totals[name] = quality_totals.get(name, 0.0) + value
                 quality_counts[name] = quality_counts.get(name, 0) + 1
     transformer.train()
@@ -1171,18 +1284,17 @@ def _validate(
     )
 
 
-def _optional_quality_metrics(sample: TransformerTupleSample) -> dict[str, float]:
+def _optional_quality_metrics(
+    output: torch.Tensor,
+    sample: TransformerTupleSample,
+) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for prefix in ("layered_rgba", "composite", "alpha_mask"):
-        prediction = sample.optional_targets.get(f"{prefix}_prediction")
         target = sample.optional_targets.get(f"{prefix}_target")
-        if prediction is None or target is None:
+        if target is None:
             continue
-        if prediction.shape != target.shape:
-            raise ValueError(
-                f"{prefix} prediction and target shapes must match for quality metrics, got "
-                f"{tuple(prediction.shape)} vs {tuple(target.shape)}: {sample.path}"
-            )
+        target = target.to(device=output.device)
+        prediction = _derive_optional_reconstruction(output, target, prefix, sample.path)
         metrics[f"{prefix}_psnr"] = _psnr(prediction, target)
         metrics[f"{prefix}_ssim"] = _simple_ssim(prediction, target)
     return metrics
