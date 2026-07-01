@@ -270,6 +270,103 @@ def test_config_accepts_sgd_optimizer(tmp_path):
     assert config.optimizer.foreach is False
 
 
+def test_config_accepts_fsdp_distributed_mode(tmp_path):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            distributed={"mode": "fsdp"},
+        )
+    )
+
+    assert config.distributed.mode == "fsdp"
+
+
+def test_distributed_init_from_torchrun_env_sets_cuda_device(tmp_path, monkeypatch):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            device="cuda",
+            distributed={"mode": "fsdp"},
+        )
+    )
+    calls = {}
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: calls.update(device=device))
+
+    def _init_process_group(*, backend):
+        calls["backend"] = backend
+
+    monkeypatch.setattr(torch.distributed, "init_process_group", _init_process_group)
+
+    assert qat_train._maybe_init_distributed_from_env(config)
+    assert calls == {"device": 3, "backend": "nccl"}
+
+
+def test_distributed_init_requires_torchrun_env(tmp_path, monkeypatch):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            device="cpu",
+            distributed={"mode": "ddp"},
+        )
+    )
+    for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    with pytest.raises(ValueError, match="RANK, WORLD_SIZE, LOCAL_RANK"):
+        qat_train._maybe_init_distributed_from_env(config)
+
+
+def test_normalize_state_name_strips_fsdp_and_checkpoint_wrappers():
+    assert (
+        qat_train._normalize_state_name(
+            "_fsdp_wrapped_module.transformer_blocks.0._checkpoint_wrapped_module."
+            "img_attn.to_q.adapter_up.weight"
+        )
+        == "transformer_blocks.0.img_attn.to_q.adapter_up.weight"
+    )
+    assert (
+        qat_train._normalize_state_name(
+            "module._checkpoint_wrapped_module.transformer_blocks.1.img_mlp.down_proj."
+            "adapter_down.weight"
+        )
+        == "transformer_blocks.1.img_mlp.down_proj.adapter_down.weight"
+    )
+
+
+def test_trainable_parameter_names_from_injections_prefix_module_names():
+    injections = (
+        qat_train.QatInjectionInfo(
+            module_name="transformer_blocks.0.img_attn.to_q",
+            block_index=0,
+            role="attn.to_q",
+            recipe="lora_adapter",
+            trainable_parameter_names=("lora_down.weight", "lora_up.weight"),
+        ),
+        qat_train.QatInjectionInfo(
+            module_name="transformer_blocks.59.img_mlp.down_proj",
+            block_index=59,
+            role="img_mlp.down_proj",
+            recipe="partial_unfreeze",
+            trainable_parameter_names=("weight", "bias"),
+        ),
+    )
+
+    assert qat_train._trainable_parameter_names_from_injections(injections) == {
+        "transformer_blocks.0.img_attn.to_q.lora_down.weight",
+        "transformer_blocks.0.img_attn.to_q.lora_up.weight",
+        "transformer_blocks.59.img_mlp.down_proj.weight",
+        "transformer_blocks.59.img_mlp.down_proj.bias",
+    }
+
+
 def test_config_rejects_partial_unfreeze_without_sensitivity(tmp_path):
     with pytest.raises(ValidationError, match="disabled"):
         QwenImageLayeredQatConfig(
@@ -712,7 +809,13 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
     assert result.last_checkpoint_path.exists()
     assert result.metrics_path.exists()
     metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    train_records = [record for record in metrics if record["phase"] == "train"]
     validation_records = [record for record in metrics if record["phase"] == "validation"]
+    assert train_records
+    assert train_records[-1]["step_time_seconds"] >= 0.0
+    assert train_records[-1]["peak_cuda_memory_bytes"] is None
+    assert train_records[-1]["rank"] == 0
+    assert train_records[-1]["world_size"] == 1
     assert validation_records
     assert "latent_reconstruction" in validation_records[-1]["loss_components"]
     assert "layered_rgba_reconstruction" in validation_records[-1]["loss_components"]
@@ -729,11 +832,19 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
     assert result.provenance_path.exists()
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
     assert provenance["tuple_count"] == 1
+    assert provenance["distributed"]["mode"] == "none"
+    assert provenance["distributed"]["rank"] == 0
+    assert provenance["distributed"]["world_size"] == 1
     assert provenance["activation_checkpointed_blocks"] == 0
     assert provenance["injections"][0]["role"] == "attn.to_q"
     assert provenance["best_checkpoint_path"] == str(result.best_checkpoint_path)
     assert provenance["last_checkpoint_path"] == str(result.last_checkpoint_path)
     assert provenance["best_validation_step"] == result.best_validation_step
+    metrics_jsonl = [
+        json.loads(line)
+        for line in (result.output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert metrics_jsonl[0]["phase"] == "train"
 
 
 def test_train_qat_sgd_optimizer_keeps_state_empty(tmp_path, monkeypatch):
@@ -769,6 +880,30 @@ def test_train_qat_sgd_optimizer_keeps_state_empty(tmp_path, monkeypatch):
     assert created_optimizers[0].state == {}
     checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=False)
     assert checkpoint["config"]["optimizer"]["name"] == "sgd"
+
+
+def test_train_qat_non_main_rank_does_not_write_artifacts(tmp_path, monkeypatch):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+        )
+    )
+    monkeypatch.setattr(qat_train, "_is_main_process", lambda: False)
+    monkeypatch.setattr(qat_train, "_distributed_barrier", lambda: None)
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=_TinyQwenTransformer(),
+        linear_cls=nn.Linear,
+    )
+
+    assert result.best_checkpoint_path == tmp_path / "out" / "checkpoint_best.pt"
+    assert not (tmp_path / "out").exists()
 
 
 def test_train_qat_best_checkpoint_is_not_overwritten_by_later_last_checkpoint(

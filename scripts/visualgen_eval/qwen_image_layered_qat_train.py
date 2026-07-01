@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import functools
 import json
 import math
+import os
 import platform
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TextIO
 
 import torch
 import torch.nn as nn
@@ -459,13 +462,16 @@ def load_bf16_qwen_transformer(config: QwenImageLayeredQatConfig) -> LoadedTrans
     if not config.model or not config.visual_gen_args:
         raise ValueError("model and visual_gen_args are required when no transformer is provided")
 
+    _debug_log("loading VisualGenArgs")
     args = VisualGenArgs.from_yaml(config.visual_gen_args, model=config.model)
     _validate_visual_gen_args_for_linear_qat(args)
     _validate_resolved_pipeline_config_for_linear_qat(args, config.model)
 
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
+    _debug_log("creating PipelineLoader")
     loader = PipelineLoader(args, device=config.device)
+    _debug_log("loading BF16 transformer pipeline")
     pipeline = loader.load(
         skip_warmup=True,
         skip_components=[
@@ -475,6 +481,7 @@ def load_bf16_qwen_transformer(config: QwenImageLayeredQatConfig) -> LoadedTrans
             PipelineComponent.SCHEDULER,
         ],
     )
+    _debug_log("loaded BF16 transformer pipeline")
     transformer = getattr(pipeline, "transformer", None)
     if transformer is None:
         cleanup = getattr(pipeline, "cleanup", None)
@@ -663,7 +670,9 @@ def train_qwen_image_layered_qat(
     dataset = TransformerTupleDataset(config.tuple_manifest)
     _validate_loss_payloads(config.loss, dataset)
     output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if _is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+    _distributed_barrier()
     best_checkpoint_path = output_dir / "checkpoint_best.pt"
     last_checkpoint_path = output_dir / "checkpoint_last.pt"
     preexisting_checkpoints = [
@@ -679,24 +688,36 @@ def train_qwen_image_layered_qat(
     provenance_path = output_dir / "provenance.json"
 
     loaded: LoadedTransformer | None = None
-    if transformer is None:
-        loaded = load_bf16_qwen_transformer(config)
-        transformer = loaded.transformer
-
     try:
+        if transformer is None:
+            _debug_log("loading transformer")
+            loaded = load_bf16_qwen_transformer(config)
+            transformer = loaded.transformer
+            _debug_log("transformer loaded")
+        _debug_log("initializing distributed process group")
+        _maybe_init_distributed_from_env(config)
+        _debug_log("distributed process group ready")
         device = torch.device(config.device)
+        _debug_log(f"moving transformer to {device}")
         transformer.to(device)
         transformer.train()
+        _debug_log("preparing QAT injections")
         injections = prepare_qat_model(transformer, config, linear_cls=linear_cls)
+        _debug_log(f"prepared {len(injections)} QAT injections")
         activation_checkpointed_blocks = 0
         if config.activation_checkpointing:
+            _debug_log("enabling activation checkpointing")
             activation_checkpointed_blocks = _enable_qat_activation_checkpointing(transformer)
+            _debug_log(f"activation checkpointed blocks: {activation_checkpointed_blocks}")
+        _debug_log("wrapping distributed model")
         trained_model = _maybe_wrap_distributed(transformer, config)
+        _debug_log("distributed model ready")
         trainable_parameters = [
             parameter for parameter in trained_model.parameters() if parameter.requires_grad
         ]
         if not trainable_parameters:
             raise ValueError("QAT training has no trainable parameters")
+        _debug_log(f"building optimizer for {len(trainable_parameters)} trainable tensors")
         optimizer = _build_optimizer(trainable_parameters, config.optimizer)
 
         train_indices, validation_indices = _split_dataset_indices(
@@ -709,8 +730,16 @@ def train_qwen_image_layered_qat(
         wrote_best_checkpoint = False
 
         step = 0
-        with metrics_jsonl_path.open("w", encoding="utf-8") as metrics_jsonl:
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        metrics_jsonl = (
+            metrics_jsonl_path.open("w", encoding="utf-8") if _is_main_process() else None
+        )
+        try:
             for step in range(1, int(config.max_steps) + 1):
+                _debug_log(f"train step {step} start")
+                _synchronize_device(device)
+                step_started_at = time.perf_counter()
                 sample = dataset[train_indices[(step - 1) % len(train_indices)]]
                 optimizer.zero_grad(set_to_none=True)
                 output = _forward_sample(trained_model, sample, device)
@@ -720,6 +749,7 @@ def train_qwen_image_layered_qat(
                     raise RuntimeError(f"non-finite training loss at step {step}: {loss_value}")
                 loss.backward()
                 optimizer.step()
+                _synchronize_device(device)
 
                 train_record = {
                     "phase": "train",
@@ -727,9 +757,14 @@ def train_qwen_image_layered_qat(
                     "loss": loss_value,
                     "loss_components": _loss_components_to_float(loss_components),
                     "sample_index": int(train_indices[(step - 1) % len(train_indices)]),
+                    "step_time_seconds": time.perf_counter() - step_started_at,
+                    "peak_cuda_memory_bytes": _peak_cuda_memory_bytes(device),
+                    "rank": _distributed_rank(),
+                    "world_size": _distributed_world_size(),
                 }
                 metrics.append(train_record)
-                metrics_jsonl.write(json.dumps(train_record, sort_keys=True) + "\n")
+                _write_jsonl_record(metrics_jsonl, train_record)
+                _debug_log(f"train step {step} wrote metrics")
 
                 should_validate = step % int(config.validation_interval_steps) == 0
                 should_checkpoint = step % int(config.checkpoint_interval_steps) == 0
@@ -749,9 +784,11 @@ def train_qwen_image_layered_qat(
                         "loss_components": validation_metrics.loss_components,
                         "quality_metrics": validation_metrics.quality_metrics,
                         "sample_count": len(validation_indices),
+                        "rank": _distributed_rank(),
+                        "world_size": _distributed_world_size(),
                     }
                     metrics.append(validation_record)
-                    metrics_jsonl.write(json.dumps(validation_record, sort_keys=True) + "\n")
+                    _write_jsonl_record(metrics_jsonl, validation_record)
                     if validation_loss < best_validation_loss - 1.0e-8:
                         best_validation_loss = validation_loss
                         best_validation_step = step
@@ -784,6 +821,9 @@ def train_qwen_image_layered_qat(
                         best_checkpoint_path,
                         last_checkpoint_path,
                     )
+        finally:
+            if metrics_jsonl is not None:
+                metrics_jsonl.close()
 
         if not wrote_best_checkpoint:
             raise RuntimeError("QAT training completed without a finite best validation checkpoint")
@@ -809,10 +849,12 @@ def train_qwen_image_layered_qat(
             best_validation_loss=best_validation_loss,
             best_validation_step=best_validation_step,
         )
-        provenance_path.write_text(
-            json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        if _is_main_process():
+            provenance_path.write_text(
+                json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        _distributed_barrier()
         return QatTrainingResult(
             output_dir=output_dir,
             checkpoint_path=best_checkpoint_path,
@@ -1142,7 +1184,128 @@ def _maybe_wrap_distributed(
 
     from torch.distributed.fsdp import FullyShardedDataParallel
 
-    return FullyShardedDataParallel(transformer)
+    fsdp_kwargs: dict[str, object] = {"use_orig_params": True}
+    auto_wrap_policy = _fsdp_transformer_block_auto_wrap_policy(transformer)
+    if auto_wrap_policy is not None:
+        fsdp_kwargs["auto_wrap_policy"] = auto_wrap_policy
+    if torch.device(config.device).type == "cuda":
+        device_id = config.distributed.device_id
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+        fsdp_kwargs["device_id"] = torch.device("cuda", device_id)
+    return FullyShardedDataParallel(transformer, **fsdp_kwargs)
+
+
+def _fsdp_transformer_block_auto_wrap_policy(
+    transformer: nn.Module,
+) -> Callable[..., bool] | None:
+    blocks = getattr(transformer, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList) or len(blocks) == 0:
+        return None
+
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    block_classes = {type(block) for block in blocks}
+    return functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=block_classes,
+    )
+
+
+def _maybe_init_distributed_from_env(config: QwenImageLayeredQatConfig) -> bool:
+    if config.distributed.mode == "none":
+        return False
+    if not torch.distributed.is_available():
+        raise ValueError("distributed training requires torch.distributed")
+    if torch.distributed.is_initialized():
+        return False
+
+    required_env = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+    missing_env = [name for name in required_env if name not in os.environ]
+    if missing_env:
+        formatted = ", ".join(missing_env)
+        raise ValueError(
+            f"distributed training requires torchrun environment variables: {formatted}"
+        )
+
+    _bind_distributed_device_from_env(config)
+    backend = "nccl" if torch.device(config.device).type == "cuda" else "gloo"
+    torch.distributed.init_process_group(backend=backend)
+    return True
+
+
+def _bind_distributed_device_from_env(config: QwenImageLayeredQatConfig) -> None:
+    if config.distributed.mode == "none":
+        return
+    if torch.device(config.device).type != "cuda":
+        return
+    local_rank_text = os.environ.get("LOCAL_RANK")
+    if local_rank_text is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(local_rank_text))
+
+
+def _destroy_distributed_if_initialized(initialized_here: bool) -> None:
+    if initialized_here and torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+def _distributed_is_initialized() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _distributed_rank() -> int:
+    if not _distributed_is_initialized():
+        return 0
+    return int(torch.distributed.get_rank())
+
+
+def _distributed_world_size() -> int:
+    if not _distributed_is_initialized():
+        return 1
+    return int(torch.distributed.get_world_size())
+
+
+def _is_main_process() -> bool:
+    return _distributed_rank() == 0
+
+
+def _distributed_barrier() -> None:
+    if _distributed_is_initialized():
+        torch.distributed.barrier()
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _peak_cuda_memory_bytes(device: torch.device) -> int | None:
+    if device.type != "cuda":
+        return None
+    return int(torch.cuda.max_memory_allocated(device))
+
+
+def _write_jsonl_record(
+    metrics_jsonl: TextIO | None,
+    record: Mapping[str, object],
+) -> None:
+    if metrics_jsonl is None:
+        return
+    metrics_jsonl.write(json.dumps(record, sort_keys=True) + "\n")
+    metrics_jsonl.flush()
+
+
+def _debug_log(message: str) -> None:
+    if not os.environ.get("QWEN_QAT_DEBUG"):
+        return
+    rank = os.environ.get("RANK", "0")
+    local_rank = os.environ.get("LOCAL_RANK", "0")
+    print(
+        f"[qat-debug rank={rank} local_rank={local_rank}] {message}",
+        flush=True,
+    )
 
 
 def _enable_qat_activation_checkpointing(transformer: nn.Module) -> int:
@@ -1439,6 +1602,82 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model
 
 
+def _contains_fsdp(model: nn.Module) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+    except ImportError:
+        return False
+    return any(isinstance(module, FullyShardedDataParallel) for module in model.modules())
+
+
+def _normalize_state_name(name: str) -> str:
+    prefixes = ("module.", "_fsdp_wrapped_module.", "_checkpoint_wrapped_module.")
+    normalized = name
+    changed = True
+    while changed:
+        changed = False
+        if "._checkpoint_wrapped_module." in normalized:
+            normalized = normalized.replace("._checkpoint_wrapped_module.", ".")
+            changed = True
+        for prefix in prefixes:
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :]
+                changed = True
+    return normalized
+
+
+def _trainable_parameter_names_from_injections(
+    injections: Sequence[QatInjectionInfo],
+) -> set[str]:
+    return {
+        _normalize_state_name(f"{injection.module_name}.{parameter_name}")
+        for injection in injections
+        for parameter_name in injection.trainable_parameter_names
+    }
+
+
+def _requires_grad_parameter_names(model: nn.Module) -> set[str]:
+    return {
+        _normalize_state_name(name)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def _trainable_state_dict_from_model(
+    model: nn.Module,
+    trainable_names: set[str],
+) -> dict[str, torch.Tensor]:
+    unwrapped = _unwrap_model(model)
+    return {
+        _normalize_state_name(name): parameter.detach().cpu()
+        for name, parameter in unwrapped.named_parameters()
+        if _normalize_state_name(name) in trainable_names
+    }
+
+
+def _trainable_state_dict_from_fsdp(
+    model: nn.Module,
+    trainable_names: set[str],
+) -> dict[str, torch.Tensor]:
+    from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel, StateDictType
+
+    state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FullyShardedDataParallel.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        state_config,
+    ):
+        full_state_dict = model.state_dict()
+    if not _is_main_process():
+        return {}
+    return {
+        _normalize_state_name(name): tensor.detach().cpu()
+        for name, tensor in full_state_dict.items()
+        if _normalize_state_name(name) in trainable_names
+    }
+
+
 def _save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -1450,12 +1689,21 @@ def _save_checkpoint(
     best_checkpoint_path: Path,
     last_checkpoint_path: Path,
 ) -> None:
-    unwrapped = _unwrap_model(model)
-    trainable_state_dict = {
-        name: parameter.detach().cpu()
-        for name, parameter in unwrapped.named_parameters()
-        if parameter.requires_grad
-    }
+    trainable_names = _trainable_parameter_names_from_injections(injections)
+    if not trainable_names:
+        trainable_names = _requires_grad_parameter_names(model)
+    if _contains_fsdp(model):
+        trainable_state_dict = _trainable_state_dict_from_fsdp(model, trainable_names)
+    else:
+        if not _is_main_process():
+            return
+        trainable_state_dict = _trainable_state_dict_from_model(model, trainable_names)
+    if not _is_main_process():
+        return
+    if trainable_names and not trainable_state_dict:
+        raise RuntimeError(
+            "QAT checkpoint contains no trainable tensors after state-dict filtering"
+        )
     checkpoint = {
         "format": TRAINING_FORMAT,
         "config": config.model_dump(),
@@ -1502,12 +1750,23 @@ def _build_provenance(
         "python": platform.python_version(),
         "torch": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
+        "distributed": {
+            "mode": config.distributed.mode,
+            "rank": _distributed_rank(),
+            "world_size": _distributed_world_size(),
+            "local_rank": os.environ.get("LOCAL_RANK"),
+        },
         "config": config.model_dump(),
         "tuple_manifest": str(dataset.manifest_path),
         "tuple_count": len(dataset),
         "tuple_paths": [str(path) for path in dataset.paths],
         "train_steps": train_steps,
         "activation_checkpointed_blocks": activation_checkpointed_blocks,
+        "peak_cuda_memory_bytes": (
+            _peak_cuda_memory_bytes(torch.device(config.device))
+            if torch.cuda.is_available()
+            else None
+        ),
         "best_checkpoint_path": str(best_checkpoint_path),
         "last_checkpoint_path": str(last_checkpoint_path),
         "best_validation_loss": best_validation_loss,
@@ -1540,23 +1799,29 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_qat_config(args.config)
-    result = train_qwen_image_layered_qat(config)
-    print(
-        json.dumps(
-            {
-                "checkpoint_path": str(result.checkpoint_path),
-                "best_checkpoint_path": str(result.best_checkpoint_path),
-                "last_checkpoint_path": str(result.last_checkpoint_path),
-                "metrics_path": str(result.metrics_path),
-                "provenance_path": str(result.provenance_path),
-                "train_steps": result.train_steps,
-                "best_validation_loss": result.best_validation_loss,
-                "best_validation_step": result.best_validation_step,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    _bind_distributed_device_from_env(config)
+    try:
+        result = train_qwen_image_layered_qat(config)
+        if _is_main_process():
+            print(
+                json.dumps(
+                    {
+                        "checkpoint_path": str(result.checkpoint_path),
+                        "best_checkpoint_path": str(result.best_checkpoint_path),
+                        "last_checkpoint_path": str(result.last_checkpoint_path),
+                        "metrics_path": str(result.metrics_path),
+                        "provenance_path": str(result.provenance_path),
+                        "train_steps": result.train_steps,
+                        "best_validation_loss": result.best_validation_loss,
+                        "best_validation_step": result.best_validation_step,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+    finally:
+        if config.distributed.mode != "none":
+            _destroy_distributed_if_initialized(initialized_here=True)
 
 
 if __name__ == "__main__":
