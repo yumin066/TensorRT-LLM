@@ -48,6 +48,20 @@ class _TinyQwenBlock(nn.Module):
         super().__init__()
         self.attn = _TinyQwenAttention()
 
+    def forward(
+        self,
+        *,
+        hidden_states,
+        encoder_hidden_states,
+        temb,
+        image_rotary_emb=None,
+        attention_mask=None,
+        timestep=None,
+        txt_seq_lens=None,
+    ):
+        del image_rotary_emb, attention_mask, timestep, txt_seq_lens
+        return encoder_hidden_states, self.attn.to_q(hidden_states) + temb * 0.0
+
 
 class _TinyQwenTransformer(nn.Module):
     def __init__(self) -> None:
@@ -66,15 +80,22 @@ class _TinyQwenTransformer(nn.Module):
         additional_t_cond=None,
         return_dict=False,
     ):
-        del encoder_hidden_states, img_shapes, txt_seq_lens, additional_t_cond, return_dict
+        del img_shapes, additional_t_cond, return_dict
         timestep_tensor = timestep
         if not isinstance(timestep_tensor, torch.Tensor):
             timestep_tensor = torch.tensor(float(timestep), dtype=hidden_states.dtype)
         timestep_tensor = timestep_tensor.to(device=hidden_states.device, dtype=hidden_states.dtype)
         while timestep_tensor.ndim < hidden_states.ndim:
             timestep_tensor = timestep_tensor.unsqueeze(-1)
-        output = self.transformer_blocks[0].attn.to_q(hidden_states)
-        return (output + timestep_tensor * 0.0,)
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=timestep_tensor,
+                timestep=timestep,
+                txt_seq_lens=txt_seq_lens,
+            )
+        return (hidden_states,)
 
 
 def _base_config(tmp_path, **overrides) -> dict:
@@ -681,4 +702,63 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
     assert result.provenance_path.exists()
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
     assert provenance["tuple_count"] == 1
+    assert provenance["activation_checkpointed_blocks"] == 0
     assert provenance["injections"][0]["role"] == "attn.to_q"
+
+
+def test_train_qat_activation_checkpointing_preserves_parameter_names(tmp_path):
+    teacher = _TinyQwenTransformer()
+    hidden_states = torch.randn(1, 2, 128)
+    encoder_hidden_states = torch.randn(1, 3, 128)
+    timestep = torch.tensor([1.0])
+    img_shapes = [[(1, 1, 2)]]
+    txt_seq_lens = [3]
+    with torch.no_grad():
+        target_output = teacher(
+            hidden_states,
+            encoder_hidden_states,
+            timestep=timestep,
+            img_shapes=img_shapes,
+            txt_seq_lens=txt_seq_lens,
+            return_dict=False,
+        )[0].to(torch.bfloat16)
+    tuple_path = tmp_path / "tuple.pt"
+    torch.save(
+        {
+            "args": [],
+            "kwargs": {
+                "hidden_states": hidden_states,
+                "encoder_hidden_states": encoder_hidden_states,
+                "timestep": timestep,
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+                "return_dict": False,
+            },
+            "target_output": target_output,
+        },
+        tuple_path,
+    )
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            activation_checkpointing=True,
+        )
+    )
+    model = _TinyQwenTransformer()
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=model,
+        linear_cls=nn.Linear,
+    )
+
+    checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["config"]["activation_checkpointing"] is True
+    assert checkpoint["injections"][0]["module_name"] == "transformer_blocks.0.attn.to_q"
+    assert all(".block." not in name for name in checkpoint["trainable_parameter_names"])
+    provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
+    assert provenance["activation_checkpointed_blocks"] == 1
+    assert getattr(model.transformer_blocks[0], "_qat_activation_checkpointing_enabled")

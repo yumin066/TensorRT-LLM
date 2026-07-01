@@ -252,6 +252,10 @@ class QwenImageLayeredQatConfig(StrictBaseModel):
         default_factory=DistributedConfig,
         description="Optional distributed wrapper settings.",
     )
+    activation_checkpointing: bool = Field(
+        default=False,
+        description="Enable block-level activation checkpointing for memory-heavy QAT pilots.",
+    )
     debug_allow_short_run: bool = Field(
         default=False,
         description="Allows sub-smoke step counts only for unit tests and local smoke fixtures.",
@@ -660,6 +664,9 @@ def train_qwen_image_layered_qat(
         transformer.to(device)
         transformer.train()
         injections = prepare_qat_model(transformer, config, linear_cls=linear_cls)
+        activation_checkpointed_blocks = 0
+        if config.activation_checkpointing:
+            activation_checkpointed_blocks = _enable_qat_activation_checkpointing(transformer)
         trained_model = _maybe_wrap_distributed(transformer, config)
         trainable_parameters = [
             parameter for parameter in trained_model.parameters() if parameter.requires_grad
@@ -756,7 +763,13 @@ def train_qwen_image_layered_qat(
                 metrics,
                 best_validation_loss,
             )
-        provenance = _build_provenance(config, dataset, injections, step)
+        provenance = _build_provenance(
+            config,
+            dataset,
+            injections,
+            step,
+            activation_checkpointed_blocks=activation_checkpointed_blocks,
+        )
         provenance_path.write_text(
             json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8"
         )
@@ -1066,6 +1079,37 @@ def _maybe_wrap_distributed(
     return FullyShardedDataParallel(transformer)
 
 
+def _enable_qat_activation_checkpointing(transformer: nn.Module) -> int:
+    """Checkpoint transformer block forwards without changing module names."""
+    from torch.utils.checkpoint import checkpoint
+
+    blocks = getattr(transformer, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList):
+        raise ValueError("activation_checkpointing requires transformer.transformer_blocks")
+
+    enabled = 0
+    for block in blocks:
+        if bool(getattr(block, "_qat_activation_checkpointing_enabled", False)):
+            continue
+        original_forward = block.forward
+
+        def _checkpointed_forward(*args, _original_forward=original_forward, **kwargs):
+            return checkpoint(
+                _original_forward,
+                *args,
+                use_reentrant=False,
+                **kwargs,
+            )
+
+        block.forward = _checkpointed_forward
+        setattr(block, "_qat_activation_checkpointing_enabled", True)
+        enabled += 1
+
+    if enabled == 0:
+        raise ValueError("activation_checkpointing found no new transformer blocks to wrap")
+    return enabled
+
+
 def _split_dataset_indices(
     dataset: TransformerTupleDataset,
     validation_fraction: float,
@@ -1370,6 +1414,8 @@ def _build_provenance(
     dataset: TransformerTupleDataset,
     injections: Sequence[QatInjectionInfo],
     train_steps: int,
+    *,
+    activation_checkpointed_blocks: int,
 ) -> dict[str, object]:
     return {
         "format": TRAINING_FORMAT,
@@ -1384,6 +1430,7 @@ def _build_provenance(
         "tuple_count": len(dataset),
         "tuple_paths": [str(path) for path in dataset.paths],
         "train_steps": train_steps,
+        "activation_checkpointed_blocks": activation_checkpointed_blocks,
         "injections": [_injection_to_dict(injection) for injection in injections],
     }
 
