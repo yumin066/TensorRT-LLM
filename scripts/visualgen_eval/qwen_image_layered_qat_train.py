@@ -95,6 +95,10 @@ class OptimizerConfig(StrictBaseModel):
         description="AdamW beta coefficients.",
     )
     eps: PositiveFloat = Field(default=1.0e-8, description="AdamW epsilon.")
+    foreach: bool | None = Field(
+        default=None,
+        description="Optional AdamW foreach implementation switch for memory-sensitive runs.",
+    )
 
     @model_validator(mode="after")
     def _validate_betas(self) -> "OptimizerConfig":
@@ -679,6 +683,7 @@ def train_qwen_image_layered_qat(
             betas=config.optimizer.betas,
             eps=float(config.optimizer.eps),
             weight_decay=float(config.optimizer.weight_decay),
+            foreach=config.optimizer.foreach,
         )
 
         train_indices, validation_indices = _split_dataset_indices(

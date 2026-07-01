@@ -246,6 +246,17 @@ def test_config_rejects_all_zero_loss(tmp_path):
         )
 
 
+def test_config_accepts_optimizer_foreach_override(tmp_path):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            optimizer={"learning_rate": 1.0e-3, "foreach": False},
+        )
+    )
+
+    assert config.optimizer.foreach is False
+
+
 def test_config_rejects_partial_unfreeze_without_sensitivity(tmp_path):
     with pytest.raises(ValidationError, match="disabled"):
         QwenImageLayeredQatConfig(
