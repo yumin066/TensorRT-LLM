@@ -355,10 +355,13 @@ class QatTrainingResult:
 
     output_dir: Path
     checkpoint_path: Path
+    best_checkpoint_path: Path
+    last_checkpoint_path: Path
     metrics_path: Path
     provenance_path: Path
     train_steps: int
     best_validation_loss: float
+    best_validation_step: int | None
     injections: tuple[QatInjectionInfo, ...]
 
 
@@ -691,8 +694,10 @@ def train_qwen_image_layered_qat(
         )
         metrics: list[dict[str, object]] = []
         best_validation_loss = float("inf")
+        best_validation_step: int | None = None
         stale_validation_count = 0
-        checkpoint_path = output_dir / "checkpoint_last.pt"
+        best_checkpoint_path = output_dir / "checkpoint_best.pt"
+        last_checkpoint_path = output_dir / "checkpoint_last.pt"
         metrics_path = output_dir / "metrics.json"
         metrics_jsonl_path = output_dir / "metrics.jsonl"
         provenance_path = output_dir / "provenance.json"
@@ -736,14 +741,18 @@ def train_qwen_image_layered_qat(
                     validation_loss = validation_metrics.loss
                     if validation_loss < best_validation_loss - 1.0e-8:
                         best_validation_loss = validation_loss
+                        best_validation_step = step
                         stale_validation_count = 0
                         _save_checkpoint(
-                            checkpoint_path,
+                            best_checkpoint_path,
                             trained_model,
                             config,
                             injections,
                             metrics,
                             best_validation_loss,
+                            best_validation_step,
+                            best_checkpoint_path,
+                            last_checkpoint_path,
                         )
                     else:
                         stale_validation_count += 1
@@ -751,29 +760,40 @@ def train_qwen_image_layered_qat(
                         break
                 elif should_checkpoint:
                     _save_checkpoint(
-                        checkpoint_path,
+                        last_checkpoint_path,
                         trained_model,
                         config,
                         injections,
                         metrics,
                         best_validation_loss,
+                        best_validation_step,
+                        best_checkpoint_path,
+                        last_checkpoint_path,
                     )
 
-        if not checkpoint_path.exists():
-            _save_checkpoint(
-                checkpoint_path,
-                trained_model,
-                config,
-                injections,
-                metrics,
-                best_validation_loss,
-            )
+        if not best_checkpoint_path.exists():
+            raise RuntimeError("QAT training completed without a best validation checkpoint")
+        _save_checkpoint(
+            last_checkpoint_path,
+            trained_model,
+            config,
+            injections,
+            metrics,
+            best_validation_loss,
+            best_validation_step,
+            best_checkpoint_path,
+            last_checkpoint_path,
+        )
         provenance = _build_provenance(
             config,
             dataset,
             injections,
             step,
             activation_checkpointed_blocks=activation_checkpointed_blocks,
+            best_checkpoint_path=best_checkpoint_path,
+            last_checkpoint_path=last_checkpoint_path,
+            best_validation_loss=best_validation_loss,
+            best_validation_step=best_validation_step,
         )
         provenance_path.write_text(
             json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8"
@@ -781,11 +801,14 @@ def train_qwen_image_layered_qat(
         metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
         return QatTrainingResult(
             output_dir=output_dir,
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=best_checkpoint_path,
+            best_checkpoint_path=best_checkpoint_path,
+            last_checkpoint_path=last_checkpoint_path,
             metrics_path=metrics_path,
             provenance_path=provenance_path,
             train_steps=step,
             best_validation_loss=best_validation_loss,
+            best_validation_step=best_validation_step,
             injections=injections,
         )
     finally:
@@ -1385,6 +1408,9 @@ def _save_checkpoint(
     injections: Sequence[QatInjectionInfo],
     metrics: Sequence[Mapping[str, object]],
     best_validation_loss: float,
+    best_validation_step: int | None,
+    best_checkpoint_path: Path,
+    last_checkpoint_path: Path,
 ) -> None:
     unwrapped = _unwrap_model(model)
     trainable_state_dict = {
@@ -1400,6 +1426,10 @@ def _save_checkpoint(
         "injections": [_injection_to_dict(injection) for injection in injections],
         "metrics": list(metrics),
         "best_validation_loss": best_validation_loss,
+        "best_validation_step": best_validation_step,
+        "checkpoint_path": str(path),
+        "best_checkpoint_path": str(best_checkpoint_path),
+        "last_checkpoint_path": str(last_checkpoint_path),
     }
     torch.save(checkpoint, path)
 
@@ -1421,6 +1451,10 @@ def _build_provenance(
     train_steps: int,
     *,
     activation_checkpointed_blocks: int,
+    best_checkpoint_path: Path,
+    last_checkpoint_path: Path,
+    best_validation_loss: float,
+    best_validation_step: int | None,
 ) -> dict[str, object]:
     return {
         "format": TRAINING_FORMAT,
@@ -1436,6 +1470,10 @@ def _build_provenance(
         "tuple_paths": [str(path) for path in dataset.paths],
         "train_steps": train_steps,
         "activation_checkpointed_blocks": activation_checkpointed_blocks,
+        "best_checkpoint_path": str(best_checkpoint_path),
+        "last_checkpoint_path": str(last_checkpoint_path),
+        "best_validation_loss": best_validation_loss,
+        "best_validation_step": best_validation_step,
         "injections": [_injection_to_dict(injection) for injection in injections],
     }
 
@@ -1469,10 +1507,13 @@ def main() -> None:
         json.dumps(
             {
                 "checkpoint_path": str(result.checkpoint_path),
+                "best_checkpoint_path": str(result.best_checkpoint_path),
+                "last_checkpoint_path": str(result.last_checkpoint_path),
                 "metrics_path": str(result.metrics_path),
                 "provenance_path": str(result.provenance_path),
                 "train_steps": result.train_steps,
                 "best_validation_loss": result.best_validation_loss,
+                "best_validation_step": result.best_validation_step,
             },
             indent=2,
             sort_keys=True,

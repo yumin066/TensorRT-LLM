@@ -694,6 +694,9 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
     assert checkpoint["config"]["recipe"] == "lora_adapter"
     assert checkpoint["injections"][0]["module_name"] == "transformer_blocks.0.attn.to_q"
     assert any("lora" in name for name in checkpoint["trainable_parameter_names"])
+    assert result.checkpoint_path == result.best_checkpoint_path
+    assert result.best_checkpoint_path.exists()
+    assert result.last_checkpoint_path.exists()
     assert result.metrics_path.exists()
     metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
     validation_records = [record for record in metrics if record["phase"] == "validation"]
@@ -715,6 +718,84 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
     assert provenance["tuple_count"] == 1
     assert provenance["activation_checkpointed_blocks"] == 0
     assert provenance["injections"][0]["role"] == "attn.to_q"
+    assert provenance["best_checkpoint_path"] == str(result.best_checkpoint_path)
+    assert provenance["last_checkpoint_path"] == str(result.last_checkpoint_path)
+    assert provenance["best_validation_step"] == result.best_validation_step
+
+
+def test_train_qat_best_checkpoint_is_not_overwritten_by_later_last_checkpoint(
+    tmp_path, monkeypatch
+):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            max_steps=4,
+            validation_interval_steps=2,
+            checkpoint_interval_steps=1,
+            early_stop_patience=2,
+        )
+    )
+    validation_losses = iter((1.0, 2.0))
+
+    def _scripted_validate(*_args, **_kwargs):
+        loss = next(validation_losses)
+        return qat_train.ValidationMetrics(
+            loss=loss,
+            loss_components={"latent_reconstruction": loss},
+            quality_metrics={},
+        )
+
+    monkeypatch.setattr(qat_train, "_validate", _scripted_validate)
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=_TinyQwenTransformer(),
+        linear_cls=nn.Linear,
+    )
+
+    assert result.checkpoint_path == result.best_checkpoint_path
+    assert result.best_checkpoint_path != result.last_checkpoint_path
+    assert result.best_validation_loss == 1.0
+    assert result.best_validation_step == 2
+
+    best_checkpoint = torch.load(
+        result.best_checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    last_checkpoint = torch.load(
+        result.last_checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best_validation_records = [
+        record for record in best_checkpoint["metrics"] if record["phase"] == "validation"
+    ]
+    last_validation_records = [
+        record for record in last_checkpoint["metrics"] if record["phase"] == "validation"
+    ]
+
+    assert best_checkpoint["checkpoint_path"] == str(result.best_checkpoint_path)
+    assert best_checkpoint["best_validation_loss"] == 1.0
+    assert best_checkpoint["best_validation_step"] == 2
+    assert best_validation_records[-1]["step"] == 2
+    assert last_checkpoint["checkpoint_path"] == str(result.last_checkpoint_path)
+    assert last_checkpoint["best_validation_loss"] == 1.0
+    assert last_checkpoint["best_validation_step"] == 2
+    assert last_checkpoint["best_checkpoint_path"] == str(result.best_checkpoint_path)
+    assert last_checkpoint["last_checkpoint_path"] == str(result.last_checkpoint_path)
+    assert last_validation_records[-1]["step"] == 4
+
+    provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
+    assert provenance["best_checkpoint_path"] == str(result.best_checkpoint_path)
+    assert provenance["last_checkpoint_path"] == str(result.last_checkpoint_path)
+    assert provenance["best_validation_loss"] == 1.0
+    assert provenance["best_validation_step"] == 2
 
 
 def test_train_qat_activation_checkpointing_preserves_parameter_names(tmp_path):
