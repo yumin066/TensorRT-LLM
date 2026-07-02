@@ -327,6 +327,39 @@ def test_config_accepts_partial_unfreeze_calibration_probe_lr_sweep(tmp_path):
     assert config.optimizer.learning_rate == 1.0e-4
 
 
+def test_config_accepts_partial_unfreeze_calibration_formal_adamw(tmp_path):
+    sensitivity_path = tmp_path / "sensitivity.json"
+    sensitivity_path.write_text(json.dumps(["transformer_blocks.0.attn.to_q"]), encoding="utf-8")
+
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            recipe="partial_unfreeze",
+            schedule="calibration_formal",
+            max_steps=1000,
+            validation_interval_steps=50,
+            checkpoint_interval_steps=50,
+            train_all_tuples=True,
+            shuffle_train_tuples=True,
+            monitor_subset_size=25,
+            monitor_all_tuples=True,
+            disable_early_stop=True,
+            enable_partial_unfreeze=True,
+            sensitivity_path=str(sensitivity_path),
+            train_priority="partial_unfreeze",
+            optimizer={"name": "adamw", "learning_rate": 3.0e-5, "foreach": False},
+            debug_allow_short_run=False,
+        )
+    )
+
+    assert config.recipe == "partial_unfreeze"
+    assert config.schedule == "calibration_formal"
+    assert config.max_steps == 1000
+    assert config.validation_interval_steps == 50
+    assert config.optimizer.name == "adamw"
+    assert config.optimizer.learning_rate == 3.0e-5
+
+
 def test_config_rejects_implicit_calibration_contract(tmp_path):
     with pytest.raises(ValidationError, match="disable_early_stop"):
         QwenImageLayeredQatConfig(

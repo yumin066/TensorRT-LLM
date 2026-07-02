@@ -63,7 +63,14 @@ OPTIONAL_TARGET_KEYS = (
 
 RecipeName = Literal["lora_adapter", "partial_unfreeze"]
 OptimizerName = Literal["adamw", "sgd"]
-ScheduleName = Literal["smoke", "pilot", "formal", "fallback", "calibration_probe"]
+ScheduleName = Literal[
+    "smoke",
+    "pilot",
+    "formal",
+    "fallback",
+    "calibration_probe",
+    "calibration_formal",
+]
 TrainingFrameworkName = Literal["native_pytorch"]
 AttentionQuantRecipe = Literal["none", "sage_attention", "cute_dsl", "fa4", "qk16pv8"]
 DistributedMode = Literal["none", "ddp", "fsdp"]
@@ -75,6 +82,7 @@ _STEP_BOUNDS: dict[ScheduleName, tuple[int, int]] = {
     "formal": (2000, 5000),
     "fallback": (500, 1500),
     "calibration_probe": (100, 300),
+    "calibration_formal": (500, 1500),
 }
 _VALIDATION_INTERVAL_BOUNDS: dict[ScheduleName, tuple[int, int]] = {
     "pilot": (100, 200),
@@ -367,15 +375,16 @@ class QwenImageLayeredQatConfig(StrictBaseModel):
         if self.recipe == "partial_unfreeze":
             if not self.enable_partial_unfreeze:
                 raise ValueError("partial_unfreeze is disabled until explicitly enabled")
-            if self.schedule not in ("fallback", "calibration_probe"):
+            calibration_schedules = ("calibration_probe", "calibration_formal")
+            if self.schedule not in ("fallback", *calibration_schedules):
                 raise ValueError(
-                    "partial_unfreeze must use the fallback schedule or a calibration_probe"
+                    "partial_unfreeze must use the fallback schedule or a calibration schedule"
                 )
-            if self.schedule == "calibration_probe" and not self.train_all_tuples:
-                raise ValueError("partial_unfreeze calibration_probe requires train_all_tuples")
+            if self.schedule in calibration_schedules and not self.train_all_tuples:
+                raise ValueError("partial_unfreeze calibration schedule requires train_all_tuples")
             if not self.sensitivity_path:
                 raise ValueError("partial_unfreeze requires sensitivity_path")
-            max_learning_rate = 1.0e-4 if self.schedule == "calibration_probe" else 1.0e-5
+            max_learning_rate = 1.0e-4 if self.schedule in calibration_schedules else 1.0e-5
             if self.optimizer.learning_rate > max_learning_rate:
                 raise ValueError(
                     f"partial_unfreeze requires learning_rate <= {max_learning_rate:g}"
