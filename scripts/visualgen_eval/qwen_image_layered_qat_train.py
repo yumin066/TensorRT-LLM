@@ -11,6 +11,7 @@ import json
 import math
 import os
 import platform
+import random
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -22,7 +23,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from pydantic import Field, NonNegativeFloat, PositiveFloat, PositiveInt, model_validator
+from pydantic import (
+    Field,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
@@ -55,7 +63,7 @@ OPTIONAL_TARGET_KEYS = (
 
 RecipeName = Literal["lora_adapter", "partial_unfreeze"]
 OptimizerName = Literal["adamw", "sgd"]
-ScheduleName = Literal["smoke", "pilot", "formal", "fallback"]
+ScheduleName = Literal["smoke", "pilot", "formal", "fallback", "calibration_probe"]
 TrainingFrameworkName = Literal["native_pytorch"]
 AttentionQuantRecipe = Literal["none", "sage_attention", "cute_dsl", "fa4", "qk16pv8"]
 DistributedMode = Literal["none", "ddp", "fsdp"]
@@ -66,6 +74,7 @@ _STEP_BOUNDS: dict[ScheduleName, tuple[int, int]] = {
     "pilot": (500, 1000),
     "formal": (2000, 5000),
     "fallback": (500, 1500),
+    "calibration_probe": (100, 300),
 }
 _VALIDATION_INTERVAL_BOUNDS: dict[ScheduleName, tuple[int, int]] = {
     "pilot": (100, 200),
@@ -231,6 +240,41 @@ class QwenImageLayeredQatConfig(StrictBaseModel):
         lt=1.0,
         description="Fraction of tuples used for validation when more than one tuple exists.",
     )
+    train_all_tuples: bool = Field(
+        default=False,
+        description="Use every cached tuple for training instead of holding out validation tuples.",
+    )
+    shuffle_train_tuples: bool = Field(
+        default=False,
+        description="Shuffle the training tuple order independently for each full tuple pass.",
+    )
+    train_shuffle_seed: NonNegativeInt = Field(
+        default=0,
+        description="Seed for deterministic per-epoch training tuple shuffles.",
+    )
+    monitor_subset_size: PositiveInt | None = Field(
+        default=None,
+        description="Fixed random tuple subset size for calibration monitoring.",
+    )
+    monitor_subset_seed: NonNegativeInt = Field(
+        default=44,
+        description="Seed used to choose the fixed monitor subset.",
+    )
+    monitor_all_tuples: bool = Field(
+        default=False,
+        description="Evaluate all cached tuples at the monitor cadence.",
+    )
+    disable_early_stop: bool = Field(
+        default=False,
+        description="Disable plateau early stop for explicit calibration runs.",
+    )
+    update_norm_interval_steps: NonNegativeInt = Field(
+        default=0,
+        description=(
+            "Cadence for recording grad_norm, weight_norm, and update norm telemetry. "
+            "A value of 0 disables the extra telemetry."
+        ),
+    )
     attention_qat: bool = Field(
         default=False,
         description="Rejected first-stage switch for attention-kernel QAT.",
@@ -280,6 +324,14 @@ class QwenImageLayeredQatConfig(StrictBaseModel):
             raise ValueError("validation_interval_steps must not exceed max_steps")
         if self.checkpoint_interval_steps > self.max_steps:
             raise ValueError("checkpoint_interval_steps must not exceed max_steps")
+        if self.train_all_tuples:
+            if not self.disable_early_stop:
+                raise ValueError("train_all_tuples calibration requires disable_early_stop=true")
+            if self.monitor_subset_size is None and not self.monitor_all_tuples:
+                raise ValueError(
+                    "train_all_tuples calibration requires monitor_subset_size or "
+                    "monitor_all_tuples"
+                )
         if self.attention_qat or self.attention_quant_recipe != "none":
             raise ValueError("first-stage QAT rejects attention-kernel quantization")
         if self.attention_backend:
@@ -315,12 +367,19 @@ class QwenImageLayeredQatConfig(StrictBaseModel):
         if self.recipe == "partial_unfreeze":
             if not self.enable_partial_unfreeze:
                 raise ValueError("partial_unfreeze is disabled until explicitly enabled")
-            if self.schedule != "fallback":
-                raise ValueError("partial_unfreeze must use the fallback schedule")
+            if self.schedule not in ("fallback", "calibration_probe"):
+                raise ValueError(
+                    "partial_unfreeze must use the fallback schedule or a calibration_probe"
+                )
+            if self.schedule == "calibration_probe" and not self.train_all_tuples:
+                raise ValueError("partial_unfreeze calibration_probe requires train_all_tuples")
             if not self.sensitivity_path:
                 raise ValueError("partial_unfreeze requires sensitivity_path")
-            if self.optimizer.learning_rate > 1.0e-5:
-                raise ValueError("partial_unfreeze requires learning_rate <= 1e-5")
+            max_learning_rate = 1.0e-4 if self.schedule == "calibration_probe" else 1.0e-5
+            if self.optimizer.learning_rate > max_learning_rate:
+                raise ValueError(
+                    f"partial_unfreeze requires learning_rate <= {max_learning_rate:g}"
+                )
             if self.train_priority not in (None, "partial_unfreeze"):
                 raise ValueError("partial_unfreeze requires train_priority=partial_unfreeze")
         elif self.enable_partial_unfreeze or self.sensitivity_path:
@@ -720,14 +779,16 @@ def train_qwen_image_layered_qat(
         _debug_log(f"building optimizer for {len(trainable_parameters)} trainable tensors")
         optimizer = _build_optimizer(trainable_parameters, config.optimizer)
 
-        train_indices, validation_indices = _split_dataset_indices(
-            dataset, config.validation_fraction
-        )
+        train_indices, validation_indices = _training_and_validation_indices(dataset, config)
+        monitor_subset_indices, monitor_all_indices = _monitor_indices(dataset, config)
         metrics: list[dict[str, object]] = []
         best_validation_loss = float("inf")
         best_validation_step: int | None = None
+        best_metric_name = "validation_loss"
+        best_metric_phase = "validation"
         stale_validation_count = 0
         wrote_best_checkpoint = False
+        epoch_orders: dict[int, list[int]] = {}
 
         step = 0
         if device.type == "cuda":
@@ -740,15 +801,43 @@ def train_qwen_image_layered_qat(
                 _debug_log(f"train step {step} start")
                 _synchronize_device(device)
                 step_started_at = time.perf_counter()
-                sample = dataset[train_indices[(step - 1) % len(train_indices)]]
+                sample_index = _training_sample_index_for_step(
+                    train_indices,
+                    step=step,
+                    shuffle=config.shuffle_train_tuples,
+                    seed=int(config.train_shuffle_seed),
+                    epoch_orders=epoch_orders,
+                )
+                sample = dataset[sample_index]
                 optimizer.zero_grad(set_to_none=True)
+                parameter_snapshots = None
+                should_record_update_norms = (
+                    config.update_norm_interval_steps > 0
+                    and step % int(config.update_norm_interval_steps) == 0
+                )
+                if should_record_update_norms:
+                    parameter_snapshots = _clone_trainable_parameters(trainable_parameters)
                 output = _forward_sample(trained_model, sample, device)
                 loss, loss_components = _compute_loss(output, sample, config.loss, device)
                 loss_value = float(loss.detach().cpu())
                 if not math.isfinite(loss_value):
                     raise RuntimeError(f"non-finite training loss at step {step}: {loss_value}")
                 loss.backward()
+                update_metrics: dict[str, float] = {}
+                if should_record_update_norms:
+                    update_metrics["grad_norm"] = _gradient_global_norm(trainable_parameters)
                 optimizer.step()
+                if should_record_update_norms and parameter_snapshots is not None:
+                    weight_norm = _parameter_global_norm(trainable_parameters)
+                    weight_delta_norm = _parameter_update_global_norm(
+                        trainable_parameters,
+                        parameter_snapshots,
+                    )
+                    update_metrics["weight_norm"] = weight_norm
+                    update_metrics["weight_delta_norm"] = weight_delta_norm
+                    update_metrics["weight_delta_to_weight_norm"] = (
+                        weight_delta_norm / weight_norm if weight_norm > 0.0 else 0.0
+                    )
                 _synchronize_device(device)
 
                 train_record = {
@@ -756,12 +845,14 @@ def train_qwen_image_layered_qat(
                     "step": step,
                     "loss": loss_value,
                     "loss_components": _loss_components_to_float(loss_components),
-                    "sample_index": int(train_indices[(step - 1) % len(train_indices)]),
+                    "sample_index": sample_index,
+                    "train_epoch": (step - 1) // len(train_indices),
                     "step_time_seconds": time.perf_counter() - step_started_at,
                     "peak_cuda_memory_bytes": _peak_cuda_memory_bytes(device),
                     "rank": _distributed_rank(),
                     "world_size": _distributed_world_size(),
                 }
+                train_record.update(update_metrics)
                 metrics.append(train_record)
                 _write_jsonl_record(metrics_jsonl, train_record)
                 _debug_log(f"train step {step} wrote metrics")
@@ -769,29 +860,69 @@ def train_qwen_image_layered_qat(
                 should_validate = step % int(config.validation_interval_steps) == 0
                 should_checkpoint = step % int(config.checkpoint_interval_steps) == 0
                 if should_validate or step == int(config.max_steps):
-                    validation_metrics = _validate(
-                        trained_model, dataset, validation_indices, config.loss, device
-                    )
-                    validation_loss = float(validation_metrics.loss)
-                    if not math.isfinite(validation_loss):
-                        raise RuntimeError(
-                            f"non-finite validation loss at step {step}: {validation_loss}"
+                    selection_loss: float | None = None
+                    selection_metric_name: str | None = None
+                    selection_metric_phase: str | None = None
+                    if validation_indices:
+                        validation_loss = _evaluate_and_record(
+                            trained_model,
+                            dataset,
+                            validation_indices,
+                            config.loss,
+                            device,
+                            metrics,
+                            metrics_jsonl,
+                            phase="validation",
+                            metric_name="validation_loss",
+                            step=step,
                         )
-                    validation_record = {
-                        "phase": "validation",
-                        "step": step,
-                        "loss": validation_loss,
-                        "loss_components": validation_metrics.loss_components,
-                        "quality_metrics": validation_metrics.quality_metrics,
-                        "sample_count": len(validation_indices),
-                        "rank": _distributed_rank(),
-                        "world_size": _distributed_world_size(),
-                    }
-                    metrics.append(validation_record)
-                    _write_jsonl_record(metrics_jsonl, validation_record)
-                    if validation_loss < best_validation_loss - 1.0e-8:
-                        best_validation_loss = validation_loss
+                        selection_loss = validation_loss
+                        selection_metric_name = "validation_loss"
+                        selection_metric_phase = "validation"
+                    if monitor_subset_indices:
+                        monitor_subset_loss = _evaluate_and_record(
+                            trained_model,
+                            dataset,
+                            monitor_subset_indices,
+                            config.loss,
+                            device,
+                            metrics,
+                            metrics_jsonl,
+                            phase="monitor_subset",
+                            metric_name="monitor_subset_loss",
+                            step=step,
+                        )
+                        if config.train_all_tuples and not monitor_all_indices:
+                            selection_loss = monitor_subset_loss
+                            selection_metric_name = "monitor_subset_loss"
+                            selection_metric_phase = "monitor_subset"
+                    if monitor_all_indices:
+                        monitor_all_loss = _evaluate_and_record(
+                            trained_model,
+                            dataset,
+                            monitor_all_indices,
+                            config.loss,
+                            device,
+                            metrics,
+                            metrics_jsonl,
+                            phase="monitor_all",
+                            metric_name="monitor_all_100_loss",
+                            step=step,
+                        )
+                        if config.train_all_tuples:
+                            selection_loss = monitor_all_loss
+                            selection_metric_name = "monitor_all_100_loss"
+                            selection_metric_phase = "monitor_all"
+                    if selection_loss is None:
+                        raise RuntimeError(
+                            "QAT training has no validation or monitor metric for "
+                            "best-checkpoint selection"
+                        )
+                    if selection_loss < best_validation_loss - 1.0e-8:
+                        best_validation_loss = selection_loss
                         best_validation_step = step
+                        best_metric_name = str(selection_metric_name)
+                        best_metric_phase = str(selection_metric_phase)
                         stale_validation_count = 0
                         _save_checkpoint(
                             best_checkpoint_path,
@@ -803,11 +934,15 @@ def train_qwen_image_layered_qat(
                             best_validation_step,
                             best_checkpoint_path,
                             last_checkpoint_path,
+                            best_metric_name,
+                            best_metric_phase,
                         )
                         wrote_best_checkpoint = True
                     else:
                         stale_validation_count += 1
-                    if stale_validation_count >= int(config.early_stop_patience):
+                    if not config.disable_early_stop and stale_validation_count >= int(
+                        config.early_stop_patience
+                    ):
                         break
                 elif should_checkpoint:
                     _save_checkpoint(
@@ -820,13 +955,15 @@ def train_qwen_image_layered_qat(
                         best_validation_step,
                         best_checkpoint_path,
                         last_checkpoint_path,
+                        best_metric_name,
+                        best_metric_phase,
                     )
         finally:
             if metrics_jsonl is not None:
                 metrics_jsonl.close()
 
         if not wrote_best_checkpoint:
-            raise RuntimeError("QAT training completed without a finite best validation checkpoint")
+            raise RuntimeError("QAT training completed without a finite best checkpoint")
         _save_checkpoint(
             last_checkpoint_path,
             trained_model,
@@ -837,6 +974,8 @@ def train_qwen_image_layered_qat(
             best_validation_step,
             best_checkpoint_path,
             last_checkpoint_path,
+            best_metric_name,
+            best_metric_phase,
         )
         provenance = _build_provenance(
             config,
@@ -848,6 +987,8 @@ def train_qwen_image_layered_qat(
             last_checkpoint_path=last_checkpoint_path,
             best_validation_loss=best_validation_loss,
             best_validation_step=best_validation_step,
+            best_metric_name=best_metric_name,
+            best_metric_phase=best_metric_phase,
         )
         if _is_main_process():
             provenance_path.write_text(
@@ -1287,6 +1428,42 @@ def _peak_cuda_memory_bytes(device: torch.device) -> int | None:
     return int(torch.cuda.max_memory_allocated(device))
 
 
+def _clone_trainable_parameters(
+    trainable_parameters: Sequence[nn.Parameter],
+) -> list[torch.Tensor]:
+    return [parameter.detach().clone() for parameter in trainable_parameters]
+
+
+def _gradient_global_norm(trainable_parameters: Sequence[nn.Parameter]) -> float:
+    total = 0.0
+    for parameter in trainable_parameters:
+        if parameter.grad is None:
+            continue
+        total += _tensor_l2_squared(parameter.grad)
+    return math.sqrt(total)
+
+
+def _parameter_global_norm(trainable_parameters: Sequence[nn.Parameter]) -> float:
+    total = 0.0
+    for parameter in trainable_parameters:
+        total += _tensor_l2_squared(parameter)
+    return math.sqrt(total)
+
+
+def _parameter_update_global_norm(
+    trainable_parameters: Sequence[nn.Parameter],
+    parameter_snapshots: Sequence[torch.Tensor],
+) -> float:
+    total = 0.0
+    for parameter, snapshot in zip(trainable_parameters, parameter_snapshots):
+        total += _tensor_l2_squared(parameter.detach() - snapshot)
+    return math.sqrt(total)
+
+
+def _tensor_l2_squared(tensor: torch.Tensor) -> float:
+    return float(tensor.detach().float().square().sum().cpu())
+
+
 def _write_jsonl_record(
     metrics_jsonl: TextIO | None,
     record: Mapping[str, object],
@@ -1349,6 +1526,76 @@ def _split_dataset_indices(
     validation_count = max(1, int(round(len(indices) * validation_fraction)))
     validation_count = min(validation_count, len(indices) - 1)
     return indices[:-validation_count], indices[-validation_count:]
+
+
+def _training_and_validation_indices(
+    dataset: TransformerTupleDataset,
+    config: QwenImageLayeredQatConfig,
+) -> tuple[list[int], list[int]]:
+    if config.train_all_tuples:
+        return list(range(len(dataset))), []
+    return _split_dataset_indices(dataset, config.validation_fraction)
+
+
+def _monitor_indices(
+    dataset: TransformerTupleDataset,
+    config: QwenImageLayeredQatConfig,
+) -> tuple[list[int], list[int]]:
+    subset_indices: list[int] = []
+    if config.monitor_subset_size is not None:
+        subset_indices = _select_monitor_subset_indices(
+            dataset,
+            int(config.monitor_subset_size),
+            int(config.monitor_subset_seed),
+        )
+    all_indices = list(range(len(dataset))) if config.monitor_all_tuples else []
+    return subset_indices, all_indices
+
+
+def _select_monitor_subset_indices(
+    dataset: TransformerTupleDataset,
+    subset_size: int,
+    seed: int,
+) -> list[int]:
+    indices = list(range(len(dataset)))
+    if subset_size > len(indices):
+        raise ValueError(f"monitor_subset_size={subset_size} exceeds tuple count {len(indices)}")
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    return sorted(indices[:subset_size])
+
+
+def _shuffled_train_indices_for_epoch(
+    train_indices: Sequence[int],
+    *,
+    seed: int,
+    epoch: int,
+) -> list[int]:
+    shuffled = list(train_indices)
+    rng = random.Random(seed + epoch)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
+def _training_sample_index_for_step(
+    train_indices: Sequence[int],
+    *,
+    step: int,
+    shuffle: bool,
+    seed: int,
+    epoch_orders: dict[int, list[int]],
+) -> int:
+    epoch = (step - 1) // len(train_indices)
+    position = (step - 1) % len(train_indices)
+    if not shuffle:
+        return int(train_indices[position])
+    if epoch not in epoch_orders:
+        epoch_orders[epoch] = _shuffled_train_indices_for_epoch(
+            train_indices,
+            seed=seed,
+            epoch=epoch,
+        )
+    return int(epoch_orders[epoch][position])
 
 
 def _move_value(value: object, device: torch.device) -> object:
@@ -1557,6 +1804,41 @@ def _validate(
     )
 
 
+def _evaluate_and_record(
+    transformer: nn.Module,
+    dataset: TransformerTupleDataset,
+    indices: Sequence[int],
+    loss_config: LossConfig,
+    device: torch.device,
+    metrics: list[dict[str, object]],
+    metrics_jsonl: TextIO | None,
+    *,
+    phase: str,
+    metric_name: str,
+    step: int,
+) -> float:
+    evaluation_metrics = _validate(transformer, dataset, indices, loss_config, device)
+    evaluation_loss = float(evaluation_metrics.loss)
+    if not math.isfinite(evaluation_loss):
+        formatted_metric_name = metric_name.replace("_", " ")
+        raise RuntimeError(f"non-finite {formatted_metric_name} at step {step}: {evaluation_loss}")
+    evaluation_record = {
+        "phase": phase,
+        "step": step,
+        "loss": evaluation_loss,
+        metric_name: evaluation_loss,
+        "metric_name": metric_name,
+        "loss_components": evaluation_metrics.loss_components,
+        "quality_metrics": evaluation_metrics.quality_metrics,
+        "sample_count": len(indices),
+        "rank": _distributed_rank(),
+        "world_size": _distributed_world_size(),
+    }
+    metrics.append(evaluation_record)
+    _write_jsonl_record(metrics_jsonl, evaluation_record)
+    return evaluation_loss
+
+
 def _optional_quality_metrics(
     output: torch.Tensor,
     sample: TransformerTupleSample,
@@ -1688,6 +1970,8 @@ def _save_checkpoint(
     best_validation_step: int | None,
     best_checkpoint_path: Path,
     last_checkpoint_path: Path,
+    best_metric_name: str,
+    best_metric_phase: str,
 ) -> None:
     trainable_names = _trainable_parameter_names_from_injections(injections)
     if not trainable_names:
@@ -1713,6 +1997,8 @@ def _save_checkpoint(
         "metrics": list(metrics),
         "best_validation_loss": best_validation_loss,
         "best_validation_step": best_validation_step,
+        "best_metric_name": best_metric_name,
+        "best_metric_phase": best_metric_phase,
         "checkpoint_path": str(path),
         "best_checkpoint_path": str(best_checkpoint_path),
         "last_checkpoint_path": str(last_checkpoint_path),
@@ -1741,6 +2027,8 @@ def _build_provenance(
     last_checkpoint_path: Path,
     best_validation_loss: float,
     best_validation_step: int | None,
+    best_metric_name: str,
+    best_metric_phase: str,
 ) -> dict[str, object]:
     return {
         "format": TRAINING_FORMAT,
@@ -1771,6 +2059,8 @@ def _build_provenance(
         "last_checkpoint_path": str(last_checkpoint_path),
         "best_validation_loss": best_validation_loss,
         "best_validation_step": best_validation_step,
+        "best_metric_name": best_metric_name,
+        "best_metric_phase": best_metric_phase,
         "injections": [_injection_to_dict(injection) for injection in injections],
     }
 

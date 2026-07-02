@@ -270,6 +270,83 @@ def test_config_accepts_sgd_optimizer(tmp_path):
     assert config.optimizer.foreach is False
 
 
+def test_config_accepts_calibration_probe_options(tmp_path):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            schedule="calibration_probe",
+            max_steps=200,
+            validation_interval_steps=100,
+            checkpoint_interval_steps=100,
+            train_all_tuples=True,
+            shuffle_train_tuples=True,
+            train_shuffle_seed=7,
+            monitor_subset_size=25,
+            monitor_subset_seed=11,
+            monitor_all_tuples=True,
+            disable_early_stop=True,
+            update_norm_interval_steps=10,
+            debug_allow_short_run=False,
+        )
+    )
+
+    assert config.schedule == "calibration_probe"
+    assert config.train_all_tuples
+    assert config.shuffle_train_tuples
+    assert config.monitor_subset_size == 25
+    assert config.monitor_all_tuples
+    assert config.disable_early_stop
+    assert config.update_norm_interval_steps == 10
+
+
+def test_config_accepts_partial_unfreeze_calibration_probe_lr_sweep(tmp_path):
+    sensitivity_path = tmp_path / "sensitivity.json"
+    sensitivity_path.write_text(json.dumps(["transformer_blocks.0.attn.to_q"]), encoding="utf-8")
+
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            recipe="partial_unfreeze",
+            schedule="calibration_probe",
+            max_steps=200,
+            validation_interval_steps=100,
+            checkpoint_interval_steps=100,
+            train_all_tuples=True,
+            monitor_all_tuples=True,
+            disable_early_stop=True,
+            enable_partial_unfreeze=True,
+            sensitivity_path=str(sensitivity_path),
+            train_priority="partial_unfreeze",
+            optimizer={"name": "sgd", "learning_rate": 1.0e-4},
+            debug_allow_short_run=False,
+        )
+    )
+
+    assert config.recipe == "partial_unfreeze"
+    assert config.schedule == "calibration_probe"
+    assert config.optimizer.learning_rate == 1.0e-4
+
+
+def test_config_rejects_implicit_calibration_contract(tmp_path):
+    with pytest.raises(ValidationError, match="disable_early_stop"):
+        QwenImageLayeredQatConfig(
+            **_base_config(
+                tmp_path,
+                train_all_tuples=True,
+                monitor_all_tuples=True,
+            )
+        )
+
+    with pytest.raises(ValidationError, match="monitor_subset_size or monitor_all_tuples"):
+        QwenImageLayeredQatConfig(
+            **_base_config(
+                tmp_path,
+                train_all_tuples=True,
+                disable_early_stop=True,
+            )
+        )
+
+
 def test_config_accepts_fsdp_distributed_mode(tmp_path):
     config = QwenImageLayeredQatConfig(
         **_base_config(
@@ -569,6 +646,37 @@ def test_tuple_dataset_rejects_empty_manifest(tmp_path):
         TransformerTupleDataset(manifest_path)
 
 
+def test_train_shuffle_covers_each_epoch_deterministically():
+    train_indices = [0, 1, 2, 3]
+    epoch_orders: dict[int, list[int]] = {}
+
+    first_pass = [
+        qat_train._training_sample_index_for_step(
+            train_indices,
+            step=step,
+            shuffle=True,
+            seed=9,
+            epoch_orders=epoch_orders,
+        )
+        for step in range(1, 9)
+    ]
+    second_epoch_orders: dict[int, list[int]] = {}
+    second_pass = [
+        qat_train._training_sample_index_for_step(
+            train_indices,
+            step=step,
+            shuffle=True,
+            seed=9,
+            epoch_orders=second_epoch_orders,
+        )
+        for step in range(1, 9)
+    ]
+
+    assert sorted(first_pass[:4]) == train_indices
+    assert sorted(first_pass[4:]) == train_indices
+    assert first_pass == second_pass
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -845,6 +953,131 @@ def test_train_qat_one_synthetic_tuple_saves_checkpoint_metadata_and_optional_lo
         for line in (result.output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert metrics_jsonl[0]["phase"] == "train"
+
+
+def test_train_qat_all_tuple_calibration_records_monitor_metrics(tmp_path):
+    tuple_paths = []
+    for index in range(4):
+        tuple_path = tmp_path / f"tuple_{index}.pt"
+        _write_tuple(tuple_path)
+        tuple_paths.append(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, tuple_paths)
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            max_steps=4,
+            validation_interval_steps=2,
+            checkpoint_interval_steps=2,
+            train_all_tuples=True,
+            monitor_subset_size=2,
+            monitor_subset_seed=3,
+            monitor_all_tuples=True,
+            disable_early_stop=True,
+            update_norm_interval_steps=1,
+        )
+    )
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=_TinyQwenTransformer(),
+        linear_cls=nn.Linear,
+    )
+
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    train_records = [record for record in metrics if record["phase"] == "train"]
+    validation_records = [record for record in metrics if record["phase"] == "validation"]
+    monitor_subset_records = [record for record in metrics if record["phase"] == "monitor_subset"]
+    monitor_all_records = [record for record in metrics if record["phase"] == "monitor_all"]
+
+    assert [record["sample_index"] for record in train_records] == [0, 1, 2, 3]
+    assert all(record["train_epoch"] == 0 for record in train_records)
+    assert all("grad_norm" in record for record in train_records)
+    assert all("weight_delta_norm" in record for record in train_records)
+    assert not validation_records
+    assert [record["sample_count"] for record in monitor_subset_records] == [2, 2]
+    assert [record["sample_count"] for record in monitor_all_records] == [4, 4]
+    assert all("monitor_subset_loss" in record for record in monitor_subset_records)
+    assert all("monitor_all_100_loss" in record for record in monitor_all_records)
+
+    checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["best_metric_name"] == "monitor_all_100_loss"
+    assert checkpoint["best_metric_phase"] == "monitor_all"
+    provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
+    assert provenance["best_metric_name"] == "monitor_all_100_loss"
+    assert provenance["config"]["train_all_tuples"] is True
+
+
+def test_train_qat_all_tuple_calibration_disables_early_stop(tmp_path, monkeypatch):
+    tuple_paths = []
+    for index in range(2):
+        tuple_path = tmp_path / f"tuple_{index}.pt"
+        _write_tuple(tuple_path)
+        tuple_paths.append(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, tuple_paths)
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            max_steps=3,
+            validation_interval_steps=1,
+            checkpoint_interval_steps=1,
+            early_stop_patience=1,
+            train_all_tuples=True,
+            monitor_all_tuples=True,
+            disable_early_stop=True,
+        )
+    )
+    scripted_losses = iter((1.0, 2.0, 3.0))
+
+    def _scripted_validate(*_args, **_kwargs):
+        loss = next(scripted_losses)
+        return qat_train.ValidationMetrics(
+            loss=loss,
+            loss_components={"latent_reconstruction": loss},
+            quality_metrics={},
+        )
+
+    monkeypatch.setattr(qat_train, "_validate", _scripted_validate)
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=_TinyQwenTransformer(),
+        linear_cls=nn.Linear,
+    )
+
+    assert result.train_steps == 3
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert [record["loss"] for record in metrics if record["phase"] == "monitor_all"] == [
+        1.0,
+        2.0,
+        3.0,
+    ]
+
+
+def test_train_qat_rejects_monitor_subset_larger_than_dataset(tmp_path):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            train_all_tuples=True,
+            monitor_subset_size=2,
+            disable_early_stop=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="monitor_subset_size=2 exceeds tuple count 1"):
+        train_qwen_image_layered_qat(
+            config,
+            transformer=_TinyQwenTransformer(),
+            linear_cls=nn.Linear,
+        )
 
 
 def test_train_qat_sgd_optimizer_keeps_state_empty(tmp_path, monkeypatch):
