@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import functools
+import inspect
 import json
 import math
 import os
@@ -869,6 +870,24 @@ def train_qwen_image_layered_qat(
                 should_validate = step % int(config.validation_interval_steps) == 0
                 should_checkpoint = step % int(config.checkpoint_interval_steps) == 0
                 if should_validate or step == int(config.max_steps):
+                    if should_checkpoint:
+                        # Preserve the completed training step before monitor/eval can fail.
+                        _debug_log(f"train step {step} saving pre-monitor checkpoint")
+                        _save_checkpoint(
+                            last_checkpoint_path,
+                            trained_model,
+                            config,
+                            injections,
+                            metrics,
+                            best_validation_loss,
+                            best_validation_step,
+                            best_checkpoint_path,
+                            last_checkpoint_path,
+                            best_metric_name,
+                            best_metric_phase,
+                        )
+                        _distributed_barrier()
+                        _debug_log(f"train step {step} saved pre-monitor checkpoint")
                     selection_loss: float | None = None
                     selection_metric_name: str | None = None
                     selection_metric_phase: str | None = None
@@ -1313,6 +1332,24 @@ def _replace_module(root: nn.Module, module_name: str, replacement: nn.Module) -
     _set_child_module(parent, parts[-1], replacement)
 
 
+def _get_module_by_name(root: nn.Module, module_name: str) -> nn.Module:
+    module = _unwrap_model(root)
+    for part in module_name.split("."):
+        module = _unwrap_model(_get_child_module(module, part))
+    return module
+
+
+def _get_parameter_by_name(module: nn.Module, parameter_name: str) -> nn.Parameter:
+    parent = _unwrap_model(module)
+    parts = parameter_name.split(".")
+    for part in parts[:-1]:
+        parent = _unwrap_model(_get_child_module(parent, part))
+    parameter = getattr(parent, parts[-1])
+    if not isinstance(parameter, nn.Parameter):
+        raise TypeError(f"{parameter_name} is not a Parameter")
+    return parameter
+
+
 def _maybe_wrap_distributed(
     transformer: nn.Module,
     config: QwenImageLayeredQatConfig,
@@ -1335,6 +1372,16 @@ def _maybe_wrap_distributed(
     from torch.distributed.fsdp import FullyShardedDataParallel
 
     fsdp_kwargs: dict[str, object] = {"use_orig_params": True}
+    trainable_parameters = [
+        parameter for parameter in transformer.parameters() if parameter.requires_grad
+    ]
+    trainables_are_replicated = False
+    if (
+        trainable_parameters
+        and "ignored_states" in inspect.signature(FullyShardedDataParallel).parameters
+    ):
+        fsdp_kwargs["ignored_states"] = trainable_parameters
+        trainables_are_replicated = True
     auto_wrap_policy = _fsdp_transformer_block_auto_wrap_policy(transformer)
     if auto_wrap_policy is not None:
         fsdp_kwargs["auto_wrap_policy"] = auto_wrap_policy
@@ -1343,7 +1390,9 @@ def _maybe_wrap_distributed(
         if device_id is None:
             device_id = torch.cuda.current_device()
         fsdp_kwargs["device_id"] = torch.device("cuda", device_id)
-    return FullyShardedDataParallel(transformer, **fsdp_kwargs)
+    wrapped = FullyShardedDataParallel(transformer, **fsdp_kwargs)
+    setattr(wrapped, "_qat_fsdp_trainables_are_replicated", trainables_are_replicated)
+    return wrapped
 
 
 def _fsdp_transformer_block_auto_wrap_policy(
@@ -1509,6 +1558,8 @@ def _enable_qat_activation_checkpointing(transformer: nn.Module) -> int:
         original_forward = block.forward
 
         def _checkpointed_forward(*args, _original_forward=original_forward, **kwargs):
+            if not torch.is_grad_enabled():
+                return _original_forward(*args, **kwargs)
             return checkpoint(
                 _original_forward,
                 *args,
@@ -1787,7 +1838,7 @@ def _validate(
     component_totals: dict[str, float] = {}
     quality_totals: dict[str, float] = {}
     quality_counts: dict[str, int] = {}
-    with torch.no_grad():
+    with torch.inference_mode():
         for index in validation_indices:
             sample = dataset[index]
             output = _forward_sample(transformer, sample, device)
@@ -1887,10 +1938,20 @@ def _simple_ssim(prediction: torch.Tensor, target: torch.Tensor) -> float:
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
-    module = getattr(model, "module", None)
-    if isinstance(module, nn.Module):
-        return module
-    return model
+    unwrapped = model
+    seen: set[int] = set()
+    while id(unwrapped) not in seen:
+        seen.add(id(unwrapped))
+        module = getattr(unwrapped, "module", None)
+        if isinstance(module, nn.Module):
+            unwrapped = module
+            continue
+        fsdp_wrapped_module = getattr(unwrapped, "_fsdp_wrapped_module", None)
+        if isinstance(fsdp_wrapped_module, nn.Module):
+            unwrapped = fsdp_wrapped_module
+            continue
+        break
+    return unwrapped
 
 
 def _contains_fsdp(model: nn.Module) -> bool:
@@ -1947,6 +2008,23 @@ def _trainable_state_dict_from_model(
     }
 
 
+def _trainable_state_dict_from_injections(
+    model: nn.Module,
+    injections: Sequence[QatInjectionInfo],
+    trainable_names: set[str],
+) -> dict[str, torch.Tensor]:
+    trainable_state_dict: dict[str, torch.Tensor] = {}
+    for injection in injections:
+        module = _get_module_by_name(model, injection.module_name)
+        for parameter_name in injection.trainable_parameter_names:
+            state_name = _normalize_state_name(f"{injection.module_name}.{parameter_name}")
+            if state_name not in trainable_names:
+                continue
+            parameter = _get_parameter_by_name(module, parameter_name)
+            trainable_state_dict[state_name] = parameter.detach().cpu()
+    return trainable_state_dict
+
+
 def _trainable_state_dict_from_fsdp(
     model: nn.Module,
     trainable_names: set[str],
@@ -1986,7 +2064,20 @@ def _save_checkpoint(
     if not trainable_names:
         trainable_names = _requires_grad_parameter_names(model)
     if _contains_fsdp(model):
-        trainable_state_dict = _trainable_state_dict_from_fsdp(model, trainable_names)
+        if config.recipe == "lora_adapter" or bool(
+            getattr(model, "_qat_fsdp_trainables_are_replicated", False)
+        ):
+            if not _is_main_process():
+                return
+            _debug_log(f"saving {len(trainable_names)} FSDP trainable tensors directly")
+            trainable_state_dict = _trainable_state_dict_from_injections(
+                model,
+                injections,
+                trainable_names,
+            )
+        else:
+            _debug_log("saving FSDP trainable tensors through full state dict")
+            trainable_state_dict = _trainable_state_dict_from_fsdp(model, trainable_names)
     else:
         if not _is_main_process():
             return
@@ -1997,6 +2088,7 @@ def _save_checkpoint(
         raise RuntimeError(
             "QAT checkpoint contains no trainable tensors after state-dict filtering"
         )
+    _debug_log(f"writing QAT checkpoint {path} with {len(trainable_state_dict)} tensors")
     checkpoint = {
         "format": TRAINING_FORMAT,
         "config": config.model_dump(),

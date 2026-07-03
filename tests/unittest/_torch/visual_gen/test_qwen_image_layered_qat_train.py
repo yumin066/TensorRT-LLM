@@ -1090,6 +1090,39 @@ def test_train_qat_all_tuple_calibration_disables_early_stop(tmp_path, monkeypat
     ]
 
 
+def test_train_qat_writes_last_checkpoint_before_validation_failure(tmp_path, monkeypatch):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            checkpoint_interval_steps=1,
+            validation_interval_steps=1,
+        )
+    )
+
+    def _raise_validate(*_args, **_kwargs):
+        raise RuntimeError("scripted validation failure")
+
+    monkeypatch.setattr(qat_train, "_validate", _raise_validate)
+
+    with pytest.raises(RuntimeError, match="scripted validation failure"):
+        train_qwen_image_layered_qat(
+            config,
+            transformer=_TinyQwenTransformer(),
+            linear_cls=nn.Linear,
+        )
+
+    last_checkpoint_path = tmp_path / "out" / "checkpoint_last.pt"
+    assert last_checkpoint_path.exists()
+    checkpoint = torch.load(last_checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["checkpoint_path"] == str(last_checkpoint_path)
+    assert [record["phase"] for record in checkpoint["metrics"]] == ["train"]
+
+
 def test_train_qat_rejects_monitor_subset_larger_than_dataset(tmp_path):
     tuple_path = tmp_path / "tuple.pt"
     _write_tuple(tuple_path)
@@ -1386,3 +1419,28 @@ def test_train_qat_activation_checkpointing_preserves_parameter_names(tmp_path):
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
     assert provenance["activation_checkpointed_blocks"] == 1
     assert getattr(model.transformer_blocks[0], "_qat_activation_checkpointing_enabled")
+
+
+def test_activation_checkpointing_skips_checkpoint_when_grad_disabled(monkeypatch):
+    import torch.utils.checkpoint
+
+    class _Block(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states + 1
+
+    class _Transformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = nn.ModuleList([_Block()])
+
+    def _raise_if_checkpointed(*_args, **_kwargs):
+        raise AssertionError("checkpoint should not run while grad is disabled")
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", _raise_if_checkpointed)
+    model = _Transformer()
+
+    assert qat_train._enable_qat_activation_checkpointing(model) == 1
+    with torch.no_grad():
+        output = model.transformer_blocks[0](torch.tensor([1.0]))
+
+    assert output.item() == 2.0
