@@ -131,6 +131,7 @@ def _write_tuple(
     include_txt_seq_lens=True,
     include_additional_t_cond=False,
     optional_targets=None,
+    extra_payload=None,
 ):
     hidden_states = torch.randn(1, 2, 128)
     encoder_hidden_states = torch.randn(1, 3, 128)
@@ -156,6 +157,8 @@ def _write_tuple(
         payload["target_output"] = (hidden_states * 0.5).to(torch.bfloat16)
     if optional_targets is not None:
         payload.update(optional_targets)
+    if extra_payload is not None:
+        payload.update(extra_payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
     return payload
@@ -242,6 +245,40 @@ def test_config_rejects_all_zero_loss(tmp_path):
                     "composite_weight": 0.0,
                     "alpha_mask_weight": 0.0,
                     "perceptual_weight": 0.0,
+                },
+            )
+        )
+
+
+def test_config_accepts_late_step_weighted_loss(tmp_path):
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            loss={
+                "latent_weight": 1.0,
+                "timestep_weighting": "late_step_piecewise",
+                "timestep_weight_reference_steps": 50,
+                "timestep_weight_min": 1.0,
+                "timestep_weight_mid": 2.0,
+                "timestep_weight_max": 3.0,
+            },
+        )
+    )
+
+    assert config.loss.timestep_weighting == "late_step_piecewise"
+    assert config.loss.timestep_weight_max == 3.0
+
+
+def test_config_rejects_invalid_late_step_weight_boundaries(tmp_path):
+    with pytest.raises(ValidationError, match="timestep_weight_mid_fraction"):
+        QwenImageLayeredQatConfig(
+            **_base_config(
+                tmp_path,
+                loss={
+                    "latent_weight": 1.0,
+                    "timestep_weighting": "late_step_piecewise",
+                    "timestep_weight_mid_fraction": 0.8,
+                    "timestep_weight_max_fraction": 0.5,
                 },
             )
         )
@@ -522,6 +559,73 @@ def test_load_qat_config_accepts_yaml(tmp_path):
 
     assert config.tuple_manifest == str(manifest_path)
     assert config.training_framework == "native_pytorch"
+
+
+def test_dataset_extracts_diffusion_step_index_from_tuple_pair_path(tmp_path):
+    tuple_path = tmp_path / "tuple_0080_cond.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+
+    dataset = TransformerTupleDataset(manifest_path)
+
+    assert dataset[0].diffusion_step_index == 40
+
+
+def test_dataset_extracts_diffusion_step_index_from_bare_tuple_pair_path(tmp_path):
+    tuple_path = tmp_path / "tuple_0080.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+
+    dataset = TransformerTupleDataset(manifest_path)
+
+    assert dataset[0].diffusion_step_index == 40
+
+
+def test_timestep_weighted_loss_requires_diffusion_step_index(tmp_path):
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    dataset = TransformerTupleDataset(manifest_path)
+    loss_config = qat_train.LossConfig(
+        latent_weight=1.0,
+        timestep_weighting="late_step_piecewise",
+    )
+
+    with pytest.raises(ValueError, match="requires a diffusion step index"):
+        qat_train._validate_loss_payloads(loss_config, dataset)
+
+
+def test_late_step_piecewise_loss_weights_latent_reconstruction(tmp_path):
+    tuple_path = tmp_path / "tuple_0080_cond.pt"
+    _write_tuple(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, [tuple_path])
+    sample = TransformerTupleDataset(manifest_path)[0]
+    output = sample.target_output.float() + 1.0
+    loss_config = qat_train.LossConfig(
+        latent_weight=1.0,
+        timestep_weighting="late_step_piecewise",
+        timestep_weight_reference_steps=50,
+        timestep_weight_min=1.0,
+        timestep_weight_mid=2.0,
+        timestep_weight_max=3.0,
+    )
+
+    loss, components = qat_train._compute_loss(
+        output,
+        sample,
+        loss_config,
+        torch.device("cpu"),
+    )
+
+    assert sample.diffusion_step_index == 40
+    assert components["latent_reconstruction"].item() == pytest.approx(1.0)
+    assert components["unweighted_total"].item() == pytest.approx(1.0)
+    assert components["timestep_weight"].item() == pytest.approx(3.0)
+    assert loss.item() == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize(
@@ -1040,6 +1144,63 @@ def test_train_qat_all_tuple_calibration_records_monitor_metrics(tmp_path):
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
     assert provenance["best_metric_name"] == "monitor_all_100_loss"
     assert provenance["config"]["train_all_tuples"] is True
+
+
+def test_train_qat_timestep_weighted_monitor_records_unweighted_loss(tmp_path):
+    tuple_paths = []
+    for tuple_name in (
+        "tuple_0000_cond.pt",
+        "tuple_0001_negative.pt",
+        "tuple_0080_cond.pt",
+        "tuple_0081_negative.pt",
+    ):
+        tuple_path = tmp_path / tuple_name
+        _write_tuple(tuple_path)
+        tuple_paths.append(tuple_path)
+    manifest_path = tmp_path / "tuples.json"
+    _write_manifest(manifest_path, tuple_paths)
+    config = QwenImageLayeredQatConfig(
+        **_base_config(
+            tmp_path,
+            tuple_manifest=str(manifest_path),
+            max_steps=2,
+            validation_interval_steps=1,
+            checkpoint_interval_steps=1,
+            train_all_tuples=True,
+            monitor_subset_size=2,
+            monitor_subset_seed=3,
+            monitor_all_tuples=True,
+            disable_early_stop=True,
+            loss={
+                "latent_weight": 1.0,
+                "timestep_weighting": "late_step_piecewise",
+                "timestep_weight_reference_steps": 50,
+                "timestep_weight_min": 1.0,
+                "timestep_weight_mid": 2.0,
+                "timestep_weight_max": 3.0,
+            },
+        )
+    )
+
+    result = train_qwen_image_layered_qat(
+        config,
+        transformer=_TinyQwenTransformer(),
+        linear_cls=nn.Linear,
+    )
+
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    train_records = [record for record in metrics if record["phase"] == "train"]
+    monitor_subset_records = [record for record in metrics if record["phase"] == "monitor_subset"]
+    monitor_all_records = [record for record in metrics if record["phase"] == "monitor_all"]
+
+    assert all("unweighted_total" in record["loss_components"] for record in train_records)
+    assert all("timestep_weight" in record["loss_components"] for record in train_records)
+    assert all("monitor_subset_loss_unweighted" in record for record in monitor_subset_records)
+    assert all("monitor_all_100_loss_unweighted" in record for record in monitor_all_records)
+    assert any(
+        record["monitor_all_100_loss"] != pytest.approx(record["monitor_all_100_loss_unweighted"])
+        for record in monitor_all_records
+    )
 
 
 def test_train_qat_all_tuple_calibration_disables_early_stop(tmp_path, monkeypatch):

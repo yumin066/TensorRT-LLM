@@ -114,12 +114,55 @@ def test_merge_qat_trainable_state_maps_fake_linear_names():
     )
 
 
-def test_merge_qat_trainable_state_rejects_lora_adapter_names():
-    with pytest.raises(ValueError, match="LoRA adapter"):
+def test_merge_qat_trainable_state_requires_lora_config():
+    with pytest.raises(ValueError, match="requires checkpoint config"):
         qat_export.merge_qat_trainable_state(
             {"transformer_blocks.0.attn.to_q.weight": torch.zeros(128, 128)},
-            {"transformer_blocks.0.attn.to_q.lora_down.weight": torch.zeros(4, 128)},
+            {
+                "transformer_blocks.0.attn.to_q.lora_down.weight": torch.zeros(4, 128),
+                "transformer_blocks.0.attn.to_q.lora_up.weight": torch.zeros(128, 4),
+            },
         )
+
+
+def test_merge_qat_trainable_state_applies_lora_delta():
+    target = "transformer_blocks.0.attn.to_q"
+    source_weight = torch.zeros(3, 4, dtype=torch.bfloat16)
+    lora_down = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [0.5, 1.0, 1.5, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    lora_up = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    merged, merged_names = qat_export.merge_qat_trainable_state(
+        {f"{target}.weight": source_weight},
+        {
+            f"{target}.lora_down.weight": lora_down,
+            f"{target}.lora_up.weight": lora_up,
+        },
+        qat_config={"lora_rank": 2, "lora_alpha": 4.0},
+        injections=(
+            {
+                "module_name": target,
+                "trainable_parameter_names": ["lora_down.weight", "lora_up.weight"],
+            },
+        ),
+    )
+
+    expected_delta = torch.matmul(lora_up, lora_down) * 2.0
+    assert merged_names == (f"{target}.weight",)
+    assert merged[f"{target}.weight"].dtype == torch.bfloat16
+    assert torch.allclose(merged[f"{target}.weight"].float(), expected_delta)
 
 
 def test_export_static_state_dict_writes_fp8_auxiliary_tensors():
@@ -250,4 +293,82 @@ def test_export_qat_checkpoint_writes_static_transformer_directory(tmp_path):
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
     assert provenance["format"] == qat_export.EXPORT_FORMAT
     assert provenance["quantized_weight_count"] == 1
+    assert provenance["merged_parameter_names"] == [f"{target}.weight"]
+
+
+def test_export_qat_lora_checkpoint_writes_static_transformer_directory(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    source_dir = tmp_path / "source"
+    transformer_dir = source_dir / "transformer"
+    transformer_dir.mkdir(parents=True)
+    (source_dir / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "QwenImageLayeredPipeline",
+                "transformer": ["diffusers", "QwenImageTransformer2DModel"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (transformer_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "QwenImageTransformer2DModel",
+                "num_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = "transformer_blocks.0.attn.to_q"
+    save_file(
+        {
+            f"{target}.weight": torch.zeros(128, 128, dtype=torch.bfloat16),
+            f"{target}.bias": torch.zeros(128, dtype=torch.bfloat16),
+        },
+        str(transformer_dir / "diffusion_pytorch_model.safetensors"),
+    )
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format": TRAINING_FORMAT,
+            "config": {
+                "recipe": "lora_adapter",
+                "lora_rank": 2,
+                "lora_alpha": 4.0,
+            },
+            "trainable_state_dict": {
+                f"{target}.lora_down.weight": torch.full((2, 128), 0.25),
+                f"{target}.lora_up.weight": torch.full((128, 2), 0.5),
+            },
+            "injections": [
+                {
+                    "module_name": target,
+                    "block_index": 0,
+                    "role": "attn.to_q",
+                    "recipe": "lora_adapter",
+                    "trainable_parameter_names": ["lora_down.weight", "lora_up.weight"],
+                }
+            ],
+            "best_validation_loss": 0.25,
+        },
+        checkpoint_path,
+    )
+
+    config = qat_export.QwenImageLayeredQatExportConfig(
+        **_base_config(
+            tmp_path,
+            model=str(source_dir),
+            qat_checkpoint=str(checkpoint_path),
+            target_layers=[target],
+        )
+    )
+    result = qat_export.export_qwen_image_layered_qat(config)
+
+    exported = load_file(str(result.weight_path))
+    assert exported[f"{target}.weight"].dtype == torch.float8_e4m3fn
+    assert exported[f"{target}.weight_scale"].shape == (1, 1)
+
+    provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
+    assert provenance["qat_best_validation_loss"] == pytest.approx(0.25)
     assert provenance["merged_parameter_names"] == [f"{target}.weight"]

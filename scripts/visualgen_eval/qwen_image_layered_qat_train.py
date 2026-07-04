@@ -64,6 +64,7 @@ OPTIONAL_TARGET_KEYS = (
 
 RecipeName = Literal["lora_adapter", "partial_unfreeze"]
 OptimizerName = Literal["adamw", "sgd"]
+TimestepWeightingName = Literal["none", "late_step_piecewise", "late_step_linear"]
 ScheduleName = Literal[
     "smoke",
     "pilot",
@@ -169,6 +170,38 @@ class LossConfig(StrictBaseModel):
         default=0.0,
         description="Weight for an optional perceptual reconstruction loss.",
     )
+    timestep_weighting: TimestepWeightingName = Field(
+        default="none",
+        description="Optional per-diffusion-step loss weighting policy.",
+    )
+    timestep_weight_reference_steps: PositiveInt = Field(
+        default=50,
+        description="Number of denoising steps represented by the cached tuple set.",
+    )
+    timestep_weight_min: PositiveFloat = Field(
+        default=1.0,
+        description="Weight for early diffusion steps.",
+    )
+    timestep_weight_mid: PositiveFloat = Field(
+        default=2.0,
+        description="Middle weight for piecewise late-step weighting.",
+    )
+    timestep_weight_max: PositiveFloat = Field(
+        default=3.0,
+        description="Weight for the latest diffusion steps.",
+    )
+    timestep_weight_mid_fraction: float = Field(
+        default=0.5,
+        gt=0.0,
+        lt=1.0,
+        description="Fractional denoising-step boundary where the middle weight starts.",
+    )
+    timestep_weight_max_fraction: float = Field(
+        default=0.8,
+        gt=0.0,
+        lt=1.0,
+        description="Fractional denoising-step boundary where the maximum weight starts.",
+    )
 
     @model_validator(mode="after")
     def _validate_at_least_one_component(self) -> "LossConfig":
@@ -181,6 +214,10 @@ class LossConfig(StrictBaseModel):
             == 0.0
         ):
             raise ValueError("loss config must enable at least one component")
+        if self.timestep_weight_mid_fraction >= self.timestep_weight_max_fraction:
+            raise ValueError(
+                "timestep_weight_mid_fraction must be smaller than timestep_weight_max_fraction"
+            )
         return self
 
 
@@ -408,6 +445,7 @@ class TransformerTupleSample:
     hidden_states: torch.Tensor
     encoder_hidden_states: torch.Tensor
     timestep: object
+    diffusion_step_index: int | None
     img_shapes: object
     txt_seq_lens: object
     additional_t_cond: object | None
@@ -454,6 +492,7 @@ class ValidationMetrics:
     """Aggregated validation losses and optional image-quality metrics."""
 
     loss: float
+    unweighted_loss: float | None
     loss_components: dict[str, float]
     quality_metrics: dict[str, float]
 
@@ -1123,6 +1162,7 @@ def _load_tuple_sample(path: Path) -> TransformerTupleSample:
     hidden_states = _extract_hidden_states(args, kwargs, path)
     encoder_hidden_states = _extract_required_forward_tensor(kwargs, "encoder_hidden_states", path)
     timestep = _extract_timestep(kwargs, path)
+    diffusion_step_index = _extract_diffusion_step_index(payload, path)
     img_shapes = _extract_required_sequence(kwargs, "img_shapes", path)
     txt_seq_lens = _extract_txt_seq_lens(kwargs, path)
     if hidden_states.shape != target_output.shape:
@@ -1144,6 +1184,7 @@ def _load_tuple_sample(path: Path) -> TransformerTupleSample:
         hidden_states=hidden_states,
         encoder_hidden_states=encoder_hidden_states,
         timestep=timestep,
+        diffusion_step_index=diffusion_step_index,
         img_shapes=img_shapes,
         txt_seq_lens=txt_seq_lens,
         additional_t_cond=kwargs.get("additional_t_cond"),
@@ -1241,6 +1282,51 @@ def _extract_timestep(kwargs: Mapping[str, object], path: Path) -> object:
     if isinstance(timestep, torch.Tensor) and timestep.numel() == 0:
         raise ValueError(f"tuple timestep tensor must not be empty: {path}")
     return timestep
+
+
+def _extract_diffusion_step_index(payload: Mapping[str, object], path: Path) -> int | None:
+    for key in ("diffusion_step_index", "denoising_step_index", "step_index"):
+        value = payload.get(key)
+        if value is not None:
+            return _scalar_non_negative_int(value, key, path)
+
+    path_index = _diffusion_step_index_from_path(path)
+    if path_index is not None:
+        return path_index
+
+    call_index = payload.get("call_index")
+    if call_index is None:
+        return None
+    raw_call_index = _scalar_non_negative_int(call_index, "call_index", path)
+    role = str(payload.get("role", "")).lower()
+    if role in ("cond", "conditional", "negative", "uncond", "unconditional"):
+        return raw_call_index // 2
+    return raw_call_index
+
+
+def _scalar_non_negative_int(value: object, key: str, path: Path) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"tuple {key} must be an integer step index: {path}")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, torch.Tensor) and value.numel() == 1:
+        result = int(value.item())
+    else:
+        raise ValueError(f"tuple {key} must be a scalar integer step index: {path}")
+    if result < 0:
+        raise ValueError(f"tuple {key} must be non-negative: {path}")
+    return result
+
+
+def _diffusion_step_index_from_path(path: Path) -> int | None:
+    stem_parts = path.stem.split("_")
+    if len(stem_parts) < 2 or stem_parts[0] != "tuple":
+        return None
+    raw_index = stem_parts[1]
+    if not raw_index.isdigit():
+        return None
+    tuple_index = int(raw_index)
+    return tuple_index // 2
 
 
 def _extract_required_sequence(
@@ -1704,6 +1790,16 @@ def _validate_loss_payloads(
                     f"latent reconstruction loss requires target_output: {sample.path}"
                 )
 
+    if loss_config.timestep_weighting != "none":
+        missing_step_indices = [
+            str(sample.path) for sample in dataset.samples if sample.diffusion_step_index is None
+        ]
+        if missing_step_indices:
+            raise ValueError(
+                "timestep-weighted loss requires a diffusion step index; "
+                f"missing in {missing_step_indices[:3]}"
+            )
+
     for component_name, weight_name in _DIFFERENTIABLE_OPTIONAL_LOSSES.items():
         weight = getattr(loss_config, weight_name)
         if weight == 0.0:
@@ -1772,7 +1868,39 @@ def _compute_loss(
         loss_components[f"{component_name}_reconstruction"] = reconstruction_loss
         total_loss = total_loss + reconstruction_loss * float(weight)
 
+    if loss_config.timestep_weighting != "none":
+        timestep_weight = _timestep_loss_weight(sample, loss_config)
+        loss_components["unweighted_total"] = total_loss
+        loss_components["timestep_weight"] = output.float().new_tensor(timestep_weight)
+        total_loss = total_loss * timestep_weight
+
     return total_loss, loss_components
+
+
+def _timestep_loss_weight(sample: TransformerTupleSample, loss_config: LossConfig) -> float:
+    if loss_config.timestep_weighting == "none":
+        return 1.0
+    if sample.diffusion_step_index is None:
+        raise ValueError(f"sample is missing diffusion step index: {sample.path}")
+
+    step_index = min(
+        int(sample.diffusion_step_index),
+        int(loss_config.timestep_weight_reference_steps) - 1,
+    )
+    if loss_config.timestep_weighting == "late_step_piecewise":
+        step_fraction = step_index / float(loss_config.timestep_weight_reference_steps)
+        if step_fraction >= float(loss_config.timestep_weight_max_fraction):
+            return float(loss_config.timestep_weight_max)
+        if step_fraction >= float(loss_config.timestep_weight_mid_fraction):
+            return float(loss_config.timestep_weight_mid)
+        return float(loss_config.timestep_weight_min)
+    if loss_config.timestep_weighting == "late_step_linear":
+        denominator = max(int(loss_config.timestep_weight_reference_steps) - 1, 1)
+        progress = step_index / float(denominator)
+        return float(loss_config.timestep_weight_min) + progress * (
+            float(loss_config.timestep_weight_max) - float(loss_config.timestep_weight_min)
+        )
+    raise ValueError(f"unsupported timestep_weighting={loss_config.timestep_weighting}")
 
 
 def _derive_optional_reconstruction(
@@ -1835,6 +1963,7 @@ def _validate(
 ) -> ValidationMetrics:
     transformer.eval()
     losses: list[float] = []
+    unweighted_losses: list[float] = []
     component_totals: dict[str, float] = {}
     quality_totals: dict[str, float] = {}
     quality_counts: dict[str, int] = {}
@@ -1844,6 +1973,9 @@ def _validate(
             output = _forward_sample(transformer, sample, device)
             loss, loss_components = _compute_loss(output, sample, loss_config, device)
             losses.append(float(loss.detach().cpu()))
+            if loss_config.timestep_weighting != "none":
+                unweighted_loss = loss_components.get("unweighted_total", loss)
+                unweighted_losses.append(float(unweighted_loss.detach().cpu()))
             for name, value in _loss_components_to_float(loss_components).items():
                 component_totals[name] = component_totals.get(name, 0.0) + value
             for name, value in _optional_quality_metrics(output, sample).items():
@@ -1859,6 +1991,9 @@ def _validate(
     }
     return ValidationMetrics(
         loss=sum(losses) / sample_count,
+        unweighted_loss=(
+            sum(unweighted_losses) / len(unweighted_losses) if unweighted_losses else None
+        ),
         loss_components=loss_components_avg,
         quality_metrics=quality_metrics_avg,
     )
@@ -1894,6 +2029,8 @@ def _evaluate_and_record(
         "rank": _distributed_rank(),
         "world_size": _distributed_world_size(),
     }
+    if evaluation_metrics.unweighted_loss is not None:
+        evaluation_record[f"{metric_name}_unweighted"] = evaluation_metrics.unweighted_loss
     metrics.append(evaluation_record)
     _write_jsonl_record(metrics_jsonl, evaluation_record)
     return evaluation_loss

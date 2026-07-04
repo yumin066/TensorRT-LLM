@@ -10,6 +10,7 @@ import json
 import platform
 import shutil
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -115,6 +116,7 @@ class QatCheckpoint:
     """Validated QAT checkpoint payload."""
 
     path: Path
+    config: dict[str, object]
     trainable_state_dict: dict[str, torch.Tensor]
     injections: tuple[dict[str, object], ...]
     best_validation_loss: float | None
@@ -187,7 +189,10 @@ def export_qwen_image_layered_qat(config: QwenImageLayeredQatExportConfig) -> Ex
     source_state = load_transformer_state_dict(source_transformer_dir)
     qat_checkpoint = load_qat_checkpoint(Path(config.qat_checkpoint))
     merged_state, merged_parameter_names = merge_qat_trainable_state(
-        source_state, qat_checkpoint.trainable_state_dict
+        source_state,
+        qat_checkpoint.trainable_state_dict,
+        qat_config=qat_checkpoint.config,
+        injections=qat_checkpoint.injections,
     )
     exported_state, quantized_layers = export_static_mxfp8_state_dict(
         merged_state,
@@ -276,8 +281,14 @@ def load_qat_checkpoint(path: Path) -> QatCheckpoint:
     best_validation_loss = payload.get("best_validation_loss")
     if best_validation_loss is not None:
         best_validation_loss = float(best_validation_loss)
+    qat_config = payload.get("config", {})
+    if qat_config is None:
+        qat_config = {}
+    if not isinstance(qat_config, dict):
+        raise ValueError("QAT checkpoint config must be a mapping when present")
     return QatCheckpoint(
         path=path,
+        config=qat_config,
         trainable_state_dict=checked_state,
         injections=tuple(dict(item) for item in injections),
         best_validation_loss=best_validation_loss,
@@ -287,11 +298,20 @@ def load_qat_checkpoint(path: Path) -> QatCheckpoint:
 def merge_qat_trainable_state(
     source_state: dict[str, torch.Tensor],
     trainable_state: dict[str, torch.Tensor],
+    *,
+    qat_config: Mapping[str, object] | None = None,
+    injections: tuple[dict[str, object], ...] = (),
 ) -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
-    """Merge partial-unfreeze QAT trainable tensors into a BF16 transformer state dict."""
+    """Merge partial-unfreeze or LoRA QAT trainables into a BF16 transformer state dict."""
     merged = dict(source_state)
     merged_names: list[str] = []
+    lora_state: dict[str, dict[str, torch.Tensor]] = {}
     for qat_name, tensor in trainable_state.items():
+        lora_name = _split_lora_trainable_name(qat_name)
+        if lora_name is not None:
+            module_name, parameter_name = lora_name
+            lora_state.setdefault(module_name, {})[parameter_name] = tensor
+            continue
         target_name = _qat_trainable_name_to_checkpoint_name(qat_name)
         if target_name not in source_state:
             raise ValueError(
@@ -307,7 +327,10 @@ def merge_qat_trainable_state(
             raise ValueError(f"QAT tensor {qat_name!r} must be floating point")
         merged[target_name] = tensor.to(dtype=source_tensor.dtype).contiguous()
         merged_names.append(target_name)
-    return merged, tuple(sorted(merged_names))
+    if lora_state:
+        _validate_lora_injections(lora_state, injections)
+        merged_names.extend(_merge_lora_adapter_state(merged, source_state, lora_state, qat_config))
+    return merged, tuple(sorted(set(merged_names)))
 
 
 def export_static_mxfp8_state_dict(
@@ -509,6 +532,128 @@ def _write_model_index(source_model: Path, output_dir: Path, *, copy_source: boo
         + "\n",
         encoding="utf-8",
     )
+
+
+def _split_lora_trainable_name(qat_name: str) -> tuple[str, str] | None:
+    normalized = _normalize_module_name(qat_name)
+    for parameter_name in ("lora_down.weight", "lora_up.weight"):
+        suffix = f".{parameter_name}"
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)], parameter_name
+    return None
+
+
+def _validate_lora_injections(
+    lora_state: Mapping[str, Mapping[str, torch.Tensor]],
+    injections: tuple[dict[str, object], ...],
+) -> None:
+    if not injections:
+        return
+    injected_lora_modules = {
+        _normalize_module_name(str(injection.get("module_name")))
+        for injection in injections
+        if _injection_has_lora_trainables(injection)
+    }
+    if not injected_lora_modules:
+        return
+    unexpected_modules = sorted(set(lora_state) - injected_lora_modules)
+    if unexpected_modules:
+        raise ValueError(
+            "LoRA trainable tensors are missing matching injection records: "
+            f"{unexpected_modules[:5]}"
+        )
+
+
+def _injection_has_lora_trainables(injection: Mapping[str, object]) -> bool:
+    trainable_names = injection.get("trainable_parameter_names")
+    if not isinstance(trainable_names, list):
+        return False
+    return "lora_down.weight" in trainable_names and "lora_up.weight" in trainable_names
+
+
+def _merge_lora_adapter_state(
+    merged_state: dict[str, torch.Tensor],
+    source_state: Mapping[str, torch.Tensor],
+    lora_state: Mapping[str, Mapping[str, torch.Tensor]],
+    qat_config: Mapping[str, object] | None,
+) -> tuple[str, ...]:
+    merged_names: list[str] = []
+    for module_name, tensors in lora_state.items():
+        target_name = f"{module_name}.weight"
+        if target_name not in source_state:
+            raise ValueError(
+                f"LoRA module {module_name!r} maps to missing checkpoint key {target_name!r}."
+            )
+        lora_down = tensors.get("lora_down.weight")
+        lora_up = tensors.get("lora_up.weight")
+        if lora_down is None or lora_up is None:
+            raise ValueError(
+                f"LoRA module {module_name!r} requires lora_down.weight and lora_up.weight"
+            )
+        source_tensor = source_state[target_name]
+        _validate_lora_pair(
+            module_name=module_name,
+            source_tensor=source_tensor,
+            lora_down=lora_down,
+            lora_up=lora_up,
+        )
+        rank = int(lora_down.shape[0])
+        scaling = _lora_scaling_from_config(qat_config, rank=rank, module_name=module_name)
+        delta = torch.matmul(lora_up.float(), lora_down.float()) * scaling
+        merged_state[target_name] = (
+            source_tensor.float().add(delta).to(dtype=source_tensor.dtype).contiguous()
+        )
+        merged_names.append(target_name)
+    return tuple(merged_names)
+
+
+def _validate_lora_pair(
+    *,
+    module_name: str,
+    source_tensor: torch.Tensor,
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
+) -> None:
+    if not torch.is_floating_point(lora_down) or not torch.is_floating_point(lora_up):
+        raise ValueError(f"LoRA tensors for {module_name!r} must be floating point")
+    if lora_down.ndim != 2 or lora_up.ndim != 2:
+        raise ValueError(f"LoRA tensors for {module_name!r} must be 2D")
+    rank, in_features = lora_down.shape
+    out_features, up_rank = lora_up.shape
+    if rank <= 0 or up_rank != rank:
+        raise ValueError(
+            f"LoRA tensors for {module_name!r} have incompatible ranks: "
+            f"down={tuple(lora_down.shape)}, up={tuple(lora_up.shape)}"
+        )
+    if tuple(source_tensor.shape) != (out_features, in_features):
+        raise ValueError(
+            f"LoRA tensors for {module_name!r} map to shape {(out_features, in_features)}, "
+            f"but checkpoint weight has shape {tuple(source_tensor.shape)}."
+        )
+
+
+def _lora_scaling_from_config(
+    qat_config: Mapping[str, object] | None,
+    *,
+    rank: int,
+    module_name: str,
+) -> float:
+    if qat_config is None:
+        raise ValueError(
+            "LoRA adapter QAT merge requires checkpoint config with lora_rank and lora_alpha"
+        )
+    config_rank = qat_config.get("lora_rank")
+    config_alpha = qat_config.get("lora_alpha")
+    if config_rank is None or config_alpha is None:
+        raise ValueError(
+            "LoRA adapter QAT merge requires checkpoint config with lora_rank and lora_alpha"
+        )
+    if int(config_rank) != rank:
+        raise ValueError(
+            f"LoRA rank mismatch for {module_name!r}: checkpoint config has {config_rank}, "
+            f"adapter tensor rank is {rank}."
+        )
+    return float(config_alpha) / float(rank)
 
 
 def _qat_trainable_name_to_checkpoint_name(qat_name: str) -> str:
