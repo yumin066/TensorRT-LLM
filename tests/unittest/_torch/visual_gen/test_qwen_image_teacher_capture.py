@@ -87,9 +87,10 @@ class DummyScheduler:
 
 
 class DummyPipeline:
-    def __init__(self) -> None:
+    def __init__(self, *, include_txt_seq_lens: bool = True) -> None:
         self.transformer = DummyTransformer()
         self.scheduler = DummyScheduler()
+        self.include_txt_seq_lens = include_txt_seq_lens
 
     def infer(self, record: dict[str, object]) -> object:
         num_steps = record["num_inference_steps"]
@@ -101,15 +102,19 @@ class DummyPipeline:
         return object()
 
     def _forward_branch(self) -> None:
-        self.transformer.forward(
-            hidden_states=FakeTensor(),
-            timestep=FakeTensor(),
-            encoder_hidden_states=FakeTensor(),
-            encoder_hidden_states_mask=FakeTensor(dtype="bool"),
-            img_shapes=[[(1, 64, 64)]],
-            txt_seq_lens=[16],
-            return_dict=False,
-        )
+        kwargs: dict[str, object] = {
+            "hidden_states": FakeTensor(),
+            "timestep": FakeTensor(),
+            "encoder_hidden_states": FakeTensor(),
+            "encoder_hidden_states_mask": FakeTensor(dtype="bool"),
+            "img_shapes": [[(1, 64, 64)]],
+            "return_dict": False,
+        }
+        if self.include_txt_seq_lens:
+            kwargs["txt_seq_lens"] = [16]
+        else:
+            kwargs["encoder_hidden_states_mask"] = [[True] * 16]
+        self.transformer.forward(**kwargs)
 
 
 @pytest.fixture
@@ -196,6 +201,42 @@ def test_capture_records_with_dummy_pipeline_and_validate(capture_case: CaptureC
     assert tuple_entries[0]["status"] == "captured"
     assert Path(tuple_entries[0]["tuple_path"]).is_file()
     assert Path(tuple_entries[0]["reference_image_path"]).is_file()
+
+
+def test_capture_derives_missing_txt_seq_lens(capture_case: CaptureCase) -> None:
+    records, prompt_summary, capture_summary, tuple_entries, smoke_records = capture_case
+    pipeline = DummyPipeline(include_txt_seq_lens=False)
+    capture_records_with_pipeline(
+        pipeline,
+        records=smoke_records,
+        tuple_entries=tuple_entries,
+        save_reference_fn=_write_reference,
+        infer_fn=lambda dummy_pipeline, record: dummy_pipeline.infer(record),
+        torch_module=FakeTorch,
+    )
+    captured_summary = build_captured_summary(
+        capture_summary,
+        tuple_entries=tuple_entries,
+        provenance={
+            "container_runtime": "enroot",
+            "enroot_image": DEFAULT_ENROOT_IMAGE,
+            "command": "ssh-gw task submit alloc -- python capture-smoke",
+        },
+        pipeline=pipeline,
+    )
+
+    validate_captured_artifacts(
+        captured_summary,
+        records=records,
+        prompt_summary=prompt_summary,
+        tuple_entries=tuple_entries,
+        torch_module=FakeTorch,
+    )
+
+    payload = FakeTorch.load(tuple_entries[0]["tuple_path"])
+    if not isinstance(payload, dict):
+        raise TypeError("expected fake tuple payload to be a mapping")
+    assert payload["txt_seq_lens"] == [16]
 
 
 def test_captured_validator_rejects_missing_tuple_file(capture_case: CaptureCase) -> None:

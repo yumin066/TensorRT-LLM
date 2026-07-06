@@ -185,7 +185,10 @@ def build_teacher_tuple_payload(
     torch_module: Any | None = None,
 ) -> dict[str, object]:
     torch_module = torch_module or _load_torch()
-    kwargs_cpu = tensor_to_cpu(kwargs, torch_module)
+    kwargs_cpu_raw = tensor_to_cpu(kwargs, torch_module)
+    if not isinstance(kwargs_cpu_raw, dict):
+        raise ValueError("transformer kwargs did not serialize to a mapping")
+    kwargs_cpu = _with_derived_capture_fields(kwargs_cpu_raw, torch_module)
     payload: dict[str, object] = {}
     for field_name in REQUIRED_CAPTURE_FIELDS:
         if field_name == "target_output":
@@ -208,6 +211,85 @@ def build_teacher_tuple_payload(
     payload["status"] = CAPTURED_TUPLE_STATUS
     payload["trajectory_source"] = BF16_TEACHER_TRAJECTORY_SOURCE
     return payload
+
+
+def _with_derived_capture_fields(
+    kwargs_cpu: dict[str, object], torch_module: Any
+) -> dict[str, object]:
+    normalized = dict(kwargs_cpu)
+    if "txt_seq_lens" not in normalized:
+        normalized["txt_seq_lens"] = _derive_txt_seq_lens(normalized, torch_module)
+    return normalized
+
+
+def _derive_txt_seq_lens(kwargs_cpu: dict[str, object], torch_module: Any) -> list[int]:
+    lengths = _txt_seq_lens_from_mask(kwargs_cpu.get("encoder_hidden_states_mask"), torch_module)
+    if lengths:
+        return lengths
+    lengths = _txt_seq_lens_from_encoder_hidden_states(
+        kwargs_cpu.get("encoder_hidden_states"), torch_module
+    )
+    if lengths:
+        return lengths
+    raise ValueError(
+        "transformer kwargs missing required field: txt_seq_lens and it could not be "
+        "derived from encoder_hidden_states_mask or encoder_hidden_states"
+    )
+
+
+def _txt_seq_lens_from_mask(mask: object, torch_module: Any) -> list[int] | None:
+    if mask is None:
+        return None
+    if _is_tensor(mask, torch_module):
+        try:
+            int_dtype = getattr(torch_module, "int64", None)
+            mask_for_sum = mask.to(dtype=int_dtype) if int_dtype is not None else mask
+            return _coerce_int_list(mask_for_sum.sum(dim=-1).tolist())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+    if isinstance(mask, (list, tuple)):
+        return _txt_seq_lens_from_sequence_mask(mask)
+    return None
+
+
+def _txt_seq_lens_from_sequence_mask(mask: list[object] | tuple[object, ...]) -> list[int]:
+    if not mask:
+        return []
+    if all(not isinstance(row, (list, tuple)) for row in mask):
+        return [sum(1 for value in mask if bool(value))]
+    lengths = []
+    for row in mask:
+        if not isinstance(row, (list, tuple)):
+            return []
+        lengths.append(sum(1 for value in row if bool(value)))
+    return lengths
+
+
+def _txt_seq_lens_from_encoder_hidden_states(
+    encoder_hidden_states: object, torch_module: Any
+) -> list[int] | None:
+    if encoder_hidden_states is None or not _is_tensor(encoder_hidden_states, torch_module):
+        return None
+    shape = getattr(encoder_hidden_states, "shape", None)
+    if shape is None:
+        return None
+    dims = tuple(int(dim) for dim in shape)
+    if len(dims) >= 3:
+        return [dims[1]] * dims[0]
+    if len(dims) == 2:
+        return [dims[0]]
+    return None
+
+
+def _coerce_int_list(value: object) -> list[int]:
+    if isinstance(value, (int, float, bool)):
+        return [int(value)]
+    if isinstance(value, list):
+        if all(isinstance(item, (int, float, bool)) for item in value):
+            return [int(item) for item in value]
+        if len(value) == 1 and isinstance(value[0], list):
+            return _coerce_int_list(value[0])
+    return []
 
 
 def capture_record_with_pipeline(
