@@ -48,6 +48,8 @@ DEFAULT_TUPLE_INDEX_NAME = "qwen_image_teacher_tuple_index_v1.jsonl"
 TIMESTEP_BIN_NAMES = ("early", "early_mid", "mid", "late_mid", "late")
 TIMESTEP_BIN_EDGES = (0.2, 0.4, 0.6, 0.8)
 FORBIDDEN_RUNTIME_TOKENS = ("docker", "--no-enroot", "no_enroot", "no-enroot")
+PLANNED_TUPLE_STATUS = "planned"
+BF16_TEACHER_TRAJECTORY_SOURCE = "bf16_teacher"
 LAYERED_ONLY_FIELDS = {
     "image",
     "layers",
@@ -166,8 +168,8 @@ def build_tuple_index(
                         "timestep_bin": timestep_bin,
                         "cfg_branch": cfg_branch,
                         "required_fields": list(REQUIRED_CAPTURE_FIELDS),
-                        "trajectory_source": "bf16_teacher",
-                        "status": "planned",
+                        "trajectory_source": BF16_TEACHER_TRAJECTORY_SOURCE,
+                        "status": PLANNED_TUPLE_STATUS,
                     }
                 )
     validate_tuple_index(
@@ -235,6 +237,8 @@ def validate_capture_summary(
     records: list[dict[str, object]],
     prompt_summary: dict[str, object],
     tuple_entries: list[dict[str, object]],
+    capture_summary_path: Path | None = None,
+    tuple_index_path: Path | None = None,
 ) -> None:
     if summary.get("format") != CAPTURE_MANIFEST_FORMAT:
         raise ValueError(f"capture summary format must be {CAPTURE_MANIFEST_FORMAT}")
@@ -246,6 +250,11 @@ def validate_capture_summary(
     selected_records = _selected_records_from_tuple_entries(records, tuple_entries)
     _validate_capture_durable_paths(summary)
     capture_durable_paths = _expect_mapping(summary, "durable_paths")
+    _validate_capture_artifact_paths(
+        capture_durable_paths,
+        capture_summary_path=capture_summary_path,
+        tuple_index_path=tuple_index_path,
+    )
     validate_tuple_index(
         tuple_entries,
         records=selected_records,
@@ -316,6 +325,18 @@ def validate_tuple_index(
         if prompt_id not in records_by_prompt:
             raise ValueError(f"tuple entry references unknown prompt_id: {prompt_id}")
         record = records_by_prompt[prompt_id]
+        entry_split = _expect_split(entry)
+        record_split = _expect_split(record)
+        if entry_split != record_split:
+            raise ValueError(f"tuple {tuple_id} split does not match prompt record split")
+        if _expect_string(entry, "trajectory_source") != BF16_TEACHER_TRAJECTORY_SOURCE:
+            raise ValueError(
+                f"tuple {tuple_id} trajectory_source must be {BF16_TEACHER_TRAJECTORY_SOURCE}"
+            )
+        if _expect_string(entry, "status") != PLANNED_TUPLE_STATUS:
+            raise ValueError(
+                f"tuple {tuple_id} status must remain {PLANNED_TUPLE_STATUS} until capture"
+            )
         num_steps = _expect_positive_int(record, "num_inference_steps")
         timestep_index = _expect_non_negative_int(entry, "timestep_index")
         if timestep_index >= num_steps:
@@ -509,6 +530,22 @@ def _validate_capture_durable_paths(summary: dict[str, object]) -> None:
             raise ValueError(f"capture durable_paths.{field_name} must be under durable run_root")
 
 
+def _validate_capture_artifact_paths(
+    durable_paths: dict[str, object],
+    *,
+    capture_summary_path: Path | None,
+    tuple_index_path: Path | None,
+) -> None:
+    if capture_summary_path is not None:
+        expected_capture_summary = _expect_string(durable_paths, "capture_summary")
+        if str(capture_summary_path) != expected_capture_summary:
+            raise ValueError("capture summary path must match durable_paths.capture_summary")
+    if tuple_index_path is not None:
+        expected_tuple_index = _expect_string(durable_paths, "tuple_index")
+        if str(tuple_index_path) != expected_tuple_index:
+            raise ValueError("tuple index path must match durable_paths.tuple_index")
+
+
 def _validate_tuple_entry_path(
     entry: dict[str, object],
     *,
@@ -638,6 +675,8 @@ def _validate_capture_plan_command(args: argparse.Namespace) -> None:
         records=records,
         prompt_summary=prompt_summary,
         tuple_entries=tuple_entries,
+        capture_summary_path=Path(args.capture_summary_json),
+        tuple_index_path=Path(args.tuple_index_jsonl),
     )
 
 

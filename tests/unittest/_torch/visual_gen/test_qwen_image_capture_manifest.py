@@ -170,6 +170,63 @@ def test_tuple_index_rejects_bad_timestep_bin():
         validate_tuple_index(tuple_entries, records=smoke_records)
 
 
+def test_tuple_index_rejects_split_mismatch():
+    records, prompt_summary = _prompt_records_and_summary()
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=PROMPT_MANIFEST_PATH,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
+        splits=("smoke",),
+        project_root=Path.cwd(),
+    )
+    tuple_entries[0] = {**tuple_entries[0], "split": "held_out"}
+
+    with pytest.raises(ValueError, match="split"):
+        validate_capture_summary(
+            capture_summary,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=tuple_entries,
+        )
+
+
+def test_tuple_index_rejects_captured_status_and_wrong_trajectory_source():
+    records, prompt_summary = _prompt_records_and_summary()
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=PROMPT_MANIFEST_PATH,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
+        splits=("smoke",),
+        project_root=Path.cwd(),
+    )
+    captured_entries = list(tuple_entries)
+    captured_entries[0] = {**captured_entries[0], "status": "captured"}
+    with pytest.raises(ValueError, match="status"):
+        validate_capture_summary(
+            capture_summary,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=captured_entries,
+        )
+
+    student_entries = list(tuple_entries)
+    student_entries[0] = {
+        **student_entries[0],
+        "trajectory_source": "student_recapture",
+    }
+    with pytest.raises(ValueError, match="trajectory_source"):
+        validate_capture_summary(
+            capture_summary,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=student_entries,
+        )
+
+
 def test_capture_summary_rejects_tmp_and_docker_provenance():
     records, prompt_summary = _prompt_records_and_summary()
     capture_summary, tuple_entries = build_capture_plan(
@@ -256,7 +313,56 @@ def test_validate_accepts_smoke_plan_with_full_prompt_records():
         records=records,
         prompt_summary=prompt_summary,
         tuple_entries=tuple_entries,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
     )
+
+
+def test_capture_summary_rejects_actual_summary_and_index_path_mismatch():
+    records, prompt_summary = _prompt_records_and_summary()
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=PROMPT_MANIFEST_PATH,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
+        splits=("smoke",),
+        project_root=Path.cwd(),
+    )
+
+    wrong_summary_path = {
+        **capture_summary,
+        "durable_paths": {
+            **capture_summary["durable_paths"],
+            "capture_summary": f"{REMOTE_RUN_ROOT}/manifests/other_capture.json",
+        },
+    }
+    with pytest.raises(ValueError, match="capture summary path"):
+        validate_capture_summary(
+            wrong_summary_path,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=tuple_entries,
+            capture_summary_path=CAPTURE_SUMMARY_PATH,
+            tuple_index_path=TUPLE_INDEX_PATH,
+        )
+
+    wrong_tuple_index_path = {
+        **capture_summary,
+        "durable_paths": {
+            **capture_summary["durable_paths"],
+            "tuple_index": f"{REMOTE_RUN_ROOT}/manifests/other_tuple_index.jsonl",
+        },
+    }
+    with pytest.raises(ValueError, match="tuple index path"):
+        validate_capture_summary(
+            wrong_tuple_index_path,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=tuple_entries,
+            capture_summary_path=CAPTURE_SUMMARY_PATH,
+            tuple_index_path=TUPLE_INDEX_PATH,
+        )
 
 
 def test_tuple_paths_must_stay_under_declared_roots():
