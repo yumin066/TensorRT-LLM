@@ -22,6 +22,8 @@ import pytest
 from scripts.visualgen_eval.qwen_image_prompt_manifest import (
     DEFAULT_ENROOT_IMAGE,
     DEFAULT_SPLIT_COUNTS,
+    LOCAL_SMOKE_ARTIFACT_POLICY,
+    REQUIRED_CAPTURE_FIELDS,
     REQUIRED_CATEGORIES,
     build_default_prompt_records,
     build_summary,
@@ -43,8 +45,9 @@ REMOTE_CACHE_ROOT = (
 
 
 def _summary_kwargs(tmp_path: Path) -> dict:
+    del tmp_path
     return {
-        "manifest_jsonl": tmp_path / "qwen_image_qat_prompts_v1.jsonl",
+        "manifest_jsonl": (Path(REMOTE_RUN_ROOT) / "manifests" / "qwen_image_qat_prompts_v1.jsonl"),
         "checkout_root": REMOTE_CHECKOUT,
         "run_root": REMOTE_RUN_ROOT,
         "cache_root": REMOTE_CACHE_ROOT,
@@ -73,6 +76,9 @@ def test_default_prompt_manifest_counts_and_summary(tmp_path):
     assert read_jsonl(manifest_jsonl) == records
     assert read_json(summary_json)["enroot_image"] == DEFAULT_ENROOT_IMAGE
     assert summary["expected_total_teacher_tuples"] == 19_300
+    assert summary["expected_tuples_per_prompt"] == 100
+    assert summary["required_capture_fields"] == list(REQUIRED_CAPTURE_FIELDS)
+    assert summary["task2_input_ready"] is True
     assert summary["durable_paths"]["prompt_manifest"].endswith(
         "manifests/qwen_image_qat_prompts_v1.jsonl"
     )
@@ -146,6 +152,32 @@ def test_prompt_summary_rejects_docker_and_wrong_enroot(tmp_path):
         validate_summary(bad_command, records=records)
 
 
+def test_prompt_summary_rejects_bad_derived_fields(tmp_path):
+    records = build_default_prompt_records()
+    summary = build_summary(records=records, **_summary_kwargs(tmp_path))
+
+    bad_total = {**summary, "expected_total_teacher_tuples": 1}
+    with pytest.raises(ValueError, match="expected_total_teacher_tuples"):
+        validate_summary(bad_total, records=records)
+
+    bad_count = {**summary, "prompt_count": 1}
+    with pytest.raises(ValueError, match="prompt_count"):
+        validate_summary(bad_count, records=records)
+
+    bad_format = {**summary, "manifest_format": "wrong"}
+    with pytest.raises(ValueError, match="manifest_format"):
+        validate_summary(bad_format, records=records)
+
+
+def test_prompt_summary_rejects_incomplete_capture_fields(tmp_path):
+    records = build_default_prompt_records()
+    summary = build_summary(records=records, **_summary_kwargs(tmp_path))
+    summary["required_capture_fields"] = ["prompt_id"]
+
+    with pytest.raises(ValueError, match="required_capture_fields"):
+        validate_summary(summary, records=records)
+
+
 def test_prompt_summary_rejects_tmp_durable_path(tmp_path):
     records = build_default_prompt_records()
     summary = build_summary(records=records, **_summary_kwargs(tmp_path))
@@ -156,3 +188,50 @@ def test_prompt_summary_rejects_tmp_durable_path(tmp_path):
 
     with pytest.raises(ValueError, match="must not be under /tmp"):
         validate_summary(summary, records=records)
+
+    summary = build_summary(records=records, **_summary_kwargs(tmp_path))
+    summary["durable_paths"] = {
+        **summary["durable_paths"],
+        "bf16_references": "/tmp/qwen_image_qat/references",
+    }
+
+    with pytest.raises(ValueError, match="bf16_references"):
+        validate_summary(summary, records=records)
+
+    summary = build_summary(records=records, **_summary_kwargs(tmp_path))
+    summary["durable_paths"] = {
+        **summary["durable_paths"],
+        "teacher_tuples": "/tmp/qwen_image_qat/tuples",
+    }
+
+    with pytest.raises(ValueError, match="teacher_tuples"):
+        validate_summary(summary, records=records)
+
+
+def test_prompt_summary_rejects_formal_manifest_path_mismatch(tmp_path):
+    records = build_default_prompt_records()
+
+    with pytest.raises(ValueError, match="formal prompt manifest path"):
+        build_summary(
+            records=records,
+            manifest_jsonl=tmp_path / "qwen_image_qat_prompts_v1.jsonl",
+            checkout_root=REMOTE_CHECKOUT,
+            run_root=REMOTE_RUN_ROOT,
+            cache_root=REMOTE_CACHE_ROOT,
+        )
+
+
+def test_prompt_summary_allows_explicit_local_smoke_output(tmp_path):
+    records = build_default_prompt_records()
+    summary = build_summary(
+        records=records,
+        manifest_jsonl=tmp_path / "qwen_image_qat_prompts_v1.jsonl",
+        checkout_root=REMOTE_CHECKOUT,
+        run_root=REMOTE_RUN_ROOT,
+        cache_root=REMOTE_CACHE_ROOT,
+        artifact_policy=LOCAL_SMOKE_ARTIFACT_POLICY,
+    )
+
+    assert summary["artifact_policy"] == LOCAL_SMOKE_ARTIFACT_POLICY
+    assert summary["task2_input_ready"] is False
+    validate_summary(summary, records=records)

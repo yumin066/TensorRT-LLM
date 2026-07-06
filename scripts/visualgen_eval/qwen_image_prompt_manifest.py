@@ -26,9 +26,12 @@ from pathlib import Path
 from typing import Literal, cast
 
 PromptSplit = Literal["smoke", "fast_calibration", "main_calibration", "held_out"]
+ArtifactPolicy = Literal["durable_b300_enroot_only", "local_smoke"]
 
 MANIFEST_FORMAT = "qwen_image_prompt_manifest_v1"
 SUMMARY_FORMAT = "qwen_image_prompt_manifest_summary_v1"
+DEFAULT_ARTIFACT_POLICY: ArtifactPolicy = "durable_b300_enroot_only"
+LOCAL_SMOKE_ARTIFACT_POLICY: ArtifactPolicy = "local_smoke"
 DEFAULT_MODEL = "Qwen/Qwen-Image"
 DEFAULT_CLUSTER_ALIAS = "B300-mars"
 DEFAULT_CONTAINER_RUNTIME = "enroot"
@@ -88,6 +91,32 @@ REQUIRED_RECORD_FIELDS = {
     "cfg_branches",
     "expected_tuple_count",
 }
+REQUIRED_CAPTURE_FIELDS = (
+    "hidden_states",
+    "timestep",
+    "encoder_hidden_states",
+    "encoder_hidden_states_mask",
+    "img_shapes",
+    "txt_seq_lens",
+    "target_output",
+    "prompt_id",
+    "timestep_index",
+    "cfg_branch",
+    "timestep_bin",
+)
+REQUIRED_DURABLE_PATH_FIELDS = (
+    "checkout_root",
+    "run_root",
+    "cache_root",
+    "prompt_manifest",
+    "bf16_references",
+    "teacher_tuples",
+)
+RUN_ROOT_DURABLE_PATH_FIELDS = (
+    "prompt_manifest",
+    "bf16_references",
+    "teacher_tuples",
+)
 
 
 @dataclass(frozen=True)
@@ -435,6 +464,7 @@ def build_summary(
     cluster_alias: str = DEFAULT_CLUSTER_ALIAS,
     container_runtime: str = DEFAULT_CONTAINER_RUNTIME,
     enroot_image: str = DEFAULT_ENROOT_IMAGE,
+    artifact_policy: ArtifactPolicy = DEFAULT_ARTIFACT_POLICY,
 ) -> dict[str, object]:
     """Build and validate the manifest summary/provenance payload."""
     split_counts = validate_prompt_records(records)
@@ -475,20 +505,9 @@ def build_summary(
         "local_output_paths": {
             "manifest_jsonl": str(manifest_jsonl),
         },
-        "artifact_policy": "durable_b300_enroot_only",
-        "required_capture_fields": [
-            "hidden_states",
-            "timestep",
-            "encoder_hidden_states",
-            "encoder_hidden_states_mask",
-            "img_shapes",
-            "txt_seq_lens",
-            "target_output",
-            "prompt_id",
-            "timestep_index",
-            "cfg_branch",
-            "timestep_bin",
-        ],
+        "artifact_policy": artifact_policy,
+        "task2_input_ready": artifact_policy == DEFAULT_ARTIFACT_POLICY,
+        "required_capture_fields": list(REQUIRED_CAPTURE_FIELDS),
     }
     validate_summary(payload, records=records)
     return payload
@@ -496,6 +515,9 @@ def build_summary(
 
 def validate_summary(summary: dict[str, object], *, records: list[dict[str, object]]) -> None:
     """Validate B300-mars/enroot provenance for a prompt manifest summary."""
+    validate_prompt_records(records)
+    _validate_summary_derived_fields(summary, records)
+
     if summary.get("cluster_alias") != DEFAULT_CLUSTER_ALIAS:
         raise ValueError(f"cluster_alias must be {DEFAULT_CLUSTER_ALIAS}")
     if summary.get("container_runtime") != DEFAULT_CONTAINER_RUNTIME:
@@ -505,21 +527,89 @@ def validate_summary(summary: dict[str, object], *, records: list[dict[str, obje
     if _contains_forbidden_runtime(summary):
         raise ValueError("prompt manifest summary must not include Docker provenance")
 
+    artifact_policy = summary.get("artifact_policy")
+    if artifact_policy not in (DEFAULT_ARTIFACT_POLICY, LOCAL_SMOKE_ARTIFACT_POLICY):
+        raise ValueError("summary artifact_policy is invalid")
+    if summary.get("task2_input_ready") != (artifact_policy == DEFAULT_ARTIFACT_POLICY):
+        raise ValueError("summary task2_input_ready does not match artifact_policy")
+
     durable_paths = summary.get("durable_paths")
     if not isinstance(durable_paths, dict):
         raise ValueError("summary durable_paths must be a mapping")
-    for key in ("checkout_root", "run_root", "cache_root", "prompt_manifest"):
+    for key in REQUIRED_DURABLE_PATH_FIELDS:
         value = durable_paths.get(key)
         if not isinstance(value, str) or not value:
             raise ValueError(f"summary durable_paths.{key} must be a non-empty string")
         if value.startswith("/tmp"):
             raise ValueError(f"summary durable_paths.{key} must not be under /tmp")
+    run_root = str(durable_paths["run_root"]).rstrip("/")
+    for key in RUN_ROOT_DURABLE_PATH_FIELDS:
+        value = str(durable_paths[key])
+        if not _path_is_under(value, run_root):
+            raise ValueError(f"summary durable_paths.{key} must be under durable run_root")
 
-    split_counts = validate_prompt_records(records)
-    if summary.get("split_counts") != split_counts:
-        raise ValueError("summary split_counts do not match prompt records")
-    if summary.get("prompt_id_sha256") != _prompt_id_digest(records):
-        raise ValueError("summary prompt_id_sha256 does not match prompt records")
+    local_output_paths = summary.get("local_output_paths")
+    if not isinstance(local_output_paths, dict):
+        raise ValueError("summary local_output_paths must be a mapping")
+    manifest_jsonl = local_output_paths.get("manifest_jsonl")
+    if not isinstance(manifest_jsonl, str) or not manifest_jsonl:
+        raise ValueError("summary local_output_paths.manifest_jsonl must be a non-empty string")
+    if (
+        artifact_policy == DEFAULT_ARTIFACT_POLICY
+        and manifest_jsonl != durable_paths["prompt_manifest"]
+    ):
+        raise ValueError("formal prompt manifest path must match durable_paths.prompt_manifest")
+
+
+def _validate_summary_derived_fields(
+    summary: dict[str, object],
+    records: list[dict[str, object]],
+) -> None:
+    expected = _expected_summary_fields(records)
+    for field_name, expected_value in expected.items():
+        if summary.get(field_name) != expected_value:
+            raise ValueError(f"summary {field_name} does not match prompt records")
+
+    capture_fields = summary.get("required_capture_fields")
+    if not isinstance(capture_fields, list) or set(capture_fields) != set(REQUIRED_CAPTURE_FIELDS):
+        raise ValueError(
+            "summary required_capture_fields must match the required capture field set"
+        )
+
+
+def _expected_summary_fields(records: list[dict[str, object]]) -> dict[str, object]:
+    first_record = records[0]
+    return {
+        "format": SUMMARY_FORMAT,
+        "manifest_format": MANIFEST_FORMAT,
+        "model": first_record["model"],
+        "height": first_record["height"],
+        "width": first_record["width"],
+        "num_inference_steps": first_record["num_inference_steps"],
+        "guidance_scale": first_record["guidance_scale"],
+        "max_sequence_length": first_record["max_sequence_length"],
+        "cfg_branches": list(DEFAULT_CFG_BRANCHES),
+        "split_counts": validate_prompt_records(records),
+        "prompt_count": len(records),
+        "prompt_id_sha256": _prompt_id_digest(records),
+        "prompt_sources": sorted({_expect_string(record, "source") for record in records}),
+        "prompt_categories": sorted(
+            {
+                category
+                for record in records
+                for category in _expect_string_list(record, "categories")
+            }
+        ),
+        "expected_tuples_per_prompt": first_record["expected_tuple_count"],
+        "expected_total_teacher_tuples": sum(
+            int(record["expected_tuple_count"]) for record in records
+        ),
+    }
+
+
+def _path_is_under(path: str, root: str) -> bool:
+    normalized_root = root.rstrip("/")
+    return path == normalized_root or path.startswith(f"{normalized_root}/")
 
 
 def _contains_forbidden_runtime(value: object, *, key_name: str = "") -> bool:
@@ -598,6 +688,7 @@ def _write_manifest_command(args: argparse.Namespace) -> None:
         cluster_alias=args.cluster_alias,
         container_runtime=args.container_runtime,
         enroot_image=args.enroot_image,
+        artifact_policy=args.artifact_policy,
     )
     write_jsonl(manifest_jsonl, records)
     write_json(Path(args.summary_json), summary)
@@ -634,6 +725,11 @@ def build_parser() -> argparse.ArgumentParser:
     write_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
     write_parser.add_argument("--container-runtime", default=DEFAULT_CONTAINER_RUNTIME)
     write_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    write_parser.add_argument(
+        "--artifact-policy",
+        choices=(DEFAULT_ARTIFACT_POLICY, LOCAL_SMOKE_ARTIFACT_POLICY),
+        default=DEFAULT_ARTIFACT_POLICY,
+    )
     write_parser.set_defaults(func=_write_manifest_command)
 
     validate_parser = subparsers.add_parser("validate-manifest")
