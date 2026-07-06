@@ -73,7 +73,8 @@ def test_build_smoke_capture_plan_from_formal_prompt_summary():
     assert capture_summary["format"] == "qwen_image_teacher_capture_manifest_v1"
     assert capture_summary["split_counts"] == {"smoke": 1}
     assert capture_summary["expected_total_tuples"] == 100
-    assert capture_summary["task3_input_ready"] is True
+    assert capture_summary["capture_plan_ready"] is True
+    assert capture_summary["task3_input_ready"] is False
     assert len(tuple_entries) == 100
     assert tuple_entries[0]["prompt_id"] == "qwen_image_smoke_0000"
     assert tuple_entries[0]["cfg_branch"] == "cond"
@@ -135,6 +136,20 @@ def test_tuple_index_rejects_wrong_true_cfg_count():
         validate_tuple_index(tuple_entries[:-1], records=smoke_records)
 
 
+def test_tuple_index_rejects_duplicate_composite_key():
+    records, prompt_summary = _prompt_records_and_summary()
+    smoke_records = [record for record in records if record["split"] == "smoke"]
+    tuple_entries = build_tuple_index(smoke_records, prompt_summary=prompt_summary)
+    tuple_entries[1] = {
+        **tuple_entries[1],
+        "tuple_id": "qwen_image_smoke_0000_step000_cond_duplicate",
+        "cfg_branch": "cond",
+    }
+
+    with pytest.raises(ValueError, match="duplicate tuple key"):
+        validate_tuple_index(tuple_entries, records=smoke_records)
+
+
 def test_tuple_index_rejects_missing_required_fields():
     records, prompt_summary = _prompt_records_and_summary()
     smoke_records = [record for record in records if record["split"] == "smoke"]
@@ -157,7 +172,6 @@ def test_tuple_index_rejects_bad_timestep_bin():
 
 def test_capture_summary_rejects_tmp_and_docker_provenance():
     records, prompt_summary = _prompt_records_and_summary()
-    smoke_records = [record for record in records if record["split"] == "smoke"]
     capture_summary, tuple_entries = build_capture_plan(
         records=records,
         prompt_summary=prompt_summary,
@@ -178,18 +192,108 @@ def test_capture_summary_rejects_tmp_and_docker_provenance():
     with pytest.raises(ValueError, match="teacher_tuples"):
         validate_capture_summary(
             bad_tmp,
-            records=smoke_records,
+            records=records,
             prompt_summary=prompt_summary,
             tuple_entries=tuple_entries,
         )
 
     bad_runtime = {**capture_summary, "remote_command": "docker run --rm --gpus all"}
-    with pytest.raises(ValueError, match="Docker provenance"):
+    with pytest.raises(ValueError, match="Docker"):
         validate_capture_summary(
             bad_runtime,
-            records=smoke_records,
+            records=records,
             prompt_summary=prompt_summary,
             tuple_entries=tuple_entries,
+        )
+
+    bad_no_enroot = {**capture_summary, "remote_command": "ssh-gw exec --no-enroot job"}
+    with pytest.raises(ValueError, match="no-enroot"):
+        validate_capture_summary(
+            bad_no_enroot,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=tuple_entries,
+        )
+
+
+def test_capture_summary_revalidates_prompt_summary_against_full_records():
+    records, prompt_summary = _prompt_records_and_summary()
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=PROMPT_MANIFEST_PATH,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
+        splits=("smoke",),
+        project_root=Path.cwd(),
+    )
+    bad_prompt_summary = {**prompt_summary, "height": 2048}
+    bad_capture_summary = {**capture_summary, "height": 2048}
+
+    with pytest.raises(ValueError, match="height"):
+        validate_capture_summary(
+            bad_capture_summary,
+            records=records,
+            prompt_summary=bad_prompt_summary,
+            tuple_entries=tuple_entries,
+        )
+
+
+def test_validate_accepts_smoke_plan_with_full_prompt_records():
+    records, prompt_summary = _prompt_records_and_summary()
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=PROMPT_MANIFEST_PATH,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
+        splits=("smoke",),
+        project_root=Path.cwd(),
+    )
+
+    validate_capture_summary(
+        capture_summary,
+        records=records,
+        prompt_summary=prompt_summary,
+        tuple_entries=tuple_entries,
+    )
+
+
+def test_tuple_paths_must_stay_under_declared_roots():
+    records, prompt_summary = _prompt_records_and_summary()
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=PROMPT_MANIFEST_PATH,
+        capture_summary_path=CAPTURE_SUMMARY_PATH,
+        tuple_index_path=TUPLE_INDEX_PATH,
+        splits=("smoke",),
+        project_root=Path.cwd(),
+    )
+    bad_reference_entries = list(tuple_entries)
+    bad_reference_entries[0] = {
+        **bad_reference_entries[0],
+        "reference_image_path": f"{REMOTE_RUN_ROOT}/other_refs/qwen_image_smoke_0000.png",
+    }
+    with pytest.raises(ValueError, match="reference_image_path"):
+        validate_capture_summary(
+            capture_summary,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=bad_reference_entries,
+        )
+
+    bad_tuple_entries = list(tuple_entries)
+    bad_tuple_entries[0] = {
+        **bad_tuple_entries[0],
+        "tuple_path": f"{REMOTE_RUN_ROOT}/other_tuples/qwen_image_smoke_0000.pt",
+    }
+    with pytest.raises(ValueError, match="tuple_path"):
+        validate_capture_summary(
+            capture_summary,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=bad_tuple_entries,
         )
 
 

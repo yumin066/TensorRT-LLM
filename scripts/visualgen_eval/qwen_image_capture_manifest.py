@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Literal, cast
 
@@ -47,6 +47,7 @@ DEFAULT_CAPTURE_SUMMARY_NAME = "qwen_image_teacher_capture_v1.json"
 DEFAULT_TUPLE_INDEX_NAME = "qwen_image_teacher_tuple_index_v1.jsonl"
 TIMESTEP_BIN_NAMES = ("early", "early_mid", "mid", "late_mid", "late")
 TIMESTEP_BIN_EDGES = (0.2, 0.4, 0.6, 0.8)
+FORBIDDEN_RUNTIME_TOKENS = ("docker", "--no-enroot", "no_enroot", "no-enroot")
 LAYERED_ONLY_FIELDS = {
     "image",
     "layers",
@@ -95,7 +96,7 @@ def build_capture_plan(
     )
     validate_capture_summary(
         summary,
-        records=selected_records,
+        records=records,
         prompt_summary=prompt_summary,
         tuple_entries=tuple_entries,
     )
@@ -169,7 +170,12 @@ def build_tuple_index(
                         "status": "planned",
                     }
                 )
-    validate_tuple_index(entries, records=records)
+    validate_tuple_index(
+        entries,
+        records=records,
+        reference_root=reference_root,
+        tuple_root=tuple_root,
+    )
     return entries
 
 
@@ -209,7 +215,8 @@ def build_capture_summary(
         "container_runtime": DEFAULT_CONTAINER_RUNTIME,
         "enroot_image": DEFAULT_ENROOT_IMAGE,
         "artifact_policy": DEFAULT_ARTIFACT_POLICY,
-        "task3_input_ready": True,
+        "capture_plan_ready": True,
+        "task3_input_ready": False,
         "git_head": git_commit(project_root or Path.cwd()),
         "durable_paths": {
             "run_root": run_root,
@@ -229,20 +236,22 @@ def validate_capture_summary(
     prompt_summary: dict[str, object],
     tuple_entries: list[dict[str, object]],
 ) -> None:
-    _validate_selected_prompt_records(records)
-    _reject_layered_prompt_fields(records)
-    if prompt_summary.get("artifact_policy") != DEFAULT_ARTIFACT_POLICY:
-        raise ValueError("capture summary requires a formal durable prompt summary")
-    if prompt_summary.get("task2_input_ready") is not True:
-        raise ValueError("capture summary requires prompt summary task2_input_ready=true")
-    prompt_durable_paths = _expect_mapping(prompt_summary, "durable_paths")
-    if summary.get("prompt_manifest_path") != _expect_string(
-        prompt_durable_paths, "prompt_manifest"
-    ):
-        raise ValueError("capture summary prompt_manifest_path must match prompt summary")
-    validate_tuple_index(tuple_entries, records=records)
     if summary.get("format") != CAPTURE_MANIFEST_FORMAT:
         raise ValueError(f"capture summary format must be {CAPTURE_MANIFEST_FORMAT}")
+    validate_prompt_handoff(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=Path(_expect_string(summary, "prompt_manifest_path")),
+    )
+    selected_records = _selected_records_from_tuple_entries(records, tuple_entries)
+    _validate_capture_durable_paths(summary)
+    capture_durable_paths = _expect_mapping(summary, "durable_paths")
+    validate_tuple_index(
+        tuple_entries,
+        records=selected_records,
+        reference_root=_expect_string(capture_durable_paths, "bf16_references"),
+        tuple_root=_expect_string(capture_durable_paths, "teacher_tuples"),
+    )
     for field_name in (
         "model",
         "height",
@@ -254,7 +263,9 @@ def validate_capture_summary(
     ):
         if summary.get(field_name) != prompt_summary.get(field_name):
             raise ValueError(f"capture summary {field_name} does not match prompt summary")
-    if summary.get("split_counts") != _split_counts(records):
+    if summary.get("prompt_count") != len(selected_records):
+        raise ValueError("capture summary prompt_count does not match selected prompt records")
+    if summary.get("split_counts") != _split_counts(selected_records):
         raise ValueError("capture summary split_counts do not match selected prompt records")
     if summary.get("expected_total_tuples") != len(tuple_entries):
         raise ValueError("capture summary expected_total_tuples does not match tuple index")
@@ -270,26 +281,28 @@ def validate_capture_summary(
         raise ValueError(f"capture summary enroot_image must be {DEFAULT_ENROOT_IMAGE}")
     if summary.get("artifact_policy") != DEFAULT_ARTIFACT_POLICY:
         raise ValueError("capture summary artifact_policy must be durable_b300_enroot_only")
+    if summary.get("capture_plan_ready") is not True:
+        raise ValueError("capture summary capture_plan_ready must be true for planned capture")
+    if summary.get("task3_input_ready") is not False:
+        raise ValueError("capture summary task3_input_ready must remain false until capture")
     if _contains_forbidden_runtime(summary):
-        raise ValueError("capture summary must not include Docker provenance")
-    _validate_capture_durable_paths(summary)
+        raise ValueError("capture summary must not include Docker or no-enroot provenance")
 
 
 def validate_tuple_index(
     entries: list[dict[str, object]],
     *,
     records: list[dict[str, object]],
+    reference_root: str | None = None,
+    tuple_root: str | None = None,
 ) -> None:
     if not entries:
         raise ValueError("tuple index must contain at least one entry")
 
+    _validate_selected_prompt_records(records)
     records_by_prompt = {_expect_string(record, "prompt_id"): record for record in records}
-    expected_counts = {
-        prompt_id: _expect_positive_int(record, "num_inference_steps")
-        * len(_expect_string_list(record, "cfg_branches"))
-        for prompt_id, record in records_by_prompt.items()
-    }
-    observed_counts: Counter[str] = Counter()
+    expected_keys = _expected_tuple_keys(records_by_prompt)
+    observed_keys: set[tuple[str, int, str]] = set()
     seen_tuple_ids: set[str] = set()
 
     for entry in entries:
@@ -313,18 +326,35 @@ def validate_tuple_index(
         cfg_branch = _expect_string(entry, "cfg_branch")
         if cfg_branch not in _expect_string_list(record, "cfg_branches"):
             raise ValueError(f"tuple {tuple_id} cfg_branch is not in prompt cfg_branches")
+        tuple_key = (prompt_id, timestep_index, cfg_branch)
+        if tuple_key in observed_keys:
+            raise ValueError(f"duplicate tuple key in tuple index: {_format_tuple_key(tuple_key)}")
+        observed_keys.add(tuple_key)
+        if tuple_key not in expected_keys:
+            raise ValueError(f"unexpected tuple key in tuple index: {_format_tuple_key(tuple_key)}")
         if set(_expect_string_list(entry, "required_fields")) != set(REQUIRED_CAPTURE_FIELDS):
             raise ValueError(f"tuple {tuple_id} required_fields are incomplete")
-        for path_field in ("reference_image_path", "tuple_path"):
-            path = _expect_string(entry, path_field)
-            if path.startswith("/tmp"):
-                raise ValueError(f"tuple {tuple_id} {path_field} must not be under /tmp")
-        observed_counts[prompt_id] += 1
+        _validate_tuple_entry_path(
+            entry,
+            path_field="reference_image_path",
+            tuple_id=tuple_id,
+            root=reference_root,
+            root_name="durable_paths.bf16_references",
+        )
+        _validate_tuple_entry_path(
+            entry,
+            path_field="tuple_path",
+            tuple_id=tuple_id,
+            root=tuple_root,
+            root_name="durable_paths.teacher_tuples",
+        )
 
-    if dict(observed_counts) != expected_counts:
+    missing_keys = expected_keys - observed_keys
+    extra_keys = observed_keys - expected_keys
+    if missing_keys or extra_keys:
         raise ValueError(
-            f"tuple counts do not match expected true CFG counts: "
-            f"observed={dict(observed_counts)}, expected={expected_counts}"
+            "tuple index key coverage does not match expected true CFG counts: "
+            f"missing={_format_tuple_keys(missing_keys)}, extra={_format_tuple_keys(extra_keys)}"
         )
 
 
@@ -362,6 +392,43 @@ def _select_records(
     if not selected:
         raise ValueError(f"no prompt records selected for splits: {splits}")
     return selected
+
+
+def _selected_records_from_tuple_entries(
+    records: list[dict[str, object]],
+    tuple_entries: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    prompt_ids = {_expect_string(entry, "prompt_id") for entry in tuple_entries}
+    if not prompt_ids:
+        raise ValueError("tuple index must reference at least one prompt")
+    records_by_prompt = {_expect_string(record, "prompt_id"): record for record in records}
+    unknown_prompt_ids = prompt_ids - set(records_by_prompt)
+    if unknown_prompt_ids:
+        raise ValueError(
+            f"tuple index references unknown prompt_id values: {sorted(unknown_prompt_ids)}"
+        )
+    return [record for record in records if _expect_string(record, "prompt_id") in prompt_ids]
+
+
+def _expected_tuple_keys(
+    records_by_prompt: dict[str, dict[str, object]],
+) -> set[tuple[str, int, str]]:
+    keys: set[tuple[str, int, str]] = set()
+    for prompt_id, record in records_by_prompt.items():
+        num_steps = _expect_positive_int(record, "num_inference_steps")
+        for timestep_index in range(num_steps):
+            for cfg_branch in _expect_string_list(record, "cfg_branches"):
+                keys.add((prompt_id, timestep_index, cfg_branch))
+    return keys
+
+
+def _format_tuple_key(tuple_key: tuple[str, int, str]) -> str:
+    prompt_id, timestep_index, cfg_branch = tuple_key
+    return f"(prompt_id={prompt_id}, timestep_index={timestep_index}, cfg_branch={cfg_branch})"
+
+
+def _format_tuple_keys(tuple_keys: set[tuple[str, int, str]]) -> list[str]:
+    return [_format_tuple_key(tuple_key) for tuple_key in sorted(tuple_keys)]
 
 
 def _validate_selected_prompt_records(records: list[dict[str, object]]) -> None:
@@ -442,16 +509,31 @@ def _validate_capture_durable_paths(summary: dict[str, object]) -> None:
             raise ValueError(f"capture durable_paths.{field_name} must be under durable run_root")
 
 
+def _validate_tuple_entry_path(
+    entry: dict[str, object],
+    *,
+    path_field: str,
+    tuple_id: str,
+    root: str | None,
+    root_name: str,
+) -> None:
+    path = _expect_string(entry, path_field)
+    if path.startswith("/tmp"):
+        raise ValueError(f"tuple {tuple_id} {path_field} must not be under /tmp")
+    if root is not None and not _path_is_under(path, root.rstrip("/")):
+        raise ValueError(f"tuple {tuple_id} {path_field} must be under declared {root_name}")
+
+
 def _path_is_under(path: str, root: str) -> bool:
     normalized_root = root.rstrip("/")
     return path == normalized_root or path.startswith(f"{normalized_root}/")
 
 
 def _contains_forbidden_runtime(value: object, *, key_name: str = "") -> bool:
-    if "docker" in key_name.casefold():
+    if any(token in key_name.casefold() for token in FORBIDDEN_RUNTIME_TOKENS):
         return True
     if isinstance(value, str):
-        return "docker" in value.casefold()
+        return any(token in value.casefold() for token in FORBIDDEN_RUNTIME_TOKENS)
     if isinstance(value, dict):
         return any(
             _contains_forbidden_runtime(child_value, key_name=str(child_key))
