@@ -288,15 +288,20 @@ def _default_linear_cls() -> type[nn.Module]:
 
 
 def _load_fake_mxfp8_helper() -> Any:
+    module_name = "_qwen_image_fake_mxfp8"
+    cached_module = sys.modules.get(module_name)
+    if cached_module is not None:
+        return cached_module
     helper_path = (
         Path(__file__).resolve().parents[2]
         / "tensorrt_llm/_torch/visual_gen/quantization/fake_mxfp8.py"
     )
     if helper_path.is_file():
-        spec = importlib.util.spec_from_file_location("_qwen_image_fake_mxfp8", helper_path)
+        spec = importlib.util.spec_from_file_location(module_name, helper_path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Could not load fake MXFP8 helper from {helper_path}")
         module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
         spec.loader.exec_module(module)
         return module
     return importlib.import_module("tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8")
