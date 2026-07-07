@@ -294,6 +294,8 @@ def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:
     assert mse_config.lora_rank == 16
     assert mse_config.lora_alpha == pytest.approx(32.0)
     assert mse_config.optimizer_foreach is False
+    assert mse_config.sample_stride == 17
+    assert mse_config.sample_start_index == 0
 
     timestep_config = build_qwen_image_qat_probe_config(
         recipe="timestep_weighted",
@@ -584,6 +586,7 @@ def test_train_qwen_image_qat_logs_loss_components_and_checkpoint(tmp_path: Path
     assert records[-1]["loss_mse"] > 0.0
     assert records[-1]["loss_direction"] is not None
     assert records[-1]["timestep_weight"] == pytest.approx(2.0)
+    assert records[-1]["sample_index"] == 0
     assert records[-1]["grad_norm"] > 0.0
     assert records[-1]["trainable_parameter_norm"] > 0.0
     assert records[-1]["lora_delta_norm"] >= 0.0
@@ -594,6 +597,70 @@ def test_train_qwen_image_qat_logs_loss_components_and_checkpoint(tmp_path: Path
     assert sorted(checkpoint["trainable_parameter_names"]) == [
         "transformer_blocks.0.attn.to_q.lora_down.weight",
         "transformer_blocks.0.attn.to_q.lora_up.weight",
+    ]
+
+
+@requires_float8
+def test_train_qwen_image_qat_supports_strided_sampling(tmp_path: Path) -> None:
+    tuple_paths = [tmp_path / "tuples" / f"tuple_{index}.pt" for index in range(3)]
+    index_path = tmp_path / "index.jsonl"
+    entries = []
+    for index, tuple_path in enumerate(tuple_paths):
+        _write_tuple(
+            tuple_path,
+            prompt_id=f"qwen_image_smoke_{index:04d}",
+            timestep_index=index,
+            timestep_bin="early",
+            hidden_states=torch.ones(1, 2, 128, dtype=torch.bfloat16),
+            encoder_hidden_states=torch.ones(1, 3, 128, dtype=torch.bfloat16),
+            target_output=torch.zeros(1, 2, 128, dtype=torch.bfloat16),
+        )
+        entries.append(
+            {
+                "prompt_id": f"qwen_image_smoke_{index:04d}",
+                "split": "smoke",
+                "timestep_index": index,
+                "timestep_bin": "early",
+                "cfg_branch": "cond",
+                "trajectory_source": "bf16_teacher",
+                "status": "captured",
+                "tuple_path": str(tuple_path),
+            }
+        )
+    index_path.write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+
+    result = train_qwen_image_qat(
+        model,
+        QwenImageQatTrainingConfig(
+            tuple_index_jsonl=index_path,
+            output_dir=tmp_path / "out",
+            max_steps=3,
+            learning_rate=1.0e-3,
+            device="cpu",
+            target_layers=("attn.to_q",),
+            lora_rank=4,
+            lora_alpha=8.0,
+            expected_num_layers=1,
+            log_interval_steps=1,
+            sample_stride=2,
+        ),
+        linear_cls=nn.Linear,
+    )
+
+    records = [
+        json.loads(line)
+        for line in result.metrics_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [record["sample_index"] for record in records] == [0, 2, 1]
+    assert [record["prompt_id"] for record in records] == [
+        "qwen_image_smoke_0000",
+        "qwen_image_smoke_0002",
+        "qwen_image_smoke_0001",
     ]
 
 

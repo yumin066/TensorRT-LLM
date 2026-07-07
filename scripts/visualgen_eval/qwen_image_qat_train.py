@@ -199,6 +199,8 @@ class QwenImageQatTrainingConfig:
     warmup_steps: int = 0
     warmup_target_layers: tuple[str, ...] = ()
     optimizer_foreach: bool | None = False
+    sample_stride: int = 1
+    sample_start_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -535,7 +537,13 @@ def train_qwen_image_qat(
                 warmup_steps=config.warmup_steps,
                 warmup_target_layers=config.warmup_target_layers,
             )
-            sample = dataset[(step - 1) % len(dataset)]
+            sample_index = _sample_index_for_step(
+                step,
+                dataset_size=len(dataset),
+                sample_stride=config.sample_stride,
+                sample_start_index=config.sample_start_index,
+            )
+            sample = dataset[sample_index]
             optimizer.zero_grad(set_to_none=True)
             output = forward_qwen_image_tuple(transformer, sample, device)
             loss, components = compute_qwen_image_tuple_loss(output, sample, config.loss)
@@ -548,6 +556,7 @@ def train_qwen_image_qat(
             if step % config.log_interval_steps == 0 or step == config.max_steps:
                 record = _build_training_record(
                     step=step,
+                    sample_index=sample_index,
                     sample=sample,
                     loss=loss,
                     components=components,
@@ -596,6 +605,8 @@ def build_qwen_image_qat_probe_config(
     scale_multipliers: Mapping[str, float] | None = None,
     checkpoint_name: str = "qwen_image_qat_lora_last.pt",
     metrics_name: str = "qwen_image_qat_train_metrics.jsonl",
+    sample_stride: int = 17,
+    sample_start_index: int = 0,
 ) -> QwenImageQatTrainingConfig:
     """Build the literature-guided 32-prompt probe training config."""
     recipe_name = validate_qwen_image_qat_probe_recipe(recipe)
@@ -618,6 +629,8 @@ def build_qwen_image_qat_probe_config(
         compute_lora_delta_norm=compute_lora_delta_norm,
         scale_multipliers=scale_multipliers if recipe_name == "scale_aware_lora" else None,
         optimizer_foreach=False,
+        sample_stride=sample_stride,
+        sample_start_index=sample_start_index,
     )
 
 
@@ -650,6 +663,8 @@ def run_qwen_image_qat_probe(
     log_interval_steps: int = 10,
     scale_clip_min: float = 0.25,
     scale_clip_max: float = 4.0,
+    sample_stride: int = 17,
+    sample_start_index: int = 0,
     summary_json: str | Path | None = None,
     provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -686,6 +701,8 @@ def run_qwen_image_qat_probe(
         expected_target_count=expected_target_count,
         log_interval_steps=log_interval_steps,
         scale_multipliers=scale_multipliers,
+        sample_stride=sample_stride,
+        sample_start_index=sample_start_index,
     )
     pipeline = load_single_worker_pipeline(
         model=model,
@@ -1114,6 +1131,18 @@ def _scale_multiplier_for_target(
     return multiplier
 
 
+def _sample_index_for_step(
+    step: int,
+    *,
+    dataset_size: int,
+    sample_stride: int,
+    sample_start_index: int,
+) -> int:
+    if dataset_size <= 0:
+        raise ValueError("dataset_size must be positive")
+    return (int(sample_start_index) + (int(step) - 1) * int(sample_stride)) % int(dataset_size)
+
+
 def _apply_progressive_warmup(
     transformer: nn.Module,
     *,
@@ -1205,6 +1234,10 @@ def _validate_training_config(config: QwenImageQatTrainingConfig) -> None:
         raise ValueError("optimizer eps must be positive")
     if config.log_interval_steps <= 0:
         raise ValueError("log_interval_steps must be positive")
+    if config.sample_stride <= 0:
+        raise ValueError("sample_stride must be positive")
+    if config.sample_start_index < 0:
+        raise ValueError("sample_start_index must be non-negative")
     if config.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
     if config.warmup_steps > 0 and not config.warmup_target_layers:
@@ -1222,6 +1255,7 @@ def _validate_training_config(config: QwenImageQatTrainingConfig) -> None:
 def _build_training_record(
     *,
     step: int,
+    sample_index: int,
     sample: QwenImageTupleSample,
     loss: torch.Tensor,
     components: Mapping[str, torch.Tensor],
@@ -1234,6 +1268,7 @@ def _build_training_record(
 ) -> dict[str, object]:
     record: dict[str, object] = {
         "step": step,
+        "sample_index": sample_index,
         "prompt_id": sample.prompt_id,
         "split": sample.split,
         "timestep_index": sample.timestep_index,
@@ -1311,6 +1346,8 @@ def _training_config_to_dict(config: QwenImageQatTrainingConfig) -> dict[str, ob
         "warmup_steps": config.warmup_steps,
         "warmup_target_layers": list(config.warmup_target_layers),
         "optimizer_foreach": config.optimizer_foreach,
+        "sample_stride": config.sample_stride,
+        "sample_start_index": config.sample_start_index,
     }
 
 
@@ -1380,6 +1417,8 @@ def _run_probe_command(args: argparse.Namespace) -> None:
         log_interval_steps=args.log_interval_steps,
         scale_clip_min=args.scale_clip_min,
         scale_clip_max=args.scale_clip_max,
+        sample_stride=args.sample_stride,
+        sample_start_index=args.sample_start_index,
         summary_json=Path(args.summary_json) if args.summary_json else None,
         provenance=_build_probe_runtime_provenance(args),
     )
@@ -1423,6 +1462,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--log-interval-steps", type=int, default=10)
     run_parser.add_argument("--scale-clip-min", type=float, default=0.25)
     run_parser.add_argument("--scale-clip-max", type=float, default=4.0)
+    run_parser.add_argument("--sample-stride", type=int, default=17)
+    run_parser.add_argument("--sample-start-index", type=int, default=0)
     run_parser.add_argument("--summary-json")
     run_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
     run_parser.add_argument("--allocation-id")
