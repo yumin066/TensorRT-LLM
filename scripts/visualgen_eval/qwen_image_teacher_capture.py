@@ -35,6 +35,7 @@ from scripts.visualgen_eval.qwen_image_capture_manifest import (
     DEFAULT_ENROOT_IMAGE,
     FORBIDDEN_RUNTIME_TOKENS,
     TUPLE_INDEX_FORMAT,
+    git_commit,
     read_tuple_index_jsonl,
     timestep_bin_name,
     validate_capture_summary,
@@ -392,6 +393,8 @@ def build_captured_summary(
     pipeline: Any | None = None,
 ) -> dict[str, object]:
     summary = dict(planned_summary)
+    if provenance.get("git_head") is not None:
+        summary["git_head"] = provenance["git_head"]
     summary["capture_status"] = CAPTURED_STATUS
     summary["task3_input_ready"] = True
     summary["captured_total_tuples"] = len(tuple_entries)
@@ -419,6 +422,11 @@ def validate_captured_artifacts(
         raise ValueError("captured summary task3_input_ready must be true")
     if _contains_forbidden_runtime(summary):
         raise ValueError("captured summary must not include Docker or no-enroot provenance")
+    provenance = _expect_mapping(summary, "capture_provenance")
+    if provenance.get("git_head") is None:
+        raise ValueError("capture_provenance.git_head must be recorded")
+    if summary.get("git_head") != provenance["git_head"]:
+        raise ValueError("captured summary git_head must match capture_provenance.git_head")
 
     validate_prompt_handoff(
         records=records,
@@ -600,6 +608,7 @@ def build_runtime_provenance(
         "command": args.command or " ".join(sys.argv),
         "model_snapshot_path": args.model_snapshot_path,
         "visual_gen_args": str(args.visual_gen_args),
+        "git_head": git_commit(Path.cwd()),
     }
     if pipeline is not None:
         provenance["scheduler"] = collect_scheduler_provenance(pipeline)

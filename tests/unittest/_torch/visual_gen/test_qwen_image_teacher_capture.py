@@ -179,6 +179,7 @@ def _capture_with_dummy_pipeline(
             "container_runtime": "enroot",
             "enroot_image": DEFAULT_ENROOT_IMAGE,
             "command": "ssh-gw task submit alloc -- python capture-smoke",
+            "git_head": "captured-git-head",
         },
         pipeline=pipeline,
     )
@@ -201,6 +202,8 @@ def test_capture_records_with_dummy_pipeline_and_validate(capture_case: CaptureC
     assert tuple_entries[0]["status"] == "captured"
     assert Path(tuple_entries[0]["tuple_path"]).is_file()
     assert Path(tuple_entries[0]["reference_image_path"]).is_file()
+    assert captured_summary["git_head"] == "captured-git-head"
+    assert captured_summary["capture_provenance"]["git_head"] == "captured-git-head"
 
 
 def test_capture_derives_missing_txt_seq_lens(capture_case: CaptureCase) -> None:
@@ -221,6 +224,7 @@ def test_capture_derives_missing_txt_seq_lens(capture_case: CaptureCase) -> None
             "container_runtime": "enroot",
             "enroot_image": DEFAULT_ENROOT_IMAGE,
             "command": "ssh-gw task submit alloc -- python capture-smoke",
+            "git_head": "captured-git-head",
         },
         pipeline=pipeline,
     )
@@ -317,6 +321,19 @@ def test_captured_validator_rejects_wrong_tuple_count_and_forbidden_runtime(
     with pytest.raises(ValueError, match="Docker"):
         validate_captured_artifacts(
             bad_runtime,
+            records=records,
+            prompt_summary=prompt_summary,
+            tuple_entries=tuple_entries,
+            torch_module=FakeTorch,
+        )
+
+    bad_git_head = {
+        **captured_summary,
+        "git_head": "planned-stale-git-head",
+    }
+    with pytest.raises(ValueError, match="git_head"):
+        validate_captured_artifacts(
+            bad_git_head,
             records=records,
             prompt_summary=prompt_summary,
             tuple_entries=tuple_entries,
