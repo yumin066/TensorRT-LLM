@@ -58,6 +58,7 @@ BF16_TENSOR_FIELDS = (
     "encoder_hidden_states",
     "target_output",
 )
+CAPTURE_SPLIT_CHOICES = ("smoke", "fast_calibration", "main_calibration", "held_out")
 
 
 def _load_torch() -> Any:
@@ -652,6 +653,28 @@ def _selected_tuple_entries(
     return selected
 
 
+def _validate_split_scoped_plan(
+    capture_summary: dict[str, object],
+    *,
+    selected_records: list[dict[str, object]],
+    selected_entries: list[dict[str, object]],
+    split: str,
+) -> None:
+    if capture_summary.get("prompt_count") != len(selected_records):
+        raise ValueError(
+            "capture summary prompt_count must match selected split prompt records; "
+            "build a split-scoped capture plan first"
+        )
+    if capture_summary.get("expected_total_tuples") != len(selected_entries):
+        raise ValueError(
+            "capture summary expected_total_tuples must match selected split tuple entries; "
+            "build a split-scoped capture plan first"
+        )
+    entry_splits = {_expect_string(entry, "split") for entry in selected_entries}
+    if entry_splits != {split}:
+        raise ValueError(f"tuple entries must contain only split {split}")
+
+
 def _selected_records_from_tuple_entries(
     records: list[dict[str, object]],
     tuple_entries: list[dict[str, object]],
@@ -742,7 +765,8 @@ def _expect_number(value: dict[str, object], field_name: str) -> int | float:
     return field
 
 
-def _capture_smoke_command(args: argparse.Namespace) -> None:
+def _capture_split_command(args: argparse.Namespace) -> None:
+    split = _expect_string(vars(args), "split")
     records = read_prompt_jsonl(Path(args.prompt_manifest_jsonl))
     prompt_summary = read_json(Path(args.prompt_summary_json))
     capture_summary = read_json(Path(args.capture_summary_json))
@@ -755,8 +779,14 @@ def _capture_smoke_command(args: argparse.Namespace) -> None:
         capture_summary_path=Path(args.capture_summary_json),
         tuple_index_path=Path(args.tuple_index_jsonl),
     )
-    selected_records = _selected_records(records, split="smoke")
+    selected_records = _selected_records(records, split=split)
     selected_entries = _selected_tuple_entries(tuple_entries, selected_records)
+    _validate_split_scoped_plan(
+        capture_summary,
+        selected_records=selected_records,
+        selected_entries=selected_entries,
+        split=split,
+    )
     pipeline = load_single_worker_pipeline(
         model=args.model or _expect_string(capture_summary, "model"),
         visual_gen_args=Path(args.visual_gen_args),
@@ -786,6 +816,11 @@ def _capture_smoke_command(args: argparse.Namespace) -> None:
         cleanup_pipeline(pipeline)
 
 
+def _capture_smoke_command(args: argparse.Namespace) -> None:
+    args.split = "smoke"
+    _capture_split_command(args)
+
+
 def _validate_captured_command(args: argparse.Namespace) -> None:
     records = read_prompt_jsonl(Path(args.prompt_manifest_jsonl))
     prompt_summary = read_json(Path(args.prompt_summary_json))
@@ -803,7 +838,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    capture_split_parser = subparsers.add_parser("capture-split")
+    capture_split_parser.add_argument("--split", required=True, choices=CAPTURE_SPLIT_CHOICES)
+    _add_capture_parser_arguments(capture_split_parser)
+    capture_split_parser.set_defaults(func=_capture_split_command)
+
     capture_parser = subparsers.add_parser("capture-smoke")
+    _add_capture_parser_arguments(capture_parser)
+    capture_parser.set_defaults(func=_capture_smoke_command)
+
+    validate_parser = subparsers.add_parser("validate-captured")
+    validate_parser.add_argument("--prompt-manifest-jsonl", required=True)
+    validate_parser.add_argument("--prompt-summary-json", required=True)
+    validate_parser.add_argument("--capture-summary-json", required=True)
+    validate_parser.add_argument("--tuple-index-jsonl", required=True)
+    validate_parser.set_defaults(func=_validate_captured_command)
+    return parser
+
+
+def _add_capture_parser_arguments(capture_parser: argparse.ArgumentParser) -> None:
     capture_parser.add_argument("--prompt-manifest-jsonl", required=True)
     capture_parser.add_argument("--prompt-summary-json", required=True)
     capture_parser.add_argument("--capture-summary-json", required=True)
@@ -820,15 +873,6 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
     capture_parser.add_argument("--model-snapshot-path")
     capture_parser.add_argument("--command")
-    capture_parser.set_defaults(func=_capture_smoke_command)
-
-    validate_parser = subparsers.add_parser("validate-captured")
-    validate_parser.add_argument("--prompt-manifest-jsonl", required=True)
-    validate_parser.add_argument("--prompt-summary-json", required=True)
-    validate_parser.add_argument("--capture-summary-json", required=True)
-    validate_parser.add_argument("--tuple-index-jsonl", required=True)
-    validate_parser.set_defaults(func=_validate_captured_command)
-    return parser
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -22,11 +22,18 @@ from pathlib import Path
 
 import pytest
 
-from scripts.visualgen_eval.qwen_image_capture_manifest import build_capture_plan
+import scripts.visualgen_eval.qwen_image_teacher_capture as teacher_capture
+from scripts.visualgen_eval.qwen_image_capture_manifest import (
+    build_capture_plan,
+    read_tuple_index_jsonl,
+    write_json,
+    write_jsonl,
+)
 from scripts.visualgen_eval.qwen_image_prompt_manifest import (
     DEFAULT_ENROOT_IMAGE,
     build_default_prompt_records,
     build_summary,
+    read_json,
 )
 from scripts.visualgen_eval.qwen_image_teacher_capture import (
     build_captured_summary,
@@ -241,6 +248,91 @@ def test_capture_derives_missing_txt_seq_lens(capture_case: CaptureCase) -> None
     if not isinstance(payload, dict):
         raise TypeError("expected fake tuple payload to be a mapping")
     assert payload["txt_seq_lens"] == [16]
+
+
+def test_capture_split_cli_selects_fast_calibration(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    root = (
+        Path.cwd()
+        / ".pytest_cache"
+        / "qwen_image_teacher_capture"
+        / f"{request.node.name}_{uuid.uuid4().hex}"
+    )
+    shutil.rmtree(root, ignore_errors=True)
+    request.addfinalizer(lambda: shutil.rmtree(root, ignore_errors=True))
+
+    records = build_default_prompt_records()
+    prompt_manifest_path = root / "manifests" / "qwen_image_qat_prompts_v1.jsonl"
+    prompt_summary_path = root / "manifests" / "qwen_image_qat_prompts_summary_v1.json"
+    capture_summary_path = root / "manifests" / "qwen_image_teacher_capture_fast_plan_v1.json"
+    tuple_index_path = root / "manifests" / "qwen_image_teacher_tuple_index_fast_plan_v1.jsonl"
+    output_summary_path = root / "manifests" / "qwen_image_teacher_capture_fast_captured_v1.json"
+    output_index_path = root / "manifests" / "qwen_image_teacher_tuple_index_fast_captured_v1.jsonl"
+    prompt_summary = build_summary(
+        records=records,
+        manifest_jsonl=prompt_manifest_path,
+        checkout_root=str(Path.cwd()),
+        run_root=str(root),
+        cache_root=str(root / "hf_cache"),
+    )
+    capture_summary, tuple_entries = build_capture_plan(
+        records=records,
+        prompt_summary=prompt_summary,
+        prompt_manifest_path=prompt_manifest_path,
+        capture_summary_path=capture_summary_path,
+        tuple_index_path=tuple_index_path,
+        splits=("fast_calibration",),
+        project_root=Path.cwd(),
+    )
+    write_jsonl(prompt_manifest_path, records)
+    write_json(prompt_summary_path, prompt_summary)
+    write_json(capture_summary_path, capture_summary)
+    write_jsonl(tuple_index_path, tuple_entries)
+
+    monkeypatch.setattr(
+        teacher_capture, "load_single_worker_pipeline", lambda **_kwargs: DummyPipeline()
+    )
+    monkeypatch.setattr(
+        teacher_capture, "infer_record", lambda pipeline, record: pipeline.infer(record)
+    )
+    monkeypatch.setattr(teacher_capture, "_load_torch", lambda: FakeTorch)
+    monkeypatch.setattr(teacher_capture, "save_reference_image", _write_reference)
+    monkeypatch.setattr(teacher_capture, "git_commit", lambda _path: "captured-git-head")
+
+    teacher_capture.main(
+        [
+            "capture-split",
+            "--split",
+            "fast_calibration",
+            "--prompt-manifest-jsonl",
+            str(prompt_manifest_path),
+            "--prompt-summary-json",
+            str(prompt_summary_path),
+            "--capture-summary-json",
+            str(capture_summary_path),
+            "--tuple-index-jsonl",
+            str(tuple_index_path),
+            "--output-capture-summary-json",
+            str(output_summary_path),
+            "--output-tuple-index-jsonl",
+            str(output_index_path),
+            "--visual-gen-args",
+            str(root / "qwen-image-bf16-sage-fp8-1gpu.yaml"),
+            "--model",
+            "Qwen/Qwen-Image",
+            "--command",
+            "ssh-gw task submit alloc -- python capture-split --split fast_calibration",
+        ]
+    )
+
+    captured_summary = read_json(output_summary_path)
+    captured_entries = read_tuple_index_jsonl(output_index_path)
+    assert captured_summary["prompt_count"] == 32
+    assert captured_summary["captured_total_tuples"] == 3200
+    assert {entry["split"] for entry in captured_entries} == {"fast_calibration"}
+    assert all(Path(entry["tuple_path"]).is_file() for entry in captured_entries)
+    assert all(Path(entry["reference_image_path"]).is_file() for entry in captured_entries)
 
 
 def test_captured_validator_rejects_missing_tuple_file(capture_case: CaptureCase) -> None:
