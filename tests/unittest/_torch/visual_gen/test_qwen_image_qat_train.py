@@ -29,7 +29,9 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     QwenImageQatTrainingConfig,
     QwenImageTupleDataset,
     QwenImageTupleLossConfig,
+    build_qwen_image_qat_scale_sensitivity_manifest,
     compute_qwen_image_tuple_loss,
+    compute_scale_aware_lora_multipliers,
     forward_qwen_image_tuple,
     load_qwen_image_tuple_sample,
     normalize_qwen_image_qat_parameter_name,
@@ -345,6 +347,25 @@ def test_prepare_qwen_image_qat_model_filters_by_role() -> None:
 
 
 @requires_float8
+def test_prepare_qwen_image_qat_model_applies_scale_multipliers() -> None:
+    model = _TinyQwenTransformer()
+
+    injections = prepare_qwen_image_qat_model(
+        model,
+        target_layers=("attn.to_q", "attn.to_k"),
+        lora_rank=4,
+        lora_alpha=8.0,
+        scale_multipliers={"attn.to_q": 2.0},
+        linear_cls=nn.Linear,
+    )
+
+    by_role = {injection.role: injection for injection in injections}
+    assert by_role["attn.to_q"].scale_multiplier == pytest.approx(2.0)
+    assert by_role["attn.to_k"].scale_multiplier == pytest.approx(1.0)
+    assert model.transformer_blocks[0].attn.to_q.scale_multiplier == pytest.approx(2.0)
+
+
+@requires_float8
 def test_prepare_qwen_image_qat_model_rejects_inconsistent_expected_counts() -> None:
     model = _TinyQwenTransformer(num_layers=2)
 
@@ -371,6 +392,29 @@ def test_normalize_qwen_image_qat_parameter_name_strips_wrappers() -> None:
         )
         == "transformer_blocks.1.attn.to_v.lora_up.weight"
     )
+
+
+@requires_float8
+def test_scale_sensitivity_manifest_and_multipliers(tmp_path: Path) -> None:
+    model = _TinyQwenTransformer()
+    prepare_qwen_image_qat_model(
+        model,
+        target_layers=("attn.to_q", "attn.to_k"),
+        linear_cls=nn.Linear,
+    )
+    output_path = tmp_path / "scale_manifest.json"
+
+    manifest = build_qwen_image_qat_scale_sensitivity_manifest(model, output_path=output_path)
+    multipliers = compute_scale_aware_lora_multipliers(manifest, clip_min=0.5, clip_max=2.0)
+
+    assert output_path.exists()
+    assert manifest["status"] == "passed"
+    assert manifest["record_count"] == 2
+    assert set(multipliers) == {
+        "transformer_blocks.0.attn.to_k",
+        "transformer_blocks.0.attn.to_q",
+    }
+    assert all(0.5 <= value <= 2.0 for value in multipliers.values())
 
 
 @requires_float8
@@ -456,3 +500,41 @@ def test_train_qwen_image_qat_logs_loss_components_and_checkpoint(tmp_path: Path
         "transformer_blocks.0.attn.to_q.lora_down.weight",
         "transformer_blocks.0.attn.to_q.lora_up.weight",
     ]
+
+
+@requires_float8
+def test_train_qwen_image_qat_records_progressive_warmup(tmp_path: Path) -> None:
+    tuple_path = tmp_path / "tuple.pt"
+    index_path = tmp_path / "index.jsonl"
+    _write_tuple(
+        tuple_path,
+        hidden_states=torch.ones(1, 2, 128, dtype=torch.bfloat16),
+        encoder_hidden_states=torch.ones(1, 3, 128, dtype=torch.bfloat16),
+        target_output=torch.zeros(1, 2, 128, dtype=torch.bfloat16),
+    )
+    _write_index(index_path, tuple_path)
+    model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+
+    result = train_qwen_image_qat(
+        model,
+        QwenImageQatTrainingConfig(
+            tuple_index_jsonl=index_path,
+            output_dir=tmp_path / "out",
+            max_steps=2,
+            learning_rate=1.0e-3,
+            device="cpu",
+            target_layers=("attn.to_q", "attn.to_k"),
+            warmup_steps=1,
+            warmup_target_layers=("attn.to_q",),
+            expected_num_layers=1,
+        ),
+        linear_cls=nn.Linear,
+    )
+
+    records = [
+        json.loads(line)
+        for line in result.metrics_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert records[0]["warmup_active"] is True
+    assert records[1]["warmup_active"] is False

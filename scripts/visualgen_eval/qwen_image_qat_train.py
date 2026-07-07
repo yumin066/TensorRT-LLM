@@ -63,6 +63,7 @@ try:
         FakeMxfp8Linear,
         Mxfp8ScaleMode,
         QwenImageBlockLinearTarget,
+        fake_mxfp8_weight_quantize,
         normalize_qwen_module_name,
         select_qwen_image_block_linears,
     )
@@ -81,6 +82,7 @@ except ModuleNotFoundError as error:
     Mxfp8ScaleMode = _fake_mxfp8.Mxfp8ScaleMode
     QWEN_IMAGE_BLOCK_LINEAR_COUNT = _fake_mxfp8.QWEN_IMAGE_BLOCK_LINEAR_COUNT
     QwenImageBlockLinearTarget = _fake_mxfp8.QwenImageBlockLinearTarget
+    fake_mxfp8_weight_quantize = _fake_mxfp8.fake_mxfp8_weight_quantize
     normalize_qwen_module_name = _fake_mxfp8.normalize_qwen_module_name
     select_qwen_image_block_linears = _fake_mxfp8.select_qwen_image_block_linears
 
@@ -142,6 +144,7 @@ class QwenImageQatInjectionInfo:
     trainable_parameter_names: tuple[str, ...]
     lora_rank: int
     lora_alpha: float
+    scale_multiplier: float
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,9 @@ class QwenImageQatTrainingConfig:
     checkpoint_name: str = "qwen_image_qat_lora_last.pt"
     metrics_name: str = "qwen_image_qat_train_metrics.jsonl"
     compute_lora_delta_norm: bool = False
+    scale_multipliers: Mapping[str, float] | None = None
+    warmup_steps: int = 0
+    warmup_target_layers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -190,6 +196,7 @@ class Mxfp8LoraAdapterLinear(nn.Module):
         rank: int,
         alpha: float,
         dropout: float = 0.0,
+        scale_multiplier: float = 1.0,
     ) -> None:
         super().__init__()
         if rank <= 0:
@@ -198,12 +205,15 @@ class Mxfp8LoraAdapterLinear(nn.Module):
             raise ValueError("LoRA alpha must be positive")
         if dropout < 0.0 or dropout >= 1.0:
             raise ValueError("LoRA dropout must be in [0, 1)")
+        if scale_multiplier <= 0.0:
+            raise ValueError("LoRA scale_multiplier must be positive")
 
         for parameter in base.parameters():
             parameter.requires_grad_(False)
         self.base = base
         self.rank = int(rank)
         self.alpha = float(alpha)
+        self.scale_multiplier = float(scale_multiplier)
         self.scaling = self.alpha / float(self.rank)
         self.dropout = nn.Dropout(float(dropout))
         factory_kwargs = {
@@ -226,11 +236,18 @@ class Mxfp8LoraAdapterLinear(nn.Module):
     def lora_delta_weight(self) -> torch.Tensor:
         """Return the dense LoRA delta that would be merged into the base weight."""
         delta = self.lora_up.weight.float() @ self.lora_down.weight.float()
-        return (delta * self.scaling).to(dtype=self.weight.dtype, device=self.weight.device)
+        return (delta * self.scaling * self.scale_multiplier).to(
+            dtype=self.weight.dtype,
+            device=self.weight.device,
+        )
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor:
         base_output = self.base(activation)
-        adapter_output = self.lora_up(self.lora_down(self.dropout(activation))) * self.scaling
+        adapter_output = (
+            self.lora_up(self.lora_down(self.dropout(activation)))
+            * self.scaling
+            * self.scale_multiplier
+        )
         return base_output + adapter_output
 
 
@@ -384,6 +401,7 @@ def prepare_qwen_image_qat_model(
     expected_target_count: int | None = None,
     block_size: int = MXFP8_BLOCK_SIZE,
     scale_mode: Mxfp8ScaleMode = "fp32_block_scale",
+    scale_multipliers: Mapping[str, float] | None = None,
     linear_cls: type[nn.Module] | None = None,
 ) -> tuple[QwenImageQatInjectionInfo, ...]:
     """Freeze base weights and inject LoRA fake-MXFP8 wrappers into Qwen block Linears."""
@@ -411,6 +429,7 @@ def prepare_qwen_image_qat_model(
 
     injections: list[QwenImageQatInjectionInfo] = []
     for target in selected_targets:
+        scale_multiplier = _scale_multiplier_for_target(target, scale_multipliers)
         fake = FakeMxfp8Linear(
             target.module,
             module_name=target.normalized_name,
@@ -422,6 +441,7 @@ def prepare_qwen_image_qat_model(
             rank=lora_rank,
             alpha=lora_alpha,
             dropout=lora_dropout,
+            scale_multiplier=scale_multiplier,
         )
         _replace_module(transformer, target.module_name, replacement)
         injections.append(
@@ -432,6 +452,7 @@ def prepare_qwen_image_qat_model(
                 trainable_parameter_names=("lora_down.weight", "lora_up.weight"),
                 lora_rank=int(lora_rank),
                 lora_alpha=float(lora_alpha),
+                scale_multiplier=scale_multiplier,
             )
         )
 
@@ -460,6 +481,7 @@ def train_qwen_image_qat(
         lora_dropout=config.lora_dropout,
         expected_num_layers=config.expected_num_layers,
         expected_target_count=config.expected_target_count,
+        scale_multipliers=config.scale_multipliers,
         linear_cls=linear_cls,
     )
     trainable_parameters = [
@@ -480,6 +502,12 @@ def train_qwen_image_qat(
     start_time = time.perf_counter()
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         for step in range(1, config.max_steps + 1):
+            warmup_active = _apply_progressive_warmup(
+                transformer,
+                step=step,
+                warmup_steps=config.warmup_steps,
+                warmup_target_layers=config.warmup_target_layers,
+            )
             sample = dataset[(step - 1) % len(dataset)]
             optimizer.zero_grad(set_to_none=True)
             output = forward_qwen_image_tuple(transformer, sample, device)
@@ -501,6 +529,7 @@ def train_qwen_image_qat(
                     transformer=transformer,
                     elapsed_seconds=time.perf_counter() - start_time,
                     compute_lora_delta_norm=config.compute_lora_delta_norm,
+                    warmup_active=warmup_active,
                 )
                 metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
                 metrics_file.flush()
@@ -547,6 +576,89 @@ def normalize_qwen_image_qat_parameter_name(name: str) -> str:
                 normalized = normalized[len(prefix) :]
                 changed = True
     return normalize_qwen_module_name(normalized)
+
+
+def build_qwen_image_qat_scale_sensitivity_manifest(
+    transformer: nn.Module,
+    *,
+    output_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Summarize per-block/role MXFP8 weight scale stats for wrapped LoRA targets."""
+    records: list[dict[str, object]] = []
+    for module_name, module in transformer.named_modules():
+        if not isinstance(module, Mxfp8LoraAdapterLinear):
+            continue
+        normalized_name = normalize_qwen_image_qat_parameter_name(module_name)
+        _, scales = fake_mxfp8_weight_quantize(
+            module.weight.detach(),
+            block_size=module.base.block_size,
+            scale_mode=module.base.scale_mode,
+        )
+        flat = scales.detach().float().reshape(-1).cpu()
+        block_index, role = _parse_qwen_block_name(normalized_name)
+        records.append(
+            {
+                "module_name": normalized_name,
+                "block_index": block_index,
+                "role": role,
+                "scale_min": float(flat.min()),
+                "scale_mean": float(flat.mean()),
+                "scale_p95": float(torch.quantile(flat, 0.95)),
+                "scale_max": float(flat.max()),
+                "scale_num_blocks": int(flat.numel()),
+                "scale_multiplier": float(module.scale_multiplier),
+            }
+        )
+
+    role_summary: dict[str, dict[str, float | int]] = {}
+    for role in sorted({str(record["role"]) for record in records}):
+        role_records = [record for record in records if record["role"] == role]
+        role_summary[role] = {
+            "count": len(role_records),
+            "scale_mean": sum(float(record["scale_mean"]) for record in role_records)
+            / max(1, len(role_records)),
+            "scale_max": max(float(record["scale_max"]) for record in role_records),
+        }
+    manifest = {
+        "format": "qwen_image_qat_scale_sensitivity_manifest_v1",
+        "status": "passed" if records else "failed",
+        "record_count": len(records),
+        "role_summary": role_summary,
+        "records": records,
+    }
+    if output_path is not None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
+def compute_scale_aware_lora_multipliers(
+    scale_manifest: Mapping[str, object],
+    *,
+    clip_min: float = 0.25,
+    clip_max: float = 4.0,
+) -> dict[str, float]:
+    """Build per-module LoRA multipliers from normalized MXFP8 scale means."""
+    if clip_min <= 0.0 or clip_max < clip_min:
+        raise ValueError("scale multiplier clip bounds must satisfy 0 < clip_min <= clip_max")
+    records = scale_manifest.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError("scale manifest contains no records")
+    scale_means = [float(record["scale_mean"]) for record in records if isinstance(record, dict)]
+    if not scale_means:
+        raise ValueError("scale manifest contains no scale_mean values")
+    global_mean = sum(scale_means) / len(scale_means)
+    if global_mean <= 0.0:
+        raise ValueError("scale manifest global scale mean must be positive")
+    multipliers: dict[str, float] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        module_name = str(record["module_name"])
+        raw_multiplier = float(record["scale_mean"]) / global_mean
+        multipliers[module_name] = min(clip_max, max(clip_min, raw_multiplier))
+    return multipliers
 
 
 def _read_tuple_index(path: Path) -> list[dict[str, object]]:
@@ -665,6 +777,58 @@ def _filter_targets(
     ]
 
 
+def _scale_multiplier_for_target(
+    target: QwenImageBlockLinearTarget,
+    scale_multipliers: Mapping[str, float] | None,
+) -> float:
+    if scale_multipliers is None:
+        return 1.0
+    value = scale_multipliers.get(target.normalized_name)
+    if value is None:
+        value = scale_multipliers.get(target.role)
+    if value is None:
+        return 1.0
+    multiplier = float(value)
+    if multiplier <= 0.0:
+        raise ValueError(
+            f"scale multiplier for {target.normalized_name} must be positive, got {multiplier}"
+        )
+    return multiplier
+
+
+def _apply_progressive_warmup(
+    transformer: nn.Module,
+    *,
+    step: int,
+    warmup_steps: int,
+    warmup_target_layers: tuple[str, ...],
+) -> bool:
+    warmup_active = warmup_steps > 0 and step <= warmup_steps
+    if warmup_steps > 0 and not warmup_target_layers:
+        raise ValueError("warmup_target_layers must be non-empty when warmup_steps > 0")
+    selectors = set(warmup_target_layers)
+    for module_name, module in transformer.named_modules():
+        if not isinstance(module, Mxfp8LoraAdapterLinear):
+            continue
+        normalized_name = normalize_qwen_image_qat_parameter_name(module_name)
+        _, role = _parse_qwen_block_name(normalized_name)
+        enabled = not warmup_active or normalized_name in selectors or role in selectors
+        module.lora_down.weight.requires_grad_(enabled)
+        module.lora_up.weight.requires_grad_(enabled)
+    return warmup_active
+
+
+def _parse_qwen_block_name(normalized_name: str) -> tuple[int | None, str]:
+    prefix = "transformer_blocks."
+    if not normalized_name.startswith(prefix):
+        return None, normalized_name
+    remainder = normalized_name[len(prefix) :]
+    block_text, sep, role = remainder.partition(".")
+    if not sep or not block_text.isdigit():
+        return None, normalized_name
+    return int(block_text), role
+
+
 def _assert_qat_target_weights_are_floating(
     targets: list[QwenImageBlockLinearTarget],
 ) -> None:
@@ -723,6 +887,18 @@ def _validate_training_config(config: QwenImageQatTrainingConfig) -> None:
         raise ValueError("optimizer eps must be positive")
     if config.log_interval_steps <= 0:
         raise ValueError("log_interval_steps must be positive")
+    if config.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if config.warmup_steps > 0 and not config.warmup_target_layers:
+        raise ValueError("warmup_target_layers must be non-empty when warmup_steps > 0")
+    if config.scale_multipliers is not None:
+        invalid = [
+            name
+            for name, multiplier in config.scale_multipliers.items()
+            if float(multiplier) <= 0.0
+        ]
+        if invalid:
+            raise ValueError(f"scale_multipliers must be positive for {invalid[:8]}")
 
 
 def _build_training_record(
@@ -736,6 +912,7 @@ def _build_training_record(
     transformer: nn.Module,
     elapsed_seconds: float,
     compute_lora_delta_norm: bool,
+    warmup_active: bool,
 ) -> dict[str, object]:
     record: dict[str, object] = {
         "step": step,
@@ -752,6 +929,7 @@ def _build_training_record(
         "grad_norm": grad_norm,
         "trainable_parameter_norm": _parameter_global_norm(trainable_parameters),
         "elapsed_seconds": float(elapsed_seconds),
+        "warmup_active": warmup_active,
     }
     if compute_lora_delta_norm:
         record["lora_delta_norm"] = _lora_delta_global_norm(transformer)
@@ -811,6 +989,9 @@ def _training_config_to_dict(config: QwenImageQatTrainingConfig) -> dict[str, ob
         "checkpoint_name": config.checkpoint_name,
         "metrics_name": config.metrics_name,
         "compute_lora_delta_norm": config.compute_lora_delta_norm,
+        "scale_multipliers": dict(config.scale_multipliers or {}),
+        "warmup_steps": config.warmup_steps,
+        "warmup_target_layers": list(config.warmup_target_layers),
     }
 
 
@@ -822,6 +1003,7 @@ def _injection_to_dict(injection: QwenImageQatInjectionInfo) -> dict[str, object
         "trainable_parameter_names": list(injection.trainable_parameter_names),
         "lora_rank": injection.lora_rank,
         "lora_alpha": injection.lora_alpha,
+        "scale_multiplier": injection.scale_multiplier,
     }
 
 
@@ -872,7 +1054,9 @@ __all__ = [
     "QwenImageTupleLossConfig",
     "QwenImageTupleSample",
     "TRAINING_FORMAT",
+    "build_qwen_image_qat_scale_sensitivity_manifest",
     "compute_qwen_image_tuple_loss",
+    "compute_scale_aware_lora_multipliers",
     "first_tensor_output",
     "forward_qwen_image_tuple",
     "load_qwen_image_tuple_sample",
