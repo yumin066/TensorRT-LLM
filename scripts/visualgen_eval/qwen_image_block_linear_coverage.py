@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib
+import importlib.util
 import json
 import os
 import platform
@@ -40,17 +42,27 @@ from scripts.visualgen_eval.qwen_image_teacher_capture import (
     cleanup_pipeline,
     load_single_worker_pipeline,
 )
-from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8 import (
-    QWEN_IMAGE_BLOCK_LINEAR_COUNT,
-    QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES,
-    normalize_qwen_module_name,
-    select_qwen_image_block_linears,
-)
 
 COVERAGE_MANIFEST_FORMAT = "qwen_image_block_linear_coverage_manifest_v1"
 QWEN_BLOCK_LINEAR_POLICY = "qwen_block_linears_840"
 QWEN_IMAGE_LAYER_COUNT = 60
+QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES = (
+    "img_mod.1",
+    "txt_mod.1",
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "attn.add_q_proj",
+    "attn.add_k_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    "img_mlp.up_proj",
+    "img_mlp.down_proj",
+    "txt_mlp.up_proj",
+    "txt_mlp.down_proj",
+)
+QWEN_IMAGE_BLOCK_LINEAR_COUNT = len(QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES)
 QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT = QWEN_IMAGE_LAYER_COUNT * QWEN_IMAGE_BLOCK_LINEAR_COUNT
 QWEN_NON_BLOCK_LINEAR_EXCLUSIONS = ("img_in", "txt_in", "norm_out.linear", "proj_out")
 
@@ -74,10 +86,12 @@ def analyze_transformer_block_linear_coverage(
     *,
     expected_num_layers: int = QWEN_IMAGE_LAYER_COUNT,
     expected_target_count: int = QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT,
-    linear_cls: type[nn.Module] = Linear,
+    linear_cls: type[nn.Module] | None = None,
 ) -> dict[str, object]:
     """Analyze Qwen-Image block Linear target coverage and fail on contract drift."""
-    targets = select_qwen_image_block_linears(
+    linear_cls = linear_cls or _default_linear_cls()
+    helper = _load_fake_mxfp8_helper()
+    targets = helper.select_qwen_image_block_linears(
         transformer,
         expected_count=expected_target_count,
         linear_cls=linear_cls,
@@ -103,16 +117,17 @@ def collect_linear_coverage_records(
     transformer: nn.Module,
     *,
     target_by_name: dict[str, Any],
-    linear_cls: type[nn.Module] = Linear,
+    linear_cls: type[nn.Module],
 ) -> tuple[BlockLinearCoverageRecord, ...]:
     """Collect all Linear modules, marking Qwen block targets and non-block exclusions."""
     seen: set[str] = set()
     records: list[BlockLinearCoverageRecord] = []
     exclusion_set = set(QWEN_NON_BLOCK_LINEAR_EXCLUSIONS)
+    helper = _load_fake_mxfp8_helper()
     for module_name, module in transformer.named_modules():
         if not module_name or not isinstance(module, linear_cls):
             continue
-        normalized_name = normalize_qwen_module_name(module_name)
+        normalized_name = helper.normalize_qwen_module_name(module_name)
         if normalized_name in seen:
             raise ValueError(f"Duplicate Linear module after normalization: {normalized_name}")
         seen.add(normalized_name)
@@ -264,6 +279,27 @@ def _format_failures(failures: dict[str, list[str]]) -> str:
         if items:
             parts.append(f"{key}: {items[:8]}")
     return "Qwen-Image block Linear coverage failed; " + "; ".join(parts)
+
+
+def _default_linear_cls() -> type[nn.Module]:
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    return Linear
+
+
+def _load_fake_mxfp8_helper() -> Any:
+    helper_path = (
+        Path(__file__).resolve().parents[2]
+        / "tensorrt_llm/_torch/visual_gen/quantization/fake_mxfp8.py"
+    )
+    if helper_path.is_file():
+        spec = importlib.util.spec_from_file_location("_qwen_image_fake_mxfp8", helper_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load fake MXFP8 helper from {helper_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    return importlib.import_module("tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8")
 
 
 def build_parser() -> argparse.ArgumentParser:
