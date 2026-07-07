@@ -22,7 +22,6 @@ import torch
 from pydantic import ValidationError
 
 from scripts.visualgen_eval import qwen_image_layered_qat_export as qat_export
-from scripts.visualgen_eval.qwen_image_layered_qat_train import TRAINING_FORMAT
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -250,7 +249,7 @@ def test_export_qat_checkpoint_writes_static_transformer_directory(tmp_path):
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(
         {
-            "format": TRAINING_FORMAT,
+            "format": qat_export.LAYERED_TRAINING_FORMAT,
             "trainable_state_dict": {
                 f"{target}.linear.weight": trained_weight,
             },
@@ -296,7 +295,13 @@ def test_export_qat_checkpoint_writes_static_transformer_directory(tmp_path):
     assert provenance["merged_parameter_names"] == [f"{target}.weight"]
 
 
-def test_export_qat_lora_checkpoint_writes_static_transformer_directory(tmp_path):
+@pytest.mark.parametrize(
+    "checkpoint_format",
+    (qat_export.LAYERED_TRAINING_FORMAT, qat_export.QWEN_IMAGE_TRAINING_FORMAT),
+)
+def test_export_qat_lora_checkpoint_writes_static_transformer_directory(
+    tmp_path, checkpoint_format
+):
     from safetensors.torch import load_file, save_file
 
     source_dir = tmp_path / "source"
@@ -331,7 +336,7 @@ def test_export_qat_lora_checkpoint_writes_static_transformer_directory(tmp_path
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(
         {
-            "format": TRAINING_FORMAT,
+            "format": checkpoint_format,
             "config": {
                 "recipe": "lora_adapter",
                 "lora_rank": 2,
@@ -370,5 +375,6 @@ def test_export_qat_lora_checkpoint_writes_static_transformer_directory(tmp_path
     assert exported[f"{target}.weight_scale"].shape == (1, 1)
 
     provenance = json.loads(result.provenance_path.read_text(encoding="utf-8"))
+    assert provenance["qat_checkpoint_format"] == checkpoint_format
     assert provenance["qat_best_validation_loss"] == pytest.approx(0.25)
     assert provenance["merged_parameter_names"] == [f"{target}.weight"]

@@ -6,13 +6,16 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.util
 import json
 import platform
 import shutil
 import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Literal
 
 import torch
@@ -20,23 +23,61 @@ import torch.nn.functional as F
 import yaml
 from pydantic import Field, PositiveInt, model_validator
 
-from scripts.visualgen_eval.qwen_image_layered_qat_train import TRAINING_FORMAT
-from tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8 import (
-    FP8_E4M3_MAX,
-    MXFP8_BLOCK_SIZE,
-    QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES,
-    normalize_qwen_module_name,
-)
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
 EXPORT_FORMAT = "qwen_image_layered_static_mxfp8_export_v1"
+LAYERED_TRAINING_FORMAT = "qwen_image_layered_mxfp8_qat_adapter_v1"
+QWEN_IMAGE_TRAINING_FORMAT = "qwen_image_mxfp8_qat_adapter_v1"
+SUPPORTED_QAT_CHECKPOINT_FORMATS = (LAYERED_TRAINING_FORMAT, QWEN_IMAGE_TRAINING_FORMAT)
+_FAKE_MXFP8_MODULE_NAMES = {
+    "tensorrt_llm.bindings",
+    "tensorrt_llm._torch.visual_gen.quantization",
+    "tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8",
+}
 QWEN_BLOCK_LINEAR_POLICY = "qwen_block_linears_840"
 EXPLICIT_TARGET_POLICY = "explicit"
 QWEN_LAYER_COUNT = 60
-QWEN_BLOCK_LINEAR_TARGET_COUNT = QWEN_LAYER_COUNT * len(QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES)
 QWEN_STATIC_BF16_EXCLUSIONS = ("img_in", "txt_in", "norm_out.linear", "proj_out")
 STATIC_INPUT_SCALE = 1.0
 SCALE_EPS = 1.0e-12
+
+
+def _load_source_fake_mxfp8() -> ModuleType:
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "tensorrt_llm"
+        / "_torch"
+        / "visual_gen"
+        / "quantization"
+        / "fake_mxfp8.py"
+    )
+    spec = importlib.util.spec_from_file_location("_qwen_image_export_fake_mxfp8", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load fake_mxfp8 module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from tensorrt_llm._torch.visual_gen.quantization.fake_mxfp8 import (
+        FP8_E4M3_MAX,
+        MXFP8_BLOCK_SIZE,
+        QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES,
+        normalize_qwen_module_name,
+    )
+except ModuleNotFoundError as error:
+    if error.name not in _FAKE_MXFP8_MODULE_NAMES:
+        raise
+    _fake_mxfp8 = _load_source_fake_mxfp8()
+    FP8_E4M3_MAX = _fake_mxfp8.FP8_E4M3_MAX
+    MXFP8_BLOCK_SIZE = _fake_mxfp8.MXFP8_BLOCK_SIZE
+    QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES = _fake_mxfp8.QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES
+    normalize_qwen_module_name = _fake_mxfp8.normalize_qwen_module_name
+
+
+QWEN_BLOCK_LINEAR_TARGET_COUNT = QWEN_LAYER_COUNT * len(QWEN_IMAGE_BLOCK_LINEAR_SUFFIXES)
 
 TargetPolicyName = Literal["qwen_block_linears_840", "explicit"]
 ScaleModeName = Literal["fp32_block_scale"]
@@ -116,6 +157,7 @@ class QatCheckpoint:
     """Validated QAT checkpoint payload."""
 
     path: Path
+    format: str
     config: dict[str, object]
     trainable_state_dict: dict[str, torch.Tensor]
     injections: tuple[dict[str, object], ...]
@@ -262,10 +304,11 @@ def load_qat_checkpoint(path: Path) -> QatCheckpoint:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"QAT checkpoint must be a dict: {path}")
-    if payload.get("format") != TRAINING_FORMAT:
+    checkpoint_format = payload.get("format")
+    if checkpoint_format not in SUPPORTED_QAT_CHECKPOINT_FORMATS:
         raise ValueError(
-            f"Unsupported QAT checkpoint format {payload.get('format')!r}; "
-            f"expected {TRAINING_FORMAT!r}."
+            f"Unsupported QAT checkpoint format {checkpoint_format!r}; "
+            f"expected one of {SUPPORTED_QAT_CHECKPOINT_FORMATS!r}."
         )
     trainable_state = payload.get("trainable_state_dict")
     if not isinstance(trainable_state, dict) or not trainable_state:
@@ -288,6 +331,7 @@ def load_qat_checkpoint(path: Path) -> QatCheckpoint:
         raise ValueError("QAT checkpoint config must be a mapping when present")
     return QatCheckpoint(
         path=path,
+        format=str(checkpoint_format),
         config=qat_config,
         trainable_state_dict=checked_state,
         injections=tuple(dict(item) for item in injections),
@@ -448,7 +492,7 @@ def build_export_provenance(
         "source_model": str(source_model),
         "source_transformer_dir": str(source_transformer_dir),
         "qat_checkpoint": str(qat_checkpoint.path),
-        "qat_checkpoint_format": TRAINING_FORMAT,
+        "qat_checkpoint_format": qat_checkpoint.format,
         "qat_best_validation_loss": qat_checkpoint.best_validation_loss,
         "qat_injection_count": len(qat_checkpoint.injections),
         "target_policy": target_policy.name,
