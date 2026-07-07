@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -30,9 +32,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from scripts.visualgen_eval.qwen_image_capture_manifest import BF16_TEACHER_TRAJECTORY_SOURCE
+from scripts.visualgen_eval.qwen_image_capture_manifest import (
+    BF16_TEACHER_TRAJECTORY_SOURCE,
+    DEFAULT_CLUSTER_ALIAS,
+    DEFAULT_CONTAINER_RUNTIME,
+    DEFAULT_ENROOT_IMAGE,
+    git_commit,
+    write_json,
+)
 from scripts.visualgen_eval.qwen_image_teacher_capture import (
     CAPTURED_TUPLE_STATUS,
+    cleanup_pipeline,
+    load_single_worker_pipeline,
     validate_teacher_tuple_payload,
 )
 
@@ -88,8 +99,22 @@ except ModuleNotFoundError as error:
 
 
 TRAINING_FORMAT = "qwen_image_mxfp8_qat_adapter_v1"
+PROBE_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_probe_summary_v1"
 QWEN_BLOCK_LINEAR_TARGET = "qwen_block_linears"
 TARGET_OUTPUT_KEY = "target_output"
+QWEN_IMAGE_QAT_PROBE_RECIPES = (
+    "mse_only",
+    "timestep_weighted",
+    "direction_aware",
+    "scale_aware_lora",
+)
+DEFAULT_TIMESTEP_WEIGHTS = {
+    "early": 1.0,
+    "early_mid": 1.25,
+    "mid": 1.5,
+    "late_mid": 2.0,
+    "late": 3.0,
+}
 _LAYERED_ONLY_FIELDS = frozenset(
     (
         "alpha_mask",
@@ -173,6 +198,7 @@ class QwenImageQatTrainingConfig:
     scale_multipliers: Mapping[str, float] | None = None
     warmup_steps: int = 0
     warmup_target_layers: tuple[str, ...] = ()
+    optimizer_foreach: bool | None = False
 
 
 @dataclass(frozen=True)
@@ -495,6 +521,7 @@ def train_qwen_image_qat(
         weight_decay=float(config.weight_decay),
         betas=config.betas,
         eps=float(config.eps),
+        foreach=config.optimizer_foreach,
     )
 
     metrics_path = output_dir / config.metrics_name
@@ -548,6 +575,181 @@ def train_qwen_image_qat(
         train_steps=config.max_steps,
         injections=injections,
     )
+
+
+def build_qwen_image_qat_probe_config(
+    *,
+    recipe: str,
+    tuple_index_jsonl: str | Path,
+    output_dir: str | Path,
+    max_steps: int,
+    learning_rate: float = 1.0e-5,
+    weight_decay: float = 0.0,
+    device: str = "cuda:0",
+    lora_rank: int = 16,
+    lora_alpha: float = 32.0,
+    lora_dropout: float = 0.0,
+    expected_num_layers: int | None = 60,
+    expected_target_count: int | None = 840,
+    log_interval_steps: int = 10,
+    compute_lora_delta_norm: bool = True,
+    scale_multipliers: Mapping[str, float] | None = None,
+    checkpoint_name: str = "qwen_image_qat_lora_last.pt",
+    metrics_name: str = "qwen_image_qat_train_metrics.jsonl",
+) -> QwenImageQatTrainingConfig:
+    """Build the literature-guided 32-prompt probe training config."""
+    recipe_name = validate_qwen_image_qat_probe_recipe(recipe)
+    return QwenImageQatTrainingConfig(
+        tuple_index_jsonl=tuple_index_jsonl,
+        output_dir=output_dir,
+        max_steps=max_steps,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        device=device,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        expected_num_layers=expected_num_layers,
+        expected_target_count=expected_target_count,
+        loss=_probe_loss_config(recipe_name),
+        log_interval_steps=log_interval_steps,
+        checkpoint_name=checkpoint_name,
+        metrics_name=metrics_name,
+        compute_lora_delta_norm=compute_lora_delta_norm,
+        scale_multipliers=scale_multipliers if recipe_name == "scale_aware_lora" else None,
+        optimizer_foreach=False,
+    )
+
+
+def validate_qwen_image_qat_probe_recipe(recipe: str) -> str:
+    """Return a supported probe recipe name or raise a precise error."""
+    if recipe not in QWEN_IMAGE_QAT_PROBE_RECIPES:
+        raise ValueError(
+            "unsupported Qwen-Image QAT probe recipe "
+            f"{recipe!r}; expected one of {QWEN_IMAGE_QAT_PROBE_RECIPES}"
+        )
+    return recipe
+
+
+def run_qwen_image_qat_probe(
+    *,
+    recipe: str,
+    model: str,
+    visual_gen_args: str | Path,
+    tuple_index_jsonl: str | Path,
+    output_dir: str | Path,
+    max_steps: int,
+    device: str = "cuda:0",
+    learning_rate: float = 1.0e-5,
+    weight_decay: float = 0.0,
+    lora_rank: int = 16,
+    lora_alpha: float = 32.0,
+    lora_dropout: float = 0.0,
+    expected_num_layers: int | None = 60,
+    expected_target_count: int | None = 840,
+    log_interval_steps: int = 10,
+    scale_clip_min: float = 0.25,
+    scale_clip_max: float = 4.0,
+    summary_json: str | Path | None = None,
+    provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Load Qwen-Image and run one fake-MXFP8 LoRA QAT probe recipe."""
+    recipe_name = validate_qwen_image_qat_probe_recipe(recipe)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    scale_multipliers = _maybe_build_probe_scale_multipliers(
+        recipe=recipe_name,
+        model=model,
+        visual_gen_args=Path(visual_gen_args),
+        output_dir=output_path,
+        device=device,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        expected_num_layers=expected_num_layers,
+        expected_target_count=expected_target_count,
+        scale_clip_min=scale_clip_min,
+        scale_clip_max=scale_clip_max,
+    )
+    config = build_qwen_image_qat_probe_config(
+        recipe=recipe_name,
+        tuple_index_jsonl=tuple_index_jsonl,
+        output_dir=output_path,
+        max_steps=max_steps,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        device=device,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        expected_num_layers=expected_num_layers,
+        expected_target_count=expected_target_count,
+        log_interval_steps=log_interval_steps,
+        scale_multipliers=scale_multipliers,
+    )
+    pipeline = load_single_worker_pipeline(
+        model=model,
+        visual_gen_args=Path(visual_gen_args),
+        device=device,
+    )
+    try:
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            raise ValueError("Loaded pipeline does not expose a transformer component")
+        result = train_qwen_image_qat(transformer, config)
+    finally:
+        cleanup_pipeline(pipeline)
+
+    summary_path = (
+        Path(summary_json) if summary_json is not None else output_path / "probe_summary.json"
+    )
+    summary = {
+        "format": PROBE_SUMMARY_FORMAT,
+        "recipe": recipe_name,
+        "model": model,
+        "visual_gen_args": str(visual_gen_args),
+        "tuple_index_jsonl": str(tuple_index_jsonl),
+        "output_dir": str(output_path),
+        "summary_json": str(summary_path),
+        "checkpoint_path": str(result.checkpoint_path),
+        "metrics_path": str(result.metrics_path),
+        "train_steps": result.train_steps,
+        "injection_count": len(result.injections),
+        "training_config": _training_config_to_dict(config),
+        "metrics_summary": summarize_qwen_image_qat_training_metrics(result.metrics_path),
+        "provenance": dict(provenance or {}),
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
+def summarize_qwen_image_qat_training_metrics(metrics_path: str | Path) -> dict[str, object]:
+    """Summarize JSONL training metrics for recipe selection."""
+    path = Path(metrics_path)
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    if not records:
+        raise ValueError(f"training metrics contain no records: {path}")
+    first_record = records[0]
+    last_record = records[-1]
+    best_record = min(records, key=lambda record: float(record["loss_total"]))
+    return {
+        "record_count": len(records),
+        "first_step": int(first_record["step"]),
+        "last_step": int(last_record["step"]),
+        "first_loss_total": float(first_record["loss_total"]),
+        "last_loss_total": float(last_record["loss_total"]),
+        "loss_total_delta": float(last_record["loss_total"]) - float(first_record["loss_total"]),
+        "best_loss_total": float(best_record["loss_total"]),
+        "best_loss_step": int(best_record["step"]),
+        "last_loss_mse": _optional_float_metric(last_record.get("loss_mse")),
+        "last_loss_direction": _optional_float_metric(last_record.get("loss_direction")),
+        "last_grad_norm": _optional_float_metric(last_record.get("grad_norm")),
+        "last_lora_delta_norm": _optional_float_metric(last_record.get("lora_delta_norm")),
+        "last_elapsed_seconds": _optional_float_metric(last_record.get("elapsed_seconds")),
+        "timestep_bins": _summarize_metrics_by_timestep_bin(records),
+    }
 
 
 def qwen_image_qat_trainable_parameter_names(
@@ -659,6 +861,122 @@ def compute_scale_aware_lora_multipliers(
         raw_multiplier = float(record["scale_mean"]) / global_mean
         multipliers[module_name] = min(clip_max, max(clip_min, raw_multiplier))
     return multipliers
+
+
+def _probe_loss_config(recipe: str) -> QwenImageTupleLossConfig:
+    if recipe == "mse_only":
+        return QwenImageTupleLossConfig(lambda_mse=1.0, lambda_dir=0.0)
+    if recipe == "timestep_weighted":
+        return QwenImageTupleLossConfig(
+            lambda_mse=1.0,
+            lambda_dir=0.0,
+            timestep_weights=DEFAULT_TIMESTEP_WEIGHTS,
+        )
+    if recipe in ("direction_aware", "scale_aware_lora"):
+        return QwenImageTupleLossConfig(
+            lambda_mse=1.0,
+            lambda_dir=0.1,
+            timestep_weights=DEFAULT_TIMESTEP_WEIGHTS,
+        )
+    raise ValueError(f"unsupported Qwen-Image QAT probe recipe {recipe!r}")
+
+
+def _maybe_build_probe_scale_multipliers(
+    *,
+    recipe: str,
+    model: str,
+    visual_gen_args: Path,
+    output_dir: Path,
+    device: str,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float,
+    expected_num_layers: int | None,
+    expected_target_count: int | None,
+    scale_clip_min: float,
+    scale_clip_max: float,
+) -> dict[str, float] | None:
+    if recipe != "scale_aware_lora":
+        return None
+    scale_dir = output_dir / "scale_sensitivity"
+    scale_manifest_path = scale_dir / "scale_sensitivity_manifest.json"
+    scale_multipliers_path = scale_dir / "scale_multipliers.json"
+    pipeline = load_single_worker_pipeline(
+        model=model,
+        visual_gen_args=visual_gen_args,
+        device=device,
+    )
+    try:
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            raise ValueError("Loaded pipeline does not expose a transformer component")
+        prepare_qwen_image_qat_model(
+            transformer,
+            target_layers=(QWEN_BLOCK_LINEAR_TARGET,),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            expected_num_layers=expected_num_layers,
+            expected_target_count=expected_target_count,
+        )
+        manifest = build_qwen_image_qat_scale_sensitivity_manifest(
+            transformer,
+            output_path=scale_manifest_path,
+        )
+        multipliers = compute_scale_aware_lora_multipliers(
+            manifest,
+            clip_min=scale_clip_min,
+            clip_max=scale_clip_max,
+        )
+        write_json(
+            scale_multipliers_path,
+            {
+                "format": "qwen_image_qat_scale_aware_multipliers_v1",
+                "clip_min": scale_clip_min,
+                "clip_max": scale_clip_max,
+                "scale_manifest": str(scale_manifest_path),
+                "multipliers": multipliers,
+            },
+        )
+        return multipliers
+    finally:
+        cleanup_pipeline(pipeline)
+
+
+def _optional_float_metric(value: object) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"metric value must be numeric or null, got {value!r}")
+    return float(value)
+
+
+def _summarize_metrics_by_timestep_bin(records: list[dict[str, object]]) -> dict[str, object]:
+    by_bin: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        timestep_bin = str(record.get("timestep_bin"))
+        by_bin.setdefault(timestep_bin, []).append(record)
+    return {
+        timestep_bin: {
+            "count": len(bin_records),
+            "loss_total_mean": _mean_record_metric(bin_records, "loss_total"),
+            "loss_mse_mean": _mean_record_metric(bin_records, "loss_mse"),
+            "loss_direction_mean": _mean_record_metric(bin_records, "loss_direction"),
+            "last_loss_total": _optional_float_metric(bin_records[-1].get("loss_total")),
+        }
+        for timestep_bin, bin_records in sorted(by_bin.items())
+    }
+
+
+def _mean_record_metric(records: list[dict[str, object]], field_name: str) -> float | None:
+    values = [
+        value
+        for record in records
+        if (value := _optional_float_metric(record.get(field_name))) is not None
+    ]
+    if not values:
+        return None
+    return float(sum(values) / len(values))
 
 
 def _read_tuple_index(path: Path) -> list[dict[str, object]]:
@@ -992,6 +1310,7 @@ def _training_config_to_dict(config: QwenImageQatTrainingConfig) -> dict[str, ob
         "scale_multipliers": dict(config.scale_multipliers or {}),
         "warmup_steps": config.warmup_steps,
         "warmup_target_layers": list(config.warmup_target_layers),
+        "optimizer_foreach": config.optimizer_foreach,
     }
 
 
@@ -1042,11 +1361,97 @@ def _lora_delta_global_norm(transformer: nn.Module) -> float:
     return total**0.5
 
 
+def _run_probe_command(args: argparse.Namespace) -> None:
+    run_qwen_image_qat_probe(
+        recipe=args.recipe,
+        model=args.model,
+        visual_gen_args=Path(args.visual_gen_args),
+        tuple_index_jsonl=Path(args.tuple_index_jsonl),
+        output_dir=Path(args.output_dir),
+        max_steps=args.max_steps,
+        device=args.device,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        expected_num_layers=args.expected_num_layers,
+        expected_target_count=args.expected_target_count,
+        log_interval_steps=args.log_interval_steps,
+        scale_clip_min=args.scale_clip_min,
+        scale_clip_max=args.scale_clip_max,
+        summary_json=Path(args.summary_json) if args.summary_json else None,
+        provenance=_build_probe_runtime_provenance(args),
+    )
+
+
+def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "cluster_alias": args.cluster_alias,
+        "allocation_id": args.allocation_id or os.environ.get("SSH_GW_ALLOC_ID"),
+        "job_id": args.job_id or os.environ.get("SLURM_JOB_ID"),
+        "node_list": args.node_list or os.environ.get("SLURM_NODELIST"),
+        "container_runtime": DEFAULT_CONTAINER_RUNTIME,
+        "enroot_image": args.enroot_image,
+        "command": args.command or " ".join(sys.argv),
+        "model_snapshot_path": args.model_snapshot_path,
+        "git_head": git_commit(Path.cwd()),
+        "teacher_attention_backend": args.teacher_attention_backend,
+        "training_attention_backend": args.training_attention_backend,
+        "evaluation_attention_backend": args.evaluation_attention_backend,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run_parser = subparsers.add_parser("run-probe")
+    run_parser.add_argument("--recipe", required=True, choices=QWEN_IMAGE_QAT_PROBE_RECIPES)
+    run_parser.add_argument("--model", required=True)
+    run_parser.add_argument("--visual-gen-args", required=True)
+    run_parser.add_argument("--tuple-index-jsonl", required=True)
+    run_parser.add_argument("--output-dir", required=True)
+    run_parser.add_argument("--max-steps", required=True, type=int)
+    run_parser.add_argument("--device", default="cuda:0")
+    run_parser.add_argument("--learning-rate", type=float, default=1.0e-5)
+    run_parser.add_argument("--weight-decay", type=float, default=0.0)
+    run_parser.add_argument("--lora-rank", type=int, default=16)
+    run_parser.add_argument("--lora-alpha", type=float, default=32.0)
+    run_parser.add_argument("--lora-dropout", type=float, default=0.0)
+    run_parser.add_argument("--expected-num-layers", type=int, default=60)
+    run_parser.add_argument("--expected-target-count", type=int, default=840)
+    run_parser.add_argument("--log-interval-steps", type=int, default=10)
+    run_parser.add_argument("--scale-clip-min", type=float, default=0.25)
+    run_parser.add_argument("--scale-clip-max", type=float, default=4.0)
+    run_parser.add_argument("--summary-json")
+    run_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
+    run_parser.add_argument("--allocation-id")
+    run_parser.add_argument("--job-id")
+    run_parser.add_argument("--node-list")
+    run_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    run_parser.add_argument("--model-snapshot-path")
+    run_parser.add_argument("--teacher-attention-backend", default="TRTLLM_FP8")
+    run_parser.add_argument("--training-attention-backend", default="TRTLLM_FP8")
+    run_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
+    run_parser.add_argument("--command")
+    run_parser.set_defaults(func=_run_probe_command)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
 __all__ = [
+    "DEFAULT_TIMESTEP_WEIGHTS",
     "FakeMxfp8Linear",
     "MXFP8_BLOCK_SIZE",
     "Mxfp8LoraAdapterLinear",
+    "PROBE_SUMMARY_FORMAT",
     "QWEN_BLOCK_LINEAR_TARGET",
+    "QWEN_IMAGE_QAT_PROBE_RECIPES",
     "QwenImageQatInjectionInfo",
     "QwenImageQatTrainingConfig",
     "QwenImageQatTrainingResult",
@@ -1054,14 +1459,24 @@ __all__ = [
     "QwenImageTupleLossConfig",
     "QwenImageTupleSample",
     "TRAINING_FORMAT",
+    "build_parser",
+    "build_qwen_image_qat_probe_config",
     "build_qwen_image_qat_scale_sensitivity_manifest",
     "compute_qwen_image_tuple_loss",
     "compute_scale_aware_lora_multipliers",
     "first_tensor_output",
     "forward_qwen_image_tuple",
     "load_qwen_image_tuple_sample",
+    "main",
     "normalize_qwen_image_qat_parameter_name",
     "prepare_qwen_image_qat_model",
     "qwen_image_qat_trainable_parameter_names",
+    "run_qwen_image_qat_probe",
+    "summarize_qwen_image_qat_training_metrics",
     "train_qwen_image_qat",
+    "validate_qwen_image_qat_probe_recipe",
 ]
+
+
+if __name__ == "__main__":
+    main()

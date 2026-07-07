@@ -23,12 +23,14 @@ import torch
 import torch.nn as nn
 
 from scripts.visualgen_eval.qwen_image_qat_train import (
+    DEFAULT_TIMESTEP_WEIGHTS,
     QWEN_BLOCK_LINEAR_TARGET,
     FakeMxfp8Linear,
     Mxfp8LoraAdapterLinear,
     QwenImageQatTrainingConfig,
     QwenImageTupleDataset,
     QwenImageTupleLossConfig,
+    build_qwen_image_qat_probe_config,
     build_qwen_image_qat_scale_sensitivity_manifest,
     compute_qwen_image_tuple_loss,
     compute_scale_aware_lora_multipliers,
@@ -37,7 +39,9 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     normalize_qwen_image_qat_parameter_name,
     prepare_qwen_image_qat_model,
     qwen_image_qat_trainable_parameter_names,
+    summarize_qwen_image_qat_training_metrics,
     train_qwen_image_qat,
+    validate_qwen_image_qat_probe_recipe,
 )
 
 requires_float8 = pytest.mark.skipif(
@@ -272,6 +276,97 @@ def test_compute_qwen_image_tuple_loss_rejects_shape_mismatch(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="shapes must match"):
         compute_qwen_image_tuple_loss(torch.zeros(1, 1, 4), sample)
+
+
+def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:
+    tuple_index = tmp_path / "index.jsonl"
+    output_dir = tmp_path / "probe"
+
+    mse_config = build_qwen_image_qat_probe_config(
+        recipe="mse_only",
+        tuple_index_jsonl=tuple_index,
+        output_dir=output_dir,
+        max_steps=200,
+    )
+    assert mse_config.loss.lambda_mse == pytest.approx(1.0)
+    assert mse_config.loss.lambda_dir == pytest.approx(0.0)
+    assert mse_config.loss.timestep_weights is None
+    assert mse_config.lora_rank == 16
+    assert mse_config.lora_alpha == pytest.approx(32.0)
+    assert mse_config.optimizer_foreach is False
+
+    timestep_config = build_qwen_image_qat_probe_config(
+        recipe="timestep_weighted",
+        tuple_index_jsonl=tuple_index,
+        output_dir=output_dir,
+        max_steps=200,
+    )
+    assert timestep_config.loss.lambda_dir == pytest.approx(0.0)
+    assert timestep_config.loss.timestep_weights == DEFAULT_TIMESTEP_WEIGHTS
+
+    direction_config = build_qwen_image_qat_probe_config(
+        recipe="direction_aware",
+        tuple_index_jsonl=tuple_index,
+        output_dir=output_dir,
+        max_steps=200,
+    )
+    assert direction_config.loss.lambda_dir == pytest.approx(0.1)
+    assert direction_config.loss.timestep_weights == DEFAULT_TIMESTEP_WEIGHTS
+
+    scale_config = build_qwen_image_qat_probe_config(
+        recipe="scale_aware_lora",
+        tuple_index_jsonl=tuple_index,
+        output_dir=output_dir,
+        max_steps=200,
+        scale_multipliers={"transformer_blocks.0.attn.to_q": 2.0},
+    )
+    assert scale_config.loss.lambda_dir == pytest.approx(0.1)
+    assert scale_config.scale_multipliers == {"transformer_blocks.0.attn.to_q": 2.0}
+
+
+def test_qwen_image_qat_probe_config_rejects_unknown_recipe() -> None:
+    with pytest.raises(ValueError, match="unsupported Qwen-Image QAT probe recipe"):
+        validate_qwen_image_qat_probe_recipe("unknown")
+
+
+def test_summarize_qwen_image_qat_training_metrics_groups_timestep_bins(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "metrics.jsonl"
+    records = [
+        {
+            "step": 1,
+            "timestep_bin": "early",
+            "loss_total": 3.0,
+            "loss_mse": 3.0,
+            "loss_direction": None,
+            "grad_norm": 2.0,
+            "elapsed_seconds": 10.0,
+        },
+        {
+            "step": 2,
+            "timestep_bin": "late",
+            "loss_total": 1.0,
+            "loss_mse": 0.5,
+            "loss_direction": 0.25,
+            "grad_norm": 1.5,
+            "lora_delta_norm": 0.1,
+            "elapsed_seconds": 20.0,
+        },
+    ]
+    metrics_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_qwen_image_qat_training_metrics(metrics_path)
+
+    assert summary["record_count"] == 2
+    assert summary["first_loss_total"] == pytest.approx(3.0)
+    assert summary["last_loss_total"] == pytest.approx(1.0)
+    assert summary["loss_total_delta"] == pytest.approx(-2.0)
+    assert summary["best_loss_step"] == 2
+    assert summary["last_lora_delta_norm"] == pytest.approx(0.1)
+    assert summary["timestep_bins"]["early"]["loss_total_mean"] == pytest.approx(3.0)
+    assert summary["timestep_bins"]["late"]["loss_direction_mean"] == pytest.approx(0.25)
 
 
 @requires_float8
