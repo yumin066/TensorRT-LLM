@@ -813,6 +813,7 @@ def run_qwen_image_qat_checkpoint_rgb_eval(
     variant: str,
     reference_variant: str = "bf16_sage_fp8",
     device: str = "cuda:0",
+    max_prompts: int | None = None,
     provenance: Mapping[str, object] | None = None,
     config_metadata: Mapping[str, object] | None = None,
     records: list[dict[str, object]] | None = None,
@@ -861,12 +862,20 @@ def run_qwen_image_qat_checkpoint_rgb_eval(
                 "qat_checkpoint_train_steps": int(checkpoint["train_steps"]),
                 "qat_injection_count": len(injections),
                 "qat_eval_mode": "probe_fake_mxfp8_lora",
+                "qat_eval_max_prompts": max_prompts,
             }
         )
+        prompt_records = (
+            list(records) if records is not None else read_prompt_jsonl(Path(prompt_manifest_jsonl))
+        )
+        if max_prompts is not None:
+            if max_prompts <= 0:
+                raise ValueError("max_prompts must be positive when set")
+            prompt_records = [
+                record for record in prompt_records if str(record.get("split")) == split
+            ][:max_prompts]
         result = run_qwen_image_rgb_split_eval(
-            records=records
-            if records is not None
-            else read_prompt_jsonl(Path(prompt_manifest_jsonl)),
+            records=prompt_records,
             split=split,
             model=model,
             visual_gen_args=visual_args_path,
@@ -1916,6 +1925,7 @@ def _run_monitor_command(args: argparse.Namespace) -> None:
 
 
 def _run_rgb_eval_command(args: argparse.Namespace) -> None:
+    max_prompts = None if args.max_prompts == 0 else args.max_prompts
     run_qwen_image_qat_checkpoint_rgb_eval(
         prompt_manifest_jsonl=Path(args.prompt_manifest_jsonl),
         split=args.split,
@@ -1928,6 +1938,7 @@ def _run_rgb_eval_command(args: argparse.Namespace) -> None:
         variant=args.variant,
         reference_variant=args.reference_variant,
         device=args.device,
+        max_prompts=max_prompts,
         provenance=_build_probe_runtime_provenance(args),
     )
 
@@ -2020,6 +2031,7 @@ def build_parser() -> argparse.ArgumentParser:
     rgb_parser.add_argument("--variant", required=True)
     rgb_parser.add_argument("--reference-variant", default="bf16_sage_fp8")
     rgb_parser.add_argument("--device", default="cuda:0")
+    rgb_parser.add_argument("--max-prompts", type=int, default=0)
     rgb_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
     rgb_parser.add_argument("--allocation-id")
     rgb_parser.add_argument("--job-id")
