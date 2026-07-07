@@ -20,7 +20,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Mapping
@@ -141,6 +142,42 @@ class QwenImageQatInjectionInfo:
     trainable_parameter_names: tuple[str, ...]
     lora_rank: int
     lora_alpha: float
+
+
+@dataclass(frozen=True)
+class QwenImageQatTrainingConfig:
+    """Minimal native PyTorch training loop config for tuple-level QAT probes."""
+
+    tuple_index_jsonl: str | Path
+    output_dir: str | Path
+    max_steps: int
+    learning_rate: float = 1.0e-5
+    weight_decay: float = 0.0
+    betas: tuple[float, float] = (0.9, 0.999)
+    eps: float = 1.0e-8
+    device: str = "cuda"
+    target_layers: tuple[str, ...] = (QWEN_BLOCK_LINEAR_TARGET,)
+    lora_rank: int = 16
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    expected_num_layers: int | None = None
+    expected_target_count: int | None = None
+    loss: QwenImageTupleLossConfig = field(default_factory=QwenImageTupleLossConfig)
+    log_interval_steps: int = 1
+    checkpoint_name: str = "qwen_image_qat_lora_last.pt"
+    metrics_name: str = "qwen_image_qat_train_metrics.jsonl"
+    compute_lora_delta_norm: bool = False
+
+
+@dataclass(frozen=True)
+class QwenImageQatTrainingResult:
+    """Artifacts emitted by one tuple-level QAT training run."""
+
+    output_dir: Path
+    metrics_path: Path
+    checkpoint_path: Path
+    train_steps: int
+    injections: tuple[QwenImageQatInjectionInfo, ...]
 
 
 class Mxfp8LoraAdapterLinear(nn.Module):
@@ -401,6 +438,89 @@ def prepare_qwen_image_qat_model(
     return tuple(injections)
 
 
+def train_qwen_image_qat(
+    transformer: nn.Module,
+    config: QwenImageQatTrainingConfig,
+    *,
+    linear_cls: type[nn.Module] | None = None,
+) -> QwenImageQatTrainingResult:
+    """Train LoRA fake-MXFP8 adapters against captured BF16 teacher tuples."""
+    _validate_training_config(config)
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = QwenImageTupleDataset(config.tuple_index_jsonl)
+    device = torch.device(config.device)
+    transformer.to(device=device)
+    transformer.train()
+    injections = prepare_qwen_image_qat_model(
+        transformer,
+        target_layers=config.target_layers,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        expected_num_layers=config.expected_num_layers,
+        expected_target_count=config.expected_target_count,
+        linear_cls=linear_cls,
+    )
+    trainable_parameters = [
+        parameter for parameter in transformer.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("QAT model has no trainable parameters")
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=float(config.learning_rate),
+        weight_decay=float(config.weight_decay),
+        betas=config.betas,
+        eps=float(config.eps),
+    )
+
+    metrics_path = output_dir / config.metrics_name
+    checkpoint_path = output_dir / config.checkpoint_name
+    start_time = time.perf_counter()
+    with metrics_path.open("w", encoding="utf-8") as metrics_file:
+        for step in range(1, config.max_steps + 1):
+            sample = dataset[(step - 1) % len(dataset)]
+            optimizer.zero_grad(set_to_none=True)
+            output = forward_qwen_image_tuple(transformer, sample, device)
+            loss, components = compute_qwen_image_tuple_loss(output, sample, config.loss)
+            loss.backward()
+            grad_norm = _parameter_global_norm(
+                trainable_parameters,
+                grad=True,
+            )
+            optimizer.step()
+            if step % config.log_interval_steps == 0 or step == config.max_steps:
+                record = _build_training_record(
+                    step=step,
+                    sample=sample,
+                    loss=loss,
+                    components=components,
+                    grad_norm=grad_norm,
+                    trainable_parameters=trainable_parameters,
+                    transformer=transformer,
+                    elapsed_seconds=time.perf_counter() - start_time,
+                    compute_lora_delta_norm=config.compute_lora_delta_norm,
+                )
+                metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
+                metrics_file.flush()
+
+    _save_qwen_image_qat_checkpoint(
+        checkpoint_path,
+        transformer=transformer,
+        config=config,
+        injections=injections,
+        train_steps=config.max_steps,
+    )
+    return QwenImageQatTrainingResult(
+        output_dir=output_dir,
+        metrics_path=metrics_path,
+        checkpoint_path=checkpoint_path,
+        train_steps=config.max_steps,
+        injections=injections,
+    )
+
+
 def qwen_image_qat_trainable_parameter_names(
     injections: tuple[QwenImageQatInjectionInfo, ...],
 ) -> set[str]:
@@ -589,12 +709,165 @@ def _replace_module(root: nn.Module, module_name: str, replacement: nn.Module) -
     _set_child_module(parent, parts[-1], replacement)
 
 
+def _validate_training_config(config: QwenImageQatTrainingConfig) -> None:
+    if config.max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if config.learning_rate <= 0.0:
+        raise ValueError("learning_rate must be positive")
+    if config.weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative")
+    beta1, beta2 = config.betas
+    if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
+        raise ValueError("optimizer betas must be in [0, 1)")
+    if config.eps <= 0.0:
+        raise ValueError("optimizer eps must be positive")
+    if config.log_interval_steps <= 0:
+        raise ValueError("log_interval_steps must be positive")
+
+
+def _build_training_record(
+    *,
+    step: int,
+    sample: QwenImageTupleSample,
+    loss: torch.Tensor,
+    components: Mapping[str, torch.Tensor],
+    grad_norm: float,
+    trainable_parameters: list[nn.Parameter],
+    transformer: nn.Module,
+    elapsed_seconds: float,
+    compute_lora_delta_norm: bool,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "step": step,
+        "prompt_id": sample.prompt_id,
+        "split": sample.split,
+        "timestep_index": sample.timestep_index,
+        "timestep_bin": sample.timestep_bin,
+        "cfg_branch": sample.cfg_branch,
+        "loss_total": _tensor_scalar(loss),
+        "loss_unweighted_total": _tensor_scalar(components["unweighted_total"]),
+        "loss_mse": _optional_component_scalar(components, "mse"),
+        "loss_direction": _optional_component_scalar(components, "direction"),
+        "timestep_weight": _tensor_scalar(components["timestep_weight"]),
+        "grad_norm": grad_norm,
+        "trainable_parameter_norm": _parameter_global_norm(trainable_parameters),
+        "elapsed_seconds": float(elapsed_seconds),
+    }
+    if compute_lora_delta_norm:
+        record["lora_delta_norm"] = _lora_delta_global_norm(transformer)
+    return record
+
+
+def _save_qwen_image_qat_checkpoint(
+    path: Path,
+    *,
+    transformer: nn.Module,
+    config: QwenImageQatTrainingConfig,
+    injections: tuple[QwenImageQatInjectionInfo, ...],
+    train_steps: int,
+) -> None:
+    trainable_names = qwen_image_qat_trainable_parameter_names(injections)
+    trainable_state_dict = {
+        normalize_qwen_image_qat_parameter_name(name): parameter.detach().cpu()
+        for name, parameter in transformer.named_parameters()
+        if normalize_qwen_image_qat_parameter_name(name) in trainable_names
+    }
+    if trainable_names and set(trainable_state_dict) != trainable_names:
+        missing = sorted(trainable_names - set(trainable_state_dict))[:20]
+        raise RuntimeError(f"QAT checkpoint is missing trainable tensors: {missing}")
+    checkpoint = {
+        "format": TRAINING_FORMAT,
+        "config": _training_config_to_dict(config),
+        "train_steps": int(train_steps),
+        "trainable_state_dict": trainable_state_dict,
+        "trainable_parameter_names": sorted(trainable_state_dict),
+        "injections": [_injection_to_dict(injection) for injection in injections],
+    }
+    torch.save(checkpoint, path)
+
+
+def _training_config_to_dict(config: QwenImageQatTrainingConfig) -> dict[str, object]:
+    return {
+        "tuple_index_jsonl": str(config.tuple_index_jsonl),
+        "output_dir": str(config.output_dir),
+        "max_steps": config.max_steps,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "betas": list(config.betas),
+        "eps": config.eps,
+        "device": config.device,
+        "target_layers": list(config.target_layers),
+        "lora_rank": config.lora_rank,
+        "lora_alpha": config.lora_alpha,
+        "lora_dropout": config.lora_dropout,
+        "expected_num_layers": config.expected_num_layers,
+        "expected_target_count": config.expected_target_count,
+        "loss": {
+            "lambda_mse": config.loss.lambda_mse,
+            "lambda_dir": config.loss.lambda_dir,
+            "timestep_weights": dict(config.loss.timestep_weights or {}),
+        },
+        "log_interval_steps": config.log_interval_steps,
+        "checkpoint_name": config.checkpoint_name,
+        "metrics_name": config.metrics_name,
+        "compute_lora_delta_norm": config.compute_lora_delta_norm,
+    }
+
+
+def _injection_to_dict(injection: QwenImageQatInjectionInfo) -> dict[str, object]:
+    return {
+        "module_name": injection.module_name,
+        "block_index": injection.block_index,
+        "role": injection.role,
+        "trainable_parameter_names": list(injection.trainable_parameter_names),
+        "lora_rank": injection.lora_rank,
+        "lora_alpha": injection.lora_alpha,
+    }
+
+
+def _optional_component_scalar(
+    components: Mapping[str, torch.Tensor],
+    name: str,
+) -> float | None:
+    tensor = components.get(name)
+    return None if tensor is None else _tensor_scalar(tensor)
+
+
+def _tensor_scalar(tensor: torch.Tensor) -> float:
+    return float(tensor.detach().float().cpu())
+
+
+def _parameter_global_norm(
+    parameters: list[nn.Parameter],
+    *,
+    grad: bool = False,
+) -> float:
+    total = 0.0
+    for parameter in parameters:
+        tensor = parameter.grad if grad else parameter
+        if tensor is None:
+            continue
+        total += float(tensor.detach().float().square().sum().cpu())
+    return total**0.5
+
+
+def _lora_delta_global_norm(transformer: nn.Module) -> float:
+    total = 0.0
+    for module in transformer.modules():
+        if not isinstance(module, Mxfp8LoraAdapterLinear):
+            continue
+        total += float(module.lora_delta_weight().detach().float().square().sum().cpu())
+    return total**0.5
+
+
 __all__ = [
     "FakeMxfp8Linear",
     "MXFP8_BLOCK_SIZE",
     "Mxfp8LoraAdapterLinear",
     "QWEN_BLOCK_LINEAR_TARGET",
     "QwenImageQatInjectionInfo",
+    "QwenImageQatTrainingConfig",
+    "QwenImageQatTrainingResult",
     "QwenImageTupleDataset",
     "QwenImageTupleLossConfig",
     "QwenImageTupleSample",
@@ -606,4 +879,5 @@ __all__ = [
     "normalize_qwen_image_qat_parameter_name",
     "prepare_qwen_image_qat_model",
     "qwen_image_qat_trainable_parameter_names",
+    "train_qwen_image_qat",
 ]

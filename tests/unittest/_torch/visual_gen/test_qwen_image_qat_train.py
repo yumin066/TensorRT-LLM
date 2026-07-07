@@ -26,6 +26,7 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     QWEN_BLOCK_LINEAR_TARGET,
     FakeMxfp8Linear,
     Mxfp8LoraAdapterLinear,
+    QwenImageQatTrainingConfig,
     QwenImageTupleDataset,
     QwenImageTupleLossConfig,
     compute_qwen_image_tuple_loss,
@@ -34,6 +35,7 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     normalize_qwen_image_qat_parameter_name,
     prepare_qwen_image_qat_model,
     qwen_image_qat_trainable_parameter_names,
+    train_qwen_image_qat,
 )
 
 requires_float8 = pytest.mark.skipif(
@@ -92,6 +94,29 @@ class _TinyQwenTransformer(nn.Module):
         self.norm_out = nn.Module()
         self.norm_out.linear = nn.Linear(128, 128)
         self.proj_out = nn.Linear(128, 64)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        *,
+        timestep: torch.Tensor,
+        img_shapes: object,
+        txt_seq_lens: object,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        additional_t_cond: torch.Tensor | None = None,
+        return_dict: bool = False,
+    ) -> tuple[torch.Tensor]:
+        del (
+            additional_t_cond,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            img_shapes,
+            return_dict,
+            timestep,
+            txt_seq_lens,
+        )
+        return (self.transformer_blocks[0].attn.to_q(hidden_states),)
 
 
 def _tuple_payload(**overrides: object) -> dict[str, object]:
@@ -375,3 +400,59 @@ def test_prepare_qwen_image_qat_model_rejects_prequantized_weight() -> None:
             target_layers=("attn.to_q",),
             linear_cls=nn.Linear,
         )
+
+
+@requires_float8
+def test_train_qwen_image_qat_logs_loss_components_and_checkpoint(tmp_path: Path) -> None:
+    tuple_path = tmp_path / "tuple.pt"
+    index_path = tmp_path / "index.jsonl"
+    _write_tuple(
+        tuple_path,
+        hidden_states=torch.ones(1, 2, 128, dtype=torch.bfloat16),
+        encoder_hidden_states=torch.ones(1, 3, 128, dtype=torch.bfloat16),
+        target_output=torch.zeros(1, 2, 128, dtype=torch.bfloat16),
+    )
+    _write_index(index_path, tuple_path)
+    model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+    config = QwenImageQatTrainingConfig(
+        tuple_index_jsonl=index_path,
+        output_dir=tmp_path / "out",
+        max_steps=2,
+        learning_rate=1.0e-3,
+        device="cpu",
+        target_layers=("attn.to_q",),
+        lora_rank=4,
+        lora_alpha=8.0,
+        expected_num_layers=1,
+        loss=QwenImageTupleLossConfig(
+            lambda_mse=1.0,
+            lambda_dir=0.1,
+            timestep_weights={"late": 2.0},
+        ),
+        compute_lora_delta_norm=True,
+    )
+
+    result = train_qwen_image_qat(model, config, linear_cls=nn.Linear)
+
+    records = [
+        json.loads(line)
+        for line in result.metrics_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(records) == 2
+    assert records[-1]["step"] == 2
+    assert records[-1]["loss_total"] > 0.0
+    assert records[-1]["loss_mse"] > 0.0
+    assert records[-1]["loss_direction"] is not None
+    assert records[-1]["timestep_weight"] == pytest.approx(2.0)
+    assert records[-1]["grad_norm"] > 0.0
+    assert records[-1]["trainable_parameter_norm"] > 0.0
+    assert records[-1]["lora_delta_norm"] >= 0.0
+
+    checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=True)
+    assert checkpoint["format"] == "qwen_image_mxfp8_qat_adapter_v1"
+    assert checkpoint["train_steps"] == 2
+    assert sorted(checkpoint["trainable_parameter_names"]) == [
+        "transformer_blocks.0.attn.to_q.lora_down.weight",
+        "transformer_blocks.0.attn.to_q.lora_up.weight",
+    ]
