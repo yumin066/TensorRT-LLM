@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 import torch.nn as nn
@@ -798,6 +798,99 @@ def run_qwen_image_qat_checkpoint_monitor(
         )
     finally:
         cleanup_pipeline(pipeline)
+
+
+def run_qwen_image_qat_checkpoint_rgb_eval(
+    *,
+    prompt_manifest_jsonl: str | Path,
+    split: str,
+    model: str,
+    visual_gen_args: str | Path,
+    checkpoint_path: str | Path,
+    reference_root: str | Path,
+    output_root: str | Path,
+    metrics_json: str | Path,
+    variant: str,
+    reference_variant: str = "bf16_sage_fp8",
+    device: str = "cuda:0",
+    provenance: Mapping[str, object] | None = None,
+    config_metadata: Mapping[str, object] | None = None,
+    records: list[dict[str, object]] | None = None,
+    pipeline: Any | None = None,
+    infer_fn: Callable[[Any, dict[str, object]], Any] | None = None,
+    save_fn: Callable[[Any, Path], None] | None = None,
+    metrics_fn: Callable[[Path, Path], dict[str, float]] | None = None,
+    linear_cls: type[nn.Module] | None = None,
+) -> dict[str, object]:
+    """Run probe-only RGB eval with a trained fake-MXFP8 LoRA checkpoint applied."""
+    from scripts.visualgen_eval.qwen_image_prompt_manifest import read_jsonl as read_prompt_jsonl
+    from scripts.visualgen_eval.qwen_image_rgb_eval import (
+        collect_visual_gen_config_metadata,
+        compute_rgb_image_metrics,
+        infer_record,
+        run_qwen_image_rgb_split_eval,
+        save_reference_image,
+    )
+
+    visual_args_path = Path(visual_gen_args)
+    owns_pipeline = pipeline is None
+    if pipeline is None:
+        pipeline = load_single_worker_pipeline(
+            model=model,
+            visual_gen_args=visual_args_path,
+            device=device,
+        )
+    try:
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            raise ValueError("Loaded pipeline does not expose a transformer component")
+        checkpoint = load_qwen_image_qat_checkpoint(checkpoint_path)
+        injections = apply_qwen_image_qat_checkpoint(
+            transformer,
+            checkpoint=checkpoint,
+            linear_cls=linear_cls,
+        )
+        metadata = (
+            dict(config_metadata)
+            if config_metadata is not None
+            else collect_visual_gen_config_metadata(visual_args_path, model=model)
+        )
+        metadata.update(
+            {
+                "qat_checkpoint_path": str(checkpoint_path),
+                "qat_checkpoint_train_steps": int(checkpoint["train_steps"]),
+                "qat_injection_count": len(injections),
+                "qat_eval_mode": "probe_fake_mxfp8_lora",
+            }
+        )
+        result = run_qwen_image_rgb_split_eval(
+            records=records
+            if records is not None
+            else read_prompt_jsonl(Path(prompt_manifest_jsonl)),
+            split=split,
+            model=model,
+            visual_gen_args=visual_args_path,
+            reference_root=Path(reference_root),
+            output_root=Path(output_root),
+            metrics_json=Path(metrics_json),
+            variant=variant,
+            reference_variant=reference_variant,
+            device=device,
+            provenance=dict(provenance or {}),
+            config_metadata=metadata,
+            pipeline=pipeline,
+            infer_fn=infer_fn or infer_record,
+            save_fn=save_fn or save_reference_image,
+            metrics_fn=metrics_fn or compute_rgb_image_metrics,
+        )
+        result["qat_checkpoint_path"] = str(checkpoint_path)
+        result["qat_checkpoint_train_steps"] = int(checkpoint["train_steps"])
+        result["qat_injection_count"] = len(injections)
+        write_json(Path(metrics_json), result)
+        return result
+    finally:
+        if owns_pipeline:
+            cleanup_pipeline(pipeline)
 
 
 def monitor_qwen_image_qat_checkpoint(
@@ -1822,6 +1915,23 @@ def _run_monitor_command(args: argparse.Namespace) -> None:
     )
 
 
+def _run_rgb_eval_command(args: argparse.Namespace) -> None:
+    run_qwen_image_qat_checkpoint_rgb_eval(
+        prompt_manifest_jsonl=Path(args.prompt_manifest_jsonl),
+        split=args.split,
+        model=args.model,
+        visual_gen_args=Path(args.visual_gen_args),
+        checkpoint_path=Path(args.checkpoint_path),
+        reference_root=Path(args.reference_root),
+        output_root=Path(args.output_root),
+        metrics_json=Path(args.metrics_json),
+        variant=args.variant,
+        reference_variant=args.reference_variant,
+        device=args.device,
+        provenance=_build_probe_runtime_provenance(args),
+    )
+
+
 def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, object]:
     return {
         "cluster_alias": args.cluster_alias,
@@ -1897,6 +2007,30 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
     monitor_parser.add_argument("--command")
     monitor_parser.set_defaults(func=_run_monitor_command)
+
+    rgb_parser = subparsers.add_parser("rgb-eval-checkpoint")
+    rgb_parser.add_argument("--prompt-manifest-jsonl", required=True)
+    rgb_parser.add_argument("--split", required=True)
+    rgb_parser.add_argument("--model", required=True)
+    rgb_parser.add_argument("--visual-gen-args", required=True)
+    rgb_parser.add_argument("--checkpoint-path", required=True)
+    rgb_parser.add_argument("--reference-root", required=True)
+    rgb_parser.add_argument("--output-root", required=True)
+    rgb_parser.add_argument("--metrics-json", required=True)
+    rgb_parser.add_argument("--variant", required=True)
+    rgb_parser.add_argument("--reference-variant", default="bf16_sage_fp8")
+    rgb_parser.add_argument("--device", default="cuda:0")
+    rgb_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
+    rgb_parser.add_argument("--allocation-id")
+    rgb_parser.add_argument("--job-id")
+    rgb_parser.add_argument("--node-list")
+    rgb_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    rgb_parser.add_argument("--model-snapshot-path")
+    rgb_parser.add_argument("--teacher-attention-backend", default="TRTLLM_FP8")
+    rgb_parser.add_argument("--training-attention-backend", default="TRTLLM_FP8")
+    rgb_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
+    rgb_parser.add_argument("--command")
+    rgb_parser.set_defaults(func=_run_rgb_eval_command)
     return parser
 
 
@@ -1938,6 +2072,7 @@ __all__ = [
     "prepare_qwen_image_qat_model",
     "qwen_image_qat_trainable_parameter_names",
     "run_qwen_image_qat_checkpoint_monitor",
+    "run_qwen_image_qat_checkpoint_rgb_eval",
     "run_qwen_image_qat_probe",
     "summarize_qwen_image_qat_training_metrics",
     "train_qwen_image_qat",

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,6 +43,7 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     normalize_qwen_image_qat_parameter_name,
     prepare_qwen_image_qat_model,
     qwen_image_qat_trainable_parameter_names,
+    run_qwen_image_qat_checkpoint_rgb_eval,
     summarize_qwen_image_qat_training_metrics,
     train_qwen_image_qat,
     validate_qwen_image_qat_probe_recipe,
@@ -171,6 +173,30 @@ def _write_index(path: Path, tuple_path: Path, **overrides: object) -> dict[str,
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
     return entry
+
+
+def _write_prompt_manifest(path: Path, *, split: str = "fast_calibration") -> dict[str, object]:
+    record: dict[str, object] = {
+        "prompt_id": "qwen_image_smoke_0000",
+        "split": split,
+        "source": "unit_test",
+        "prompt": "a ceramic mug on a desk",
+        "negative_prompt": "",
+        "seed": 1234,
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "max_sequence_length": 512,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return record
+
+
+def _write_placeholder_png(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"placeholder png")
 
 
 def test_qwen_image_tuple_dataset_loads_captured_schema(tmp_path: Path) -> None:
@@ -669,6 +695,75 @@ def test_monitor_qwen_image_qat_checkpoint_restores_adapter_and_writes_summary(
     ]
     assert records[0]["sample_index"] == 0
     assert records[0]["monitor_step"] == 1
+
+
+@requires_float8
+def test_run_qwen_image_qat_checkpoint_rgb_eval_applies_adapter(
+    tmp_path: Path,
+) -> None:
+    tuple_path = tmp_path / "tuple.pt"
+    index_path = tmp_path / "index.jsonl"
+    _write_tuple(
+        tuple_path,
+        hidden_states=torch.ones(1, 2, 128, dtype=torch.bfloat16),
+        encoder_hidden_states=torch.ones(1, 3, 128, dtype=torch.bfloat16),
+        target_output=torch.zeros(1, 2, 128, dtype=torch.bfloat16),
+    )
+    _write_index(index_path, tuple_path)
+    train_model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+    train_result = train_qwen_image_qat(
+        train_model,
+        QwenImageQatTrainingConfig(
+            tuple_index_jsonl=index_path,
+            output_dir=tmp_path / "train",
+            max_steps=1,
+            learning_rate=1.0e-3,
+            device="cpu",
+            target_layers=("attn.to_q",),
+            lora_rank=4,
+            lora_alpha=8.0,
+            expected_num_layers=1,
+        ),
+        linear_cls=nn.Linear,
+    )
+    prompt_manifest = tmp_path / "prompts.jsonl"
+    prompt_record = _write_prompt_manifest(prompt_manifest)
+    reference_root = tmp_path / "references" / "bf16_sage_fp8"
+    _write_placeholder_png(reference_root / "fast_calibration" / "qwen_image_smoke_0000.png")
+    pipeline = SimpleNamespace(transformer=_TinyQwenTransformer().to(dtype=torch.bfloat16))
+    metrics_json = tmp_path / "rgb_metrics.json"
+
+    result = run_qwen_image_qat_checkpoint_rgb_eval(
+        prompt_manifest_jsonl=prompt_manifest,
+        split="fast_calibration",
+        model="Qwen/Qwen-Image",
+        visual_gen_args=tmp_path / "qwen-image.yaml",
+        checkpoint_path=train_result.checkpoint_path,
+        reference_root=reference_root,
+        output_root=tmp_path / "outputs" / "qat_mse_only",
+        metrics_json=metrics_json,
+        variant="qat_mse_only_probe_fake_mxfp8_lora",
+        device="cpu",
+        provenance={"git_head": "test"},
+        config_metadata={"pipeline_quant_algo": "FP8_BLOCK_SCALES"},
+        records=[prompt_record],
+        pipeline=pipeline,
+        infer_fn=lambda _pipeline, record: record,
+        save_fn=lambda _output, path: _write_placeholder_png(path),
+        metrics_fn=lambda _candidate, _reference: {
+            "mse": 0.25,
+            "psnr": 6.020599913279624,
+            "ssim": 0.9,
+        },
+        linear_cls=nn.Linear,
+    )
+
+    assert isinstance(pipeline.transformer.transformer_blocks[0].attn.to_q, Mxfp8LoraAdapterLinear)
+    assert result["qat_checkpoint_path"] == str(train_result.checkpoint_path)
+    assert result["qat_injection_count"] == 1
+    assert result["aggregates"]["psnr_mean"] == pytest.approx(6.020599913279624)
+    assert result["config_metadata"]["qat_eval_mode"] == "probe_fake_mxfp8_lora"
+    assert metrics_json.is_file()
 
 
 @requires_float8
