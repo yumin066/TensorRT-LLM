@@ -100,6 +100,7 @@ except ModuleNotFoundError as error:
 
 TRAINING_FORMAT = "qwen_image_mxfp8_qat_adapter_v1"
 PROBE_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_probe_summary_v1"
+MONITOR_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_checkpoint_monitor_v1"
 QWEN_BLOCK_LINEAR_TARGET = "qwen_block_linears"
 TARGET_OUTPUT_KEY = "target_output"
 QWEN_IMAGE_QAT_PROBE_RECIPES = (
@@ -212,6 +213,21 @@ class QwenImageQatTrainingResult:
     checkpoint_path: Path
     train_steps: int
     injections: tuple[QwenImageQatInjectionInfo, ...]
+
+
+@dataclass(frozen=True)
+class QwenImageQatMonitorConfig:
+    """Fixed tuple-monitor config for one trained QAT adapter checkpoint."""
+
+    checkpoint_path: str | Path
+    tuple_index_jsonl: str | Path
+    output_json: str | Path
+    records_jsonl: str | Path | None = None
+    max_samples: int | None = None
+    sample_stride: int = 1
+    sample_start_index: int = 0
+    device: str = "cuda"
+    loss: QwenImageTupleLossConfig | None = None
 
 
 class Mxfp8LoraAdapterLinear(nn.Module):
@@ -740,6 +756,217 @@ def run_qwen_image_qat_probe(
     return summary
 
 
+def run_qwen_image_qat_checkpoint_monitor(
+    *,
+    model: str,
+    visual_gen_args: str | Path,
+    checkpoint_path: str | Path,
+    tuple_index_jsonl: str | Path,
+    output_json: str | Path,
+    records_jsonl: str | Path | None = None,
+    max_samples: int | None = None,
+    sample_stride: int = 1,
+    sample_start_index: int = 0,
+    device: str = "cuda:0",
+    provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Load Qwen-Image and evaluate one trained fake-MXFP8 LoRA checkpoint on fixed tuples."""
+    pipeline = load_single_worker_pipeline(
+        model=model,
+        visual_gen_args=Path(visual_gen_args),
+        device=device,
+    )
+    try:
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            raise ValueError("Loaded pipeline does not expose a transformer component")
+        return monitor_qwen_image_qat_checkpoint(
+            transformer,
+            QwenImageQatMonitorConfig(
+                checkpoint_path=checkpoint_path,
+                tuple_index_jsonl=tuple_index_jsonl,
+                output_json=output_json,
+                records_jsonl=records_jsonl,
+                max_samples=max_samples,
+                sample_stride=sample_stride,
+                sample_start_index=sample_start_index,
+                device=device,
+            ),
+            model=model,
+            visual_gen_args=visual_gen_args,
+            provenance=provenance,
+        )
+    finally:
+        cleanup_pipeline(pipeline)
+
+
+def monitor_qwen_image_qat_checkpoint(
+    transformer: nn.Module,
+    config: QwenImageQatMonitorConfig,
+    *,
+    model: str | None = None,
+    visual_gen_args: str | Path | None = None,
+    provenance: Mapping[str, object] | None = None,
+    linear_cls: type[nn.Module] | None = None,
+) -> dict[str, object]:
+    """Evaluate a trained QAT adapter checkpoint on a fixed tuple subset."""
+    _validate_monitor_config(config)
+    dataset = QwenImageTupleDataset(config.tuple_index_jsonl)
+    device = torch.device(config.device)
+    transformer.to(device=device)
+    checkpoint = load_qwen_image_qat_checkpoint(config.checkpoint_path)
+    injections = apply_qwen_image_qat_checkpoint(
+        transformer,
+        checkpoint=checkpoint,
+        linear_cls=linear_cls,
+    )
+    transformer.eval()
+    loss_config = config.loss or _loss_config_from_checkpoint(checkpoint)
+    sample_count = len(dataset)
+    if config.max_samples is not None:
+        sample_count = min(sample_count, int(config.max_samples))
+    records_path = Path(config.records_jsonl) if config.records_jsonl is not None else None
+    if records_path is not None:
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+
+    start_time = time.perf_counter()
+    records: list[dict[str, object]] = []
+    records_file = records_path.open("w", encoding="utf-8") if records_path is not None else None
+    try:
+        with torch.no_grad():
+            for monitor_step in range(1, sample_count + 1):
+                sample_index = _sample_index_for_step(
+                    monitor_step,
+                    dataset_size=len(dataset),
+                    sample_stride=config.sample_stride,
+                    sample_start_index=config.sample_start_index,
+                )
+                sample = dataset[sample_index]
+                output = forward_qwen_image_tuple(transformer, sample, device)
+                loss, components = compute_qwen_image_tuple_loss(output, sample, loss_config)
+                record = _build_monitor_record(
+                    monitor_step=monitor_step,
+                    sample_index=sample_index,
+                    sample=sample,
+                    output=output,
+                    loss=loss,
+                    components=components,
+                    elapsed_seconds=time.perf_counter() - start_time,
+                )
+                records.append(record)
+                if records_file is not None:
+                    records_file.write(json.dumps(record, sort_keys=True) + "\n")
+                    records_file.flush()
+    finally:
+        if records_file is not None:
+            records_file.close()
+
+    output_path = Path(config.output_json)
+    checkpoint_config = checkpoint["config"]
+    summary: dict[str, object] = {
+        "format": MONITOR_SUMMARY_FORMAT,
+        "model": model,
+        "visual_gen_args": str(visual_gen_args) if visual_gen_args is not None else None,
+        "checkpoint_path": str(config.checkpoint_path),
+        "tuple_index_jsonl": str(config.tuple_index_jsonl),
+        "output_json": str(output_path),
+        "records_jsonl": str(records_path) if records_path is not None else None,
+        "checkpoint_train_steps": int(checkpoint["train_steps"]),
+        "checkpoint_training_config": checkpoint_config,
+        "monitor_config": _monitor_config_to_dict(config),
+        "sample_count": sample_count,
+        "dataset_size": len(dataset),
+        "injection_count": len(injections),
+        "metrics_summary": _summarize_monitor_records(records),
+        "provenance": dict(provenance or {}),
+    }
+    write_json(output_path, summary)
+    return summary
+
+
+def load_qwen_image_qat_checkpoint(path: str | Path) -> dict[str, object]:
+    """Load and validate a LoRA-only Qwen-Image QAT checkpoint."""
+    checkpoint_path = Path(path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"QAT checkpoint must be a mapping: {checkpoint_path}")
+    if checkpoint.get("format") != TRAINING_FORMAT:
+        raise ValueError(
+            f"unsupported QAT checkpoint format {checkpoint.get('format')!r}: {checkpoint_path}"
+        )
+    required_fields = (
+        "config",
+        "train_steps",
+        "trainable_state_dict",
+        "trainable_parameter_names",
+        "injections",
+    )
+    missing = [field for field in required_fields if field not in checkpoint]
+    if missing:
+        raise ValueError(f"QAT checkpoint missing fields {missing}: {checkpoint_path}")
+    if not isinstance(checkpoint["config"], dict):
+        raise ValueError(f"QAT checkpoint config must be a mapping: {checkpoint_path}")
+    if not isinstance(checkpoint["trainable_state_dict"], dict):
+        raise ValueError(
+            f"QAT checkpoint trainable_state_dict must be a mapping: {checkpoint_path}"
+        )
+    if not isinstance(checkpoint["injections"], list):
+        raise ValueError(f"QAT checkpoint injections must be a list: {checkpoint_path}")
+    return checkpoint
+
+
+def apply_qwen_image_qat_checkpoint(
+    transformer: nn.Module,
+    *,
+    checkpoint: Mapping[str, object],
+    linear_cls: type[nn.Module] | None = None,
+) -> tuple[QwenImageQatInjectionInfo, ...]:
+    """Inject fake-MXFP8 LoRA wrappers and restore trainable adapter weights."""
+    checkpoint_config = _checkpoint_training_config(checkpoint)
+    injections = prepare_qwen_image_qat_model(
+        transformer,
+        target_layers=tuple(str(item) for item in checkpoint_config.get("target_layers", [])),
+        lora_rank=int(checkpoint_config["lora_rank"]),
+        lora_alpha=float(checkpoint_config["lora_alpha"]),
+        lora_dropout=float(checkpoint_config["lora_dropout"]),
+        expected_num_layers=_optional_int(checkpoint_config.get("expected_num_layers")),
+        expected_target_count=_optional_int(checkpoint_config.get("expected_target_count")),
+        scale_multipliers=_optional_float_mapping(checkpoint_config.get("scale_multipliers")),
+        linear_cls=linear_cls,
+    )
+    trainable_state = checkpoint.get("trainable_state_dict")
+    if not isinstance(trainable_state, dict):
+        raise ValueError("QAT checkpoint trainable_state_dict must be a mapping")
+    named_parameters = {
+        normalize_qwen_image_qat_parameter_name(name): parameter
+        for name, parameter in transformer.named_parameters()
+    }
+    expected_names = qwen_image_qat_trainable_parameter_names(injections)
+    actual_names = {str(name) for name in trainable_state}
+    missing = sorted(expected_names - actual_names)
+    unexpected = sorted(actual_names - expected_names)
+    if missing or unexpected:
+        raise ValueError(
+            "QAT checkpoint trainable names do not match injected adapters: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    for name, tensor in trainable_state.items():
+        normalized_name = str(name)
+        parameter = named_parameters.get(normalized_name)
+        if parameter is None:
+            raise ValueError(f"QAT checkpoint tensor has no matching parameter: {normalized_name}")
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"QAT checkpoint value must be a tensor: {normalized_name}")
+        if tuple(tensor.shape) != tuple(parameter.shape):
+            raise ValueError(
+                f"QAT checkpoint tensor {normalized_name} shape {tuple(tensor.shape)} "
+                f"does not match parameter shape {tuple(parameter.shape)}"
+            )
+        with torch.no_grad():
+            parameter.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
+    return injections
+
+
 def summarize_qwen_image_qat_training_metrics(metrics_path: str | Path) -> dict[str, object]:
     """Summarize JSONL training metrics for recipe selection."""
     path = Path(metrics_path)
@@ -880,6 +1107,137 @@ def compute_scale_aware_lora_multipliers(
     return multipliers
 
 
+def _checkpoint_training_config(checkpoint: Mapping[str, object]) -> Mapping[str, object]:
+    config = checkpoint.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("QAT checkpoint config must be a mapping")
+    return config
+
+
+def _loss_config_from_checkpoint(checkpoint: Mapping[str, object]) -> QwenImageTupleLossConfig:
+    checkpoint_config = _checkpoint_training_config(checkpoint)
+    loss = checkpoint_config.get("loss")
+    if not isinstance(loss, dict):
+        return QwenImageTupleLossConfig()
+    timestep_weights = loss.get("timestep_weights")
+    if isinstance(timestep_weights, dict) and timestep_weights:
+        parsed_timestep_weights = {
+            str(key): float(value) for key, value in timestep_weights.items()
+        }
+    else:
+        parsed_timestep_weights = None
+    return QwenImageTupleLossConfig(
+        lambda_mse=float(loss.get("lambda_mse", 1.0)),
+        lambda_dir=float(loss.get("lambda_dir", 0.0)),
+        timestep_weights=parsed_timestep_weights,
+    )
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(value)
+
+
+def _optional_float_mapping(value: object) -> dict[str, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("scale_multipliers must be a mapping in QAT checkpoint config")
+    return {str(key): float(multiplier) for key, multiplier in value.items()}
+
+
+def _validate_monitor_config(config: QwenImageQatMonitorConfig) -> None:
+    if config.max_samples is not None and config.max_samples <= 0:
+        raise ValueError("max_samples must be positive when set")
+    if config.sample_stride <= 0:
+        raise ValueError("sample_stride must be positive")
+    if config.sample_start_index < 0:
+        raise ValueError("sample_start_index must be non-negative")
+
+
+def _monitor_config_to_dict(config: QwenImageQatMonitorConfig) -> dict[str, object]:
+    loss = config.loss
+    return {
+        "checkpoint_path": str(config.checkpoint_path),
+        "tuple_index_jsonl": str(config.tuple_index_jsonl),
+        "output_json": str(config.output_json),
+        "records_jsonl": str(config.records_jsonl) if config.records_jsonl is not None else None,
+        "max_samples": config.max_samples,
+        "sample_stride": config.sample_stride,
+        "sample_start_index": config.sample_start_index,
+        "device": config.device,
+        "loss": None
+        if loss is None
+        else {
+            "lambda_mse": loss.lambda_mse,
+            "lambda_dir": loss.lambda_dir,
+            "timestep_weights": dict(loss.timestep_weights or {}),
+        },
+    }
+
+
+def _build_monitor_record(
+    *,
+    monitor_step: int,
+    sample_index: int,
+    sample: QwenImageTupleSample,
+    output: torch.Tensor,
+    loss: torch.Tensor,
+    components: Mapping[str, torch.Tensor],
+    elapsed_seconds: float,
+) -> dict[str, object]:
+    return {
+        "monitor_step": monitor_step,
+        "sample_index": sample_index,
+        "prompt_id": sample.prompt_id,
+        "split": sample.split,
+        "timestep_index": sample.timestep_index,
+        "timestep_bin": sample.timestep_bin,
+        "cfg_branch": sample.cfg_branch,
+        "loss_total": _tensor_scalar(loss),
+        "loss_unweighted_total": _tensor_scalar(components["unweighted_total"]),
+        "loss_mse": _optional_component_scalar(components, "mse"),
+        "loss_direction": _optional_component_scalar(components, "direction"),
+        "direction_loss": _direction_loss(output, sample),
+        "timestep_weight": _tensor_scalar(components["timestep_weight"]),
+        "elapsed_seconds": float(elapsed_seconds),
+    }
+
+
+def _direction_loss(output: torch.Tensor, sample: QwenImageTupleSample) -> float:
+    target = sample.target_output.to(device=output.device, dtype=output.dtype)
+    value = (
+        1.0
+        - F.cosine_similarity(
+            output.float().reshape(1, -1),
+            target.float().reshape(1, -1),
+            dim=1,
+            eps=1.0e-8,
+        ).mean()
+    )
+    return _tensor_scalar(value)
+
+
+def _summarize_monitor_records(records: list[dict[str, object]]) -> dict[str, object]:
+    if not records:
+        raise ValueError("monitor records must not be empty")
+    prompt_ids = {str(record["prompt_id"]) for record in records}
+    sample_indices = {int(record["sample_index"]) for record in records}
+    return {
+        "record_count": len(records),
+        "prompt_count": len(prompt_ids),
+        "sample_index_unique": len(sample_indices),
+        "first_monitor_step": int(records[0]["monitor_step"]),
+        "last_monitor_step": int(records[-1]["monitor_step"]),
+        "loss_total_mean": _mean_record_metric(records, "loss_total"),
+        "loss_mse_mean": _mean_record_metric(records, "loss_mse"),
+        "loss_mse_max": _max_record_metric(records, "loss_mse"),
+        "direction_loss_mean": _mean_record_metric(records, "direction_loss"),
+        "direction_loss_max": _max_record_metric(records, "direction_loss"),
+        "timestep_bins": _summarize_metrics_by_timestep_bin(records),
+        "cfg_branches": _summarize_records_by_field(records, "cfg_branch"),
+    }
+
+
 def _probe_loss_config(recipe: str) -> QwenImageTupleLossConfig:
     if recipe == "mse_only":
         return QwenImageTupleLossConfig(lambda_mse=1.0, lambda_dir=0.0)
@@ -979,6 +1337,7 @@ def _summarize_metrics_by_timestep_bin(records: list[dict[str, object]]) -> dict
             "loss_total_mean": _mean_record_metric(bin_records, "loss_total"),
             "loss_mse_mean": _mean_record_metric(bin_records, "loss_mse"),
             "loss_direction_mean": _mean_record_metric(bin_records, "loss_direction"),
+            "direction_loss_mean": _mean_record_metric(bin_records, "direction_loss"),
             "last_loss_total": _optional_float_metric(bin_records[-1].get("loss_total")),
         }
         for timestep_bin, bin_records in sorted(by_bin.items())
@@ -994,6 +1353,28 @@ def _mean_record_metric(records: list[dict[str, object]], field_name: str) -> fl
     if not values:
         return None
     return float(sum(values) / len(values))
+
+
+def _max_record_metric(records: list[dict[str, object]], field_name: str) -> float | None:
+    values = [
+        value
+        for record in records
+        if (value := _optional_float_metric(record.get(field_name))) is not None
+    ]
+    if not values:
+        return None
+    return float(max(values))
+
+
+def _summarize_records_by_field(
+    records: list[dict[str, object]],
+    field_name: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        value = str(record.get(field_name))
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _read_tuple_index(path: Path) -> list[dict[str, object]]:
@@ -1424,6 +1805,23 @@ def _run_probe_command(args: argparse.Namespace) -> None:
     )
 
 
+def _run_monitor_command(args: argparse.Namespace) -> None:
+    max_samples = None if args.max_samples == 0 else args.max_samples
+    run_qwen_image_qat_checkpoint_monitor(
+        model=args.model,
+        visual_gen_args=Path(args.visual_gen_args),
+        checkpoint_path=Path(args.checkpoint_path),
+        tuple_index_jsonl=Path(args.tuple_index_jsonl),
+        output_json=Path(args.output_json),
+        records_jsonl=Path(args.records_jsonl) if args.records_jsonl else None,
+        max_samples=max_samples,
+        sample_stride=args.sample_stride,
+        sample_start_index=args.sample_start_index,
+        device=args.device,
+        provenance=_build_probe_runtime_provenance(args),
+    )
+
+
 def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, object]:
     return {
         "cluster_alias": args.cluster_alias,
@@ -1476,6 +1874,29 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
     run_parser.add_argument("--command")
     run_parser.set_defaults(func=_run_probe_command)
+
+    monitor_parser = subparsers.add_parser("monitor-checkpoint")
+    monitor_parser.add_argument("--model", required=True)
+    monitor_parser.add_argument("--visual-gen-args", required=True)
+    monitor_parser.add_argument("--checkpoint-path", required=True)
+    monitor_parser.add_argument("--tuple-index-jsonl", required=True)
+    monitor_parser.add_argument("--output-json", required=True)
+    monitor_parser.add_argument("--records-jsonl")
+    monitor_parser.add_argument("--max-samples", type=int, default=320)
+    monitor_parser.add_argument("--sample-stride", type=int, default=17)
+    monitor_parser.add_argument("--sample-start-index", type=int, default=0)
+    monitor_parser.add_argument("--device", default="cuda:0")
+    monitor_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
+    monitor_parser.add_argument("--allocation-id")
+    monitor_parser.add_argument("--job-id")
+    monitor_parser.add_argument("--node-list")
+    monitor_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    monitor_parser.add_argument("--model-snapshot-path")
+    monitor_parser.add_argument("--teacher-attention-backend", default="TRTLLM_FP8")
+    monitor_parser.add_argument("--training-attention-backend", default="TRTLLM_FP8")
+    monitor_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
+    monitor_parser.add_argument("--command")
+    monitor_parser.set_defaults(func=_run_monitor_command)
     return parser
 
 
@@ -1490,10 +1911,12 @@ __all__ = [
     "FakeMxfp8Linear",
     "MXFP8_BLOCK_SIZE",
     "Mxfp8LoraAdapterLinear",
+    "MONITOR_SUMMARY_FORMAT",
     "PROBE_SUMMARY_FORMAT",
     "QWEN_BLOCK_LINEAR_TARGET",
     "QWEN_IMAGE_QAT_PROBE_RECIPES",
     "QwenImageQatInjectionInfo",
+    "QwenImageQatMonitorConfig",
     "QwenImageQatTrainingConfig",
     "QwenImageQatTrainingResult",
     "QwenImageTupleDataset",
@@ -1507,11 +1930,14 @@ __all__ = [
     "compute_scale_aware_lora_multipliers",
     "first_tensor_output",
     "forward_qwen_image_tuple",
+    "load_qwen_image_qat_checkpoint",
     "load_qwen_image_tuple_sample",
     "main",
+    "monitor_qwen_image_qat_checkpoint",
     "normalize_qwen_image_qat_parameter_name",
     "prepare_qwen_image_qat_model",
     "qwen_image_qat_trainable_parameter_names",
+    "run_qwen_image_qat_checkpoint_monitor",
     "run_qwen_image_qat_probe",
     "summarize_qwen_image_qat_training_metrics",
     "train_qwen_image_qat",

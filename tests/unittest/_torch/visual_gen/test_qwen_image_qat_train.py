@@ -27,6 +27,7 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     QWEN_BLOCK_LINEAR_TARGET,
     FakeMxfp8Linear,
     Mxfp8LoraAdapterLinear,
+    QwenImageQatMonitorConfig,
     QwenImageQatTrainingConfig,
     QwenImageTupleDataset,
     QwenImageTupleLossConfig,
@@ -35,7 +36,9 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     compute_qwen_image_tuple_loss,
     compute_scale_aware_lora_multipliers,
     forward_qwen_image_tuple,
+    load_qwen_image_qat_checkpoint,
     load_qwen_image_tuple_sample,
+    monitor_qwen_image_qat_checkpoint,
     normalize_qwen_image_qat_parameter_name,
     prepare_qwen_image_qat_model,
     qwen_image_qat_trainable_parameter_names,
@@ -598,6 +601,74 @@ def test_train_qwen_image_qat_logs_loss_components_and_checkpoint(tmp_path: Path
         "transformer_blocks.0.attn.to_q.lora_down.weight",
         "transformer_blocks.0.attn.to_q.lora_up.weight",
     ]
+
+
+@requires_float8
+def test_monitor_qwen_image_qat_checkpoint_restores_adapter_and_writes_summary(
+    tmp_path: Path,
+) -> None:
+    tuple_path = tmp_path / "tuple.pt"
+    index_path = tmp_path / "index.jsonl"
+    _write_tuple(
+        tuple_path,
+        hidden_states=torch.ones(1, 2, 128, dtype=torch.bfloat16),
+        encoder_hidden_states=torch.ones(1, 3, 128, dtype=torch.bfloat16),
+        target_output=torch.zeros(1, 2, 128, dtype=torch.bfloat16),
+    )
+    _write_index(index_path, tuple_path)
+    train_model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+    train_result = train_qwen_image_qat(
+        train_model,
+        QwenImageQatTrainingConfig(
+            tuple_index_jsonl=index_path,
+            output_dir=tmp_path / "train",
+            max_steps=1,
+            learning_rate=1.0e-3,
+            device="cpu",
+            target_layers=("attn.to_q",),
+            lora_rank=4,
+            lora_alpha=8.0,
+            expected_num_layers=1,
+            loss=QwenImageTupleLossConfig(lambda_mse=1.0, lambda_dir=0.1),
+        ),
+        linear_cls=nn.Linear,
+    )
+    monitor_model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+    output_json = tmp_path / "monitor" / "summary.json"
+    records_jsonl = tmp_path / "monitor" / "records.jsonl"
+
+    summary = monitor_qwen_image_qat_checkpoint(
+        monitor_model,
+        QwenImageQatMonitorConfig(
+            checkpoint_path=train_result.checkpoint_path,
+            tuple_index_jsonl=index_path,
+            output_json=output_json,
+            records_jsonl=records_jsonl,
+            max_samples=1,
+            device="cpu",
+        ),
+        linear_cls=nn.Linear,
+    )
+
+    checkpoint = load_qwen_image_qat_checkpoint(train_result.checkpoint_path)
+    assert checkpoint["train_steps"] == 1
+    assert output_json.is_file()
+    assert records_jsonl.is_file()
+    assert summary["format"] == "qwen_image_mxfp8_qat_checkpoint_monitor_v1"
+    assert summary["sample_count"] == 1
+    assert summary["dataset_size"] == 1
+    assert summary["injection_count"] == 1
+    metrics = summary["metrics_summary"]
+    assert metrics["record_count"] == 1
+    assert metrics["prompt_count"] == 1
+    assert metrics["loss_mse_mean"] is not None
+    assert metrics["direction_loss_mean"] is not None
+    assert metrics["timestep_bins"]["late"]["count"] == 1
+    records = [
+        json.loads(line) for line in records_jsonl.read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert records[0]["sample_index"] == 0
+    assert records[0]["monitor_step"] == 1
 
 
 @requires_float8
