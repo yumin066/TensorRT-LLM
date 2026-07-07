@@ -16,10 +16,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.visualgen_eval.qwen_image_rgb_eval import (
+    build_visual_gen_config_metadata,
     compute_rgb_values_metrics,
     run_qwen_image_rgb_split_eval,
 )
@@ -52,6 +54,27 @@ def test_compute_rgb_values_metrics_exact_match() -> None:
     assert metrics["mse"] == 0.0
     assert metrics["psnr"] == float("inf")
     assert metrics["ssim"] == pytest.approx(1.0)
+
+
+def test_build_visual_gen_config_metadata_accepts_dict_quant_config() -> None:
+    args = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            backend="TRTLLM",
+            quant_attention_config={"qk_dtype": "fp8", "v_dtype": "fp8"},
+        ),
+        quant_config={
+            "quant_algo": "FP8_BLOCK_SCALES",
+            "dynamic": True,
+            "ignore": ["img_in", "txt_in"],
+        },
+    )
+
+    metadata = build_visual_gen_config_metadata(args)
+
+    assert metadata["attention_backend"] == "TRTLLM"
+    assert metadata["pipeline_quant_algo"] == "FP8_BLOCK_SCALES"
+    assert metadata["pipeline_dynamic_weight_quant"] is True
+    assert metadata["pipeline_force_dynamic_quantization"] is False
 
 
 def test_run_qwen_image_rgb_split_eval_with_fake_pipeline(tmp_path: Path) -> None:

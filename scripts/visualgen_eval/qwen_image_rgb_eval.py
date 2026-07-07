@@ -162,15 +162,27 @@ def collect_visual_gen_config_metadata(visual_gen_args: Path, *, model: str) -> 
     from tensorrt_llm.visual_gen import VisualGenArgs
 
     args = VisualGenArgs.from_yaml(visual_gen_args, model=model)
+    return build_visual_gen_config_metadata(args)
+
+
+def build_visual_gen_config_metadata(args: Any) -> dict[str, object]:
     attention_config = getattr(args, "attention_config", None)
     quant_config = getattr(args, "quant_config", None)
+    quant_dynamic = _config_field(quant_config, "dynamic")
+    force_dynamic_quantization = _config_field(quant_config, "force_dynamic_quantization")
     return {
         "attention_backend": _enum_value(getattr(attention_config, "backend", None)),
         "quant_attention_config": repr(getattr(attention_config, "quant_attention_config", None)),
-        "pipeline_quant_algo": _enum_value(getattr(quant_config, "quant_algo", None)),
-        "pipeline_dynamic_weight_quant": bool(getattr(args, "dynamic_weight_quant", False)),
+        "pipeline_quant_algo": _enum_value(_config_field(quant_config, "quant_algo")),
+        "pipeline_dynamic_weight_quant": bool(
+            quant_dynamic
+            if quant_dynamic is not None
+            else getattr(args, "dynamic_weight_quant", False)
+        ),
         "pipeline_force_dynamic_quantization": bool(
-            getattr(args, "force_dynamic_quantization", False)
+            force_dynamic_quantization
+            if force_dynamic_quantization is not None
+            else getattr(args, "force_dynamic_quantization", False)
         ),
     }
 
@@ -272,6 +284,12 @@ def _enum_value(value: object) -> object:
     if value is None:
         return None
     return getattr(value, "name", None) or getattr(value, "value", None) or str(value)
+
+
+def _config_field(config: object, field_name: str) -> object:
+    if isinstance(config, dict):
+        return config.get(field_name)
+    return getattr(config, field_name, None)
 
 
 def _expect_string(value: dict[str, object], field_name: str) -> str:
