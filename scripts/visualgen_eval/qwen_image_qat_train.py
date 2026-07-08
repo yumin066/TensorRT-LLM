@@ -4092,7 +4092,7 @@ def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, objec
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
     run_parser = subparsers.add_parser("run-probe")
     run_parser.add_argument("--recipe", required=True, choices=QWEN_IMAGE_QAT_PROBE_RECIPES)
     run_parser.add_argument("--model", required=True)

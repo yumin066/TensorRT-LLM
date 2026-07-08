@@ -1078,9 +1078,9 @@ def test_build_parser_accepts_rollout_commands(tmp_path: Path) -> None:
         ]
     )
 
-    assert augment_args.command == "augment-rollout-tuples"
+    assert augment_args.subcommand == "augment-rollout-tuples"
     assert augment_args.func.__name__ == "_run_augment_rollout_tuples_command"
-    assert rollout_args.command == "run-rollout-qat"
+    assert rollout_args.subcommand == "run-rollout-qat"
     assert rollout_args.func.__name__ == "_run_rollout_qat_command"
 
 
@@ -1532,11 +1532,10 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
             max_steps=2,
             learning_rate=1.0e-3,
             device="cpu",
-            target_layers=("attn.to_q",),
             lora_rank=4,
             lora_alpha=8.0,
             expected_num_layers=1,
-            expected_target_count=1,
+            expected_target_count=14,
             diagnostic_only=True,
             loss=QwenImageRolloutLossConfig(
                 rollout_k=1,
