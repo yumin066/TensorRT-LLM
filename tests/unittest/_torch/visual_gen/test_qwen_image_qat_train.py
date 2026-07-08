@@ -26,6 +26,7 @@ import torch.nn as nn
 from scripts.visualgen_eval.qwen_image_qat_train import (
     DEFAULT_TIMESTEP_WEIGHTS,
     QWEN_BLOCK_LINEAR_TARGET,
+    ROLLOUT_TUPLE_SCHEMA_VERSION,
     FakeMxfp8Linear,
     Mxfp8LoraAdapterLinear,
     QwenImageQatMonitorConfig,
@@ -139,14 +140,25 @@ class _IndexedRolloutTransformer(nn.Module):
         super().__init__()
         self.step0_scale = nn.Parameter(torch.tensor(1.0))
         self.step1_scale = nn.Parameter(torch.tensor(2.0))
+        self.cond_branch_scale = nn.Parameter(torch.tensor(1.0))
+        self.negative_branch_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, **kwargs: object) -> tuple[torch.Tensor]:
         hidden_states = kwargs["hidden_states"]
         timestep = kwargs["timestep"]
-        if not isinstance(hidden_states, torch.Tensor) or not isinstance(timestep, torch.Tensor):
-            raise TypeError("hidden_states and timestep must be tensors")
+        encoder_hidden_states = kwargs["encoder_hidden_states"]
+        if (
+            not isinstance(hidden_states, torch.Tensor)
+            or not isinstance(timestep, torch.Tensor)
+            or not isinstance(encoder_hidden_states, torch.Tensor)
+        ):
+            raise TypeError("hidden_states, timestep, and encoder_hidden_states must be tensors")
         scale = self.step0_scale if int(timestep.flatten()[0].item()) == 0 else self.step1_scale
-        return (hidden_states * scale,)
+        branch_indicator = float(encoder_hidden_states.flatten()[0].item())
+        branch_scale = (
+            self.cond_branch_scale if branch_indicator > 0.0 else self.negative_branch_scale
+        )
+        return (hidden_states * scale * branch_scale,)
 
 
 def _tuple_payload(**overrides: object) -> dict[str, object]:
@@ -221,9 +233,36 @@ def _write_placeholder_png(path: Path) -> None:
 def _rollout_scheduler_step(
     latent: torch.Tensor,
     output: torch.Tensor,
-    _sample: object,
+    _step: object,
 ) -> torch.Tensor:
     return latent + output
+
+
+def _rollout_tuple_fields(
+    *,
+    branch: str = "cond",
+    timestep_index: int = 0,
+) -> dict[str, object]:
+    branch_indicator = 1.0 if branch == "cond" else -1.0
+    return {
+        "cfg_branch": branch,
+        "timestep_index": timestep_index,
+        "timestep_bin": "late",
+        "timestep": torch.tensor([float(timestep_index)], dtype=torch.bfloat16),
+        "hidden_states": torch.ones(1, 1, 1, dtype=torch.bfloat16),
+        "target_output": torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+        "encoder_hidden_states": torch.full(
+            (1, 1, 1),
+            branch_indicator,
+            dtype=torch.bfloat16,
+        ),
+        "latent_before_step": torch.ones(1, 1, 1, dtype=torch.bfloat16),
+        "latent_after_step": torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+        "scheduler_state": {"sigma": float(timestep_index), "order": 1},
+        "rollout_tuple_schema": ROLLOUT_TUPLE_SCHEMA_VERSION,
+        "guidance_scale": 4.0,
+        "reference_image_path": "/durable/qwen_image_smoke_0000.png",
+    }
 
 
 def test_qwen_image_tuple_dataset_loads_captured_schema(tmp_path: Path) -> None:
@@ -339,41 +378,76 @@ def test_rollout_tuple_validation_requires_latent_fields(tmp_path: Path) -> None
     _write_tuple(tuple_path)
     sample = load_qwen_image_tuple_sample(tuple_path)
 
-    with pytest.raises(ValueError, match="latent_before_step"):
+    with pytest.raises(ValueError, match="schema"):
         validate_qwen_image_rollout_tuple_sample(sample)
 
     _write_tuple(
         tuple_path,
-        latent_before_step=torch.ones(1, 2, 4, dtype=torch.bfloat16),
-        latent_after_step=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
-        scheduler_state={"sigma": 0.5},
+        **_rollout_tuple_fields(timestep_index=0),
     )
     sample = load_qwen_image_tuple_sample(tuple_path)
 
     validate_qwen_image_rollout_tuple_sample(sample)
     assert sample.latent_before_step is not None
     assert sample.latent_after_step is not None
-    assert sample.scheduler_state == {"sigma": 0.5}
+    assert sample.scheduler_state == {"sigma": 0.0, "order": 1}
+
+    _write_tuple(
+        tuple_path,
+        **_rollout_tuple_fields(timestep_index=0),
+        scheduler_state=None,
+    )
+    sample = load_qwen_image_tuple_sample(tuple_path)
+
+    with pytest.raises(ValueError, match="scheduler_state"):
+        validate_qwen_image_rollout_tuple_sample(sample)
+
+
+def test_compute_qwen_image_rollout_loss_requires_cfg_pairs(tmp_path: Path) -> None:
+    tuple_path = tmp_path / "tuples" / "tuple_0_cond.pt"
+    _write_tuple(tuple_path, **_rollout_tuple_fields(branch="cond", timestep_index=0))
+    sample = load_qwen_image_tuple_sample(tuple_path)
+
+    with pytest.raises(ValueError, match="paired CFG branch"):
+        compute_qwen_image_rollout_loss(
+            _IndexedRolloutTransformer(),
+            [sample],
+            scheduler_step_fn=_rollout_scheduler_step,
+            device="cpu",
+            config=QwenImageRolloutLossConfig(rollout_k=1),
+            teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+        )
+
+
+def test_compute_qwen_image_rollout_loss_rejects_duplicate_cfg_branch(
+    tmp_path: Path,
+) -> None:
+    samples = []
+    for suffix in ("a", "b"):
+        tuple_path = tmp_path / "tuples" / f"tuple_0_cond_{suffix}.pt"
+        _write_tuple(tuple_path, **_rollout_tuple_fields(branch="cond", timestep_index=0))
+        samples.append(load_qwen_image_tuple_sample(tuple_path))
+
+    with pytest.raises(ValueError, match="duplicate CFG branch"):
+        compute_qwen_image_rollout_loss(
+            _IndexedRolloutTransformer(),
+            samples,
+            scheduler_step_fn=_rollout_scheduler_step,
+            device="cpu",
+            config=QwenImageRolloutLossConfig(rollout_k=1),
+            teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+        )
 
 
 def test_compute_qwen_image_rollout_loss_backprops_through_previous_step(
     tmp_path: Path,
 ) -> None:
-    tuple_paths = [tmp_path / "tuples" / f"tuple_{index}.pt" for index in range(2)]
     samples = []
-    for index, tuple_path in enumerate(tuple_paths):
-        _write_tuple(
-            tuple_path,
-            timestep_index=index,
-            timestep_bin="late",
-            timestep=torch.tensor([float(index)], dtype=torch.bfloat16),
-            hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
-            target_output=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
-            encoder_hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
-            latent_before_step=torch.ones(1, 1, 1, dtype=torch.bfloat16),
-            latent_after_step=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
-        )
-        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    for index in range(2):
+        for branch in ("cond", "negative"):
+            tuple_path = tmp_path / "tuples" / f"tuple_{index}_{branch}.pt"
+            _write_tuple(tuple_path, **_rollout_tuple_fields(branch=branch, timestep_index=index))
+            samples.append(load_qwen_image_tuple_sample(tuple_path))
     student = _IndexedRolloutTransformer()
 
     loss, components, records = compute_qwen_image_rollout_loss(
@@ -387,6 +461,7 @@ def test_compute_qwen_image_rollout_loss_backprops_through_previous_step(
             lambda_dir=0.0,
             lambda_latent=0.0,
             lambda_anchor=0.0,
+            cfg_normalize=False,
         ),
         teacher_forward_fn=lambda latent, sample: latent
         if sample.timestep_index == 0
@@ -401,24 +476,19 @@ def test_compute_qwen_image_rollout_loss_backprops_through_previous_step(
     assert student.step0_scale.grad.abs().item() > 0.0
     assert student.step1_scale.grad is not None
     assert student.step1_scale.grad.abs().item() > 0.0
+    assert student.cond_branch_scale.grad is not None
+    assert student.cond_branch_scale.grad.abs().item() > 0.0
+    assert student.negative_branch_scale.grad is not None
+    assert student.negative_branch_scale.grad.abs().item() > 0.0
 
 
 def test_monitor_qwen_image_rollout_no_grad_writes_summary(tmp_path: Path) -> None:
-    tuple_paths = [tmp_path / "tuples" / f"tuple_{index}.pt" for index in range(2)]
     samples = []
-    for index, tuple_path in enumerate(tuple_paths):
-        _write_tuple(
-            tuple_path,
-            timestep_index=index,
-            timestep_bin="late",
-            timestep=torch.tensor([float(index)], dtype=torch.bfloat16),
-            hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
-            target_output=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
-            encoder_hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
-            latent_before_step=torch.ones(1, 1, 1, dtype=torch.bfloat16),
-            latent_after_step=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
-        )
-        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    for index in range(2):
+        for branch in ("cond", "negative"):
+            tuple_path = tmp_path / "tuples" / f"tuple_{index}_{branch}.pt"
+            _write_tuple(tuple_path, **_rollout_tuple_fields(branch=branch, timestep_index=index))
+            samples.append(load_qwen_image_tuple_sample(tuple_path))
     output_json = tmp_path / "rollout_monitor" / "summary.json"
     records_jsonl = tmp_path / "rollout_monitor" / "records.jsonl"
 
@@ -435,6 +505,7 @@ def test_monitor_qwen_image_rollout_no_grad_writes_summary(tmp_path: Path) -> No
             lambda_dir=0.0,
             lambda_latent=0.0,
             lambda_anchor=0.0,
+            cfg_normalize=False,
         ),
         teacher_forward_fn=lambda latent, sample: latent
         if sample.timestep_index == 0
@@ -446,11 +517,15 @@ def test_monitor_qwen_image_rollout_no_grad_writes_summary(tmp_path: Path) -> No
     assert records_jsonl.is_file()
     assert summary["format"] == "qwen_image_mxfp8_qat_rollout_monitor_v1"
     assert summary["metrics_summary"]["rollout_steps"] == pytest.approx(2.0)
+    assert "cond_output_mse_sum" in summary["metrics_summary"]
+    assert "negative_output_mse_sum" in summary["metrics_summary"]
     assert summary["provenance"] == {"mode": "unit"}
     records = [
         json.loads(line) for line in records_jsonl.read_text(encoding="utf-8").splitlines() if line
     ]
     assert [record["rollout_index"] for record in records] == [0, 1]
+    assert records[0]["cfg_branches"] == ["cond", "negative"]
+    assert records[0]["guidance_scale"] == pytest.approx(4.0)
 
 
 def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:
