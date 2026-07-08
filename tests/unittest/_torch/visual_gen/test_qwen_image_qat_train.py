@@ -1113,6 +1113,7 @@ def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> N
     assert config.loss.timestep_weights["late"] == pytest.approx(8.0)
     assert config.loss.student_activation_checkpoint is False
     assert config.checkpoint_interval_steps == 250
+    assert config.resume_checkpoint_path is None
 
 
 def test_load_rollout_qat_config_requires_diagnostic_for_non_840(tmp_path: Path) -> None:
@@ -1568,15 +1569,21 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
     )
     checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=True)
     assert checkpoint["config"]["recipe"] == "closed_set_rollout_qat_v1"
+    assert checkpoint["checkpoint_kind"] == "rollout_training_state"
     assert checkpoint["config"]["lora_rank"] == 4
     assert checkpoint["config"]["diagnostic_only"] is True
     assert checkpoint["config"]["teacher_target_mode"] == "captured_tuple"
     assert checkpoint["config"]["checkpoint_interval_steps"] == 1
     assert checkpoint["config"]["loss"]["timestep_weights"]["late"] == pytest.approx(8.0)
     assert checkpoint["config"]["loss"]["student_activation_checkpoint"] is True
+    assert checkpoint["completed_steps"] == 2
+    assert checkpoint["optimizer_state_dict"]
+    assert checkpoint["sampling_state"]["dataset_size"] == 1
     step_checkpoint = result.output_dir / "rollout_last_step0001.pt"
     assert step_checkpoint.exists()
-    assert torch.load(step_checkpoint, map_location="cpu", weights_only=True)["train_steps"] == 1
+    step_payload = torch.load(step_checkpoint, map_location="cpu", weights_only=True)
+    assert step_payload["train_steps"] == 1
+    assert step_payload["checkpoint_kind"] == "rollout_training_state"
     assert (result.output_dir / "rollout_last_step0002.pt").exists()
     trainable_state = checkpoint["trainable_state_dict"]
     lora_up_tensors = [
@@ -1584,6 +1591,138 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
     ]
     assert lora_up_tensors
     assert any(tensor.abs().sum().item() > 0.0 for tensor in lora_up_tensors)
+
+
+@requires_float8
+def test_train_qwen_image_rollout_qat_resume_matches_uninterrupted(
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "rollout.jsonl"
+    entries = []
+    for branch in ("cond", "negative"):
+        tuple_path = tmp_path / "tuples" / f"tuple_0_{branch}.pt"
+        _write_tuple(
+            tuple_path,
+            **_rollout_tuple_fields(
+                branch=branch,
+                timestep_index=0,
+                hidden_size=128,
+                image_seq_len=2,
+                text_seq_len=3,
+            ),
+        )
+        entries.append(
+            {
+                "prompt_id": "qwen_image_smoke_0000",
+                "split": "smoke",
+                "timestep_index": 0,
+                "timestep_bin": "late",
+                "cfg_branch": branch,
+                "trajectory_source": "bf16_teacher",
+                "status": "captured",
+                "tuple_path": str(tuple_path),
+            }
+        )
+    index_path.write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    base_model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+    base_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
+
+    def new_model() -> _TinyQwenTransformer:
+        model = _TinyQwenTransformer().to(dtype=torch.bfloat16)
+        model.load_state_dict(base_state)
+        return model
+
+    def rollout_config(
+        output_dir: Path,
+        *,
+        max_steps: int,
+        resume_checkpoint_path: Path | None = None,
+    ) -> QwenImageRolloutQatTrainingConfig:
+        return QwenImageRolloutQatTrainingConfig(
+            tuple_index_jsonl=index_path,
+            output_dir=output_dir,
+            max_steps=max_steps,
+            learning_rate=1.0e-3,
+            device="cpu",
+            lora_rank=4,
+            lora_alpha=8.0,
+            expected_num_layers=1,
+            expected_target_count=14,
+            diagnostic_only=True,
+            teacher_target_mode="captured_tuple",
+            loss=QwenImageRolloutLossConfig(rollout_k=1, cfg_normalize=False),
+            checkpoint_name="rollout_last.pt",
+            metrics_name="rollout_metrics.jsonl",
+            resume_checkpoint_path=resume_checkpoint_path,
+        )
+
+    torch.manual_seed(1234)
+    uninterrupted = train_qwen_image_rollout_qat(
+        new_model(),
+        rollout_config(tmp_path / "full", max_steps=2),
+        scheduler_step_fn=_rollout_scheduler_step,
+        teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+        linear_cls=nn.Linear,
+    )
+
+    torch.manual_seed(1234)
+    first_leg = train_qwen_image_rollout_qat(
+        new_model(),
+        rollout_config(tmp_path / "resume", max_steps=1),
+        scheduler_step_fn=_rollout_scheduler_step,
+        teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+        linear_cls=nn.Linear,
+    )
+    resumed = train_qwen_image_rollout_qat(
+        new_model(),
+        rollout_config(
+            tmp_path / "resume",
+            max_steps=2,
+            resume_checkpoint_path=first_leg.checkpoint_path,
+        ),
+        scheduler_step_fn=_rollout_scheduler_step,
+        teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+        linear_cls=nn.Linear,
+    )
+
+    uninterrupted_state = load_qwen_image_qat_checkpoint(uninterrupted.checkpoint_path)[
+        "trainable_state_dict"
+    ]
+    resumed_state = load_qwen_image_qat_checkpoint(resumed.checkpoint_path)["trainable_state_dict"]
+    assert set(resumed_state) == set(uninterrupted_state)
+    for name, tensor in uninterrupted_state.items():
+        assert torch.equal(resumed_state[name], tensor), name
+    records = [
+        json.loads(line)
+        for line in resumed.metrics_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [record["step"] for record in records] == [1, 2]
+
+
+@requires_float8
+def test_rollout_qat_captured_tuple_requires_diagnostic_only(tmp_path: Path) -> None:
+    index_path = tmp_path / "rollout.jsonl"
+    index_path.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="diagnostic-only"):
+        train_qwen_image_rollout_qat(
+            _TinyQwenTransformer().to(dtype=torch.bfloat16),
+            QwenImageRolloutQatTrainingConfig(
+                tuple_index_jsonl=index_path,
+                output_dir=tmp_path / "out",
+                max_steps=1,
+                teacher_target_mode="captured_tuple",
+                expected_num_layers=1,
+                expected_target_count=14,
+                diagnostic_only=False,
+            ),
+            scheduler_step_fn=_rollout_scheduler_step,
+            teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+            linear_cls=nn.Linear,
+        )
 
 
 @requires_float8

@@ -361,6 +361,7 @@ class QwenImageRolloutQatTrainingConfig:
     log_interval_steps: int = 1
     checkpoint_name: str = "qwen_image_closed_set_rollout_qat_lora_last.pt"
     checkpoint_interval_steps: int | None = None
+    resume_checkpoint_path: str | Path | None = None
     metrics_name: str = "qwen_image_closed_set_rollout_qat_train_metrics.jsonl"
     compute_lora_delta_norm: bool = False
     scale_multipliers: Mapping[str, float] | None = None
@@ -1430,12 +1431,42 @@ def train_qwen_image_rollout_qat(
         eps=float(config.eps),
         foreach=config.optimizer_foreach,
     )
+    completed_steps = 0
+    if config.resume_checkpoint_path is not None:
+        resume_checkpoint = load_qwen_image_qat_checkpoint(config.resume_checkpoint_path)
+        _validate_rollout_resume_checkpoint(
+            resume_checkpoint,
+            config=config,
+            dataset_size=len(dataset),
+        )
+        _restore_qwen_image_qat_trainable_state(
+            student_transformer,
+            checkpoint=resume_checkpoint,
+            injections=injections,
+        )
+        optimizer_state = resume_checkpoint.get("optimizer_state_dict")
+        if not isinstance(optimizer_state, dict):
+            raise ValueError(
+                "resume_checkpoint_path must point to a rollout training-state checkpoint "
+                "with optimizer_state_dict"
+            )
+        optimizer.load_state_dict(optimizer_state)
+        _move_optimizer_state_to_device(optimizer, device)
+        completed_steps = int(
+            resume_checkpoint.get("completed_steps", resume_checkpoint["train_steps"])
+        )
+        if completed_steps >= config.max_steps:
+            raise ValueError(
+                "resume_checkpoint_path already completed "
+                f"{completed_steps} steps, which is >= max_steps={config.max_steps}"
+            )
 
     metrics_path = output_dir / config.metrics_name
     checkpoint_path = output_dir / config.checkpoint_name
     start_time = time.perf_counter()
-    with metrics_path.open("w", encoding="utf-8") as metrics_file:
-        for step in range(1, config.max_steps + 1):
+    metrics_mode = "a" if completed_steps > 0 and metrics_path.exists() else "w"
+    with metrics_path.open(metrics_mode, encoding="utf-8") as metrics_file:
+        for step in range(completed_steps + 1, config.max_steps + 1):
             window_index = _sample_index_for_step(
                 step,
                 dataset_size=len(dataset),
@@ -1494,6 +1525,10 @@ def train_qwen_image_rollout_qat(
                     config=_rollout_training_config_to_dict(config),
                     injections=injections,
                     train_steps=step,
+                    optimizer=optimizer,
+                    completed_steps=step,
+                    checkpoint_kind="rollout_training_state",
+                    dataset_size=len(dataset),
                 )
 
     _save_qwen_image_qat_checkpoint_from_config(
@@ -1502,6 +1537,10 @@ def train_qwen_image_rollout_qat(
         config=_rollout_training_config_to_dict(config),
         injections=injections,
         train_steps=config.max_steps,
+        optimizer=optimizer,
+        completed_steps=config.max_steps,
+        checkpoint_kind="rollout_training_state",
+        dataset_size=len(dataset),
     )
     return QwenImageRolloutQatTrainingResult(
         output_dir=output_dir,
@@ -1628,6 +1667,11 @@ def load_qwen_image_rollout_qat_config(
         checkpoint_interval_steps=(
             int(data["checkpoint_interval_steps"])
             if data.get("checkpoint_interval_steps") is not None
+            else None
+        ),
+        resume_checkpoint_path=(
+            str(data["resume_checkpoint_path"])
+            if data.get("resume_checkpoint_path") is not None
             else None
         ),
         metrics_name=str(
@@ -2150,6 +2194,21 @@ def apply_qwen_image_qat_checkpoint(
         scale_multipliers=_optional_float_mapping(checkpoint_config.get("scale_multipliers")),
         linear_cls=linear_cls,
     )
+    _restore_qwen_image_qat_trainable_state(
+        transformer,
+        checkpoint=checkpoint,
+        injections=injections,
+    )
+    return injections
+
+
+def _restore_qwen_image_qat_trainable_state(
+    transformer: nn.Module,
+    *,
+    checkpoint: Mapping[str, object],
+    injections: tuple[QwenImageQatInjectionInfo, ...],
+) -> None:
+    """Restore adapter tensors into already-injected LoRA fake-MXFP8 modules."""
     trainable_state = checkpoint.get("trainable_state_dict")
     if not isinstance(trainable_state, dict):
         raise ValueError("QAT checkpoint trainable_state_dict must be a mapping")
@@ -2180,7 +2239,73 @@ def apply_qwen_image_qat_checkpoint(
             )
         with torch.no_grad():
             parameter.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
-    return injections
+
+
+def _validate_rollout_resume_checkpoint(
+    checkpoint: Mapping[str, object],
+    *,
+    config: QwenImageRolloutQatTrainingConfig,
+    dataset_size: int,
+) -> None:
+    """Validate that a rollout training-state checkpoint can resume this config."""
+    if checkpoint.get("checkpoint_kind") != "rollout_training_state":
+        raise ValueError("resume_checkpoint_path must point to a rollout_training_state checkpoint")
+    if "optimizer_state_dict" not in checkpoint:
+        raise ValueError(
+            "resume_checkpoint_path must include optimizer_state_dict for AdamW resume"
+        )
+    checkpoint_config = _checkpoint_training_config(checkpoint)
+    current_config = _rollout_training_config_to_dict(config)
+    compatible_fields = (
+        "recipe",
+        "tuple_index_jsonl",
+        "target_layers",
+        "lora_rank",
+        "lora_alpha",
+        "lora_dropout",
+        "expected_num_layers",
+        "expected_target_count",
+        "diagnostic_only",
+        "teacher_target_mode",
+        "learning_rate",
+        "weight_decay",
+        "betas",
+        "eps",
+        "grad_clip_norm",
+        "scale_multipliers",
+        "optimizer_foreach",
+        "window_stride",
+        "window_start_index",
+        "loss",
+    )
+    mismatches = []
+    for field_name in compatible_fields:
+        if checkpoint_config.get(field_name) != current_config.get(field_name):
+            mismatches.append(field_name)
+    if mismatches:
+        raise ValueError(
+            f"resume checkpoint config does not match current rollout config fields: {mismatches}"
+        )
+    sampling_state = checkpoint.get("sampling_state")
+    if not isinstance(sampling_state, Mapping):
+        raise ValueError("resume checkpoint missing sampling_state")
+    if int(sampling_state.get("dataset_size", -1)) != int(dataset_size):
+        raise ValueError(
+            "resume checkpoint dataset_size does not match current rollout dataset: "
+            f"{sampling_state.get('dataset_size')} vs {dataset_size}"
+        )
+    if int(checkpoint.get("completed_steps", checkpoint["train_steps"])) < 0:
+        raise ValueError("resume checkpoint completed_steps must be non-negative")
+
+
+def _move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device=device)
 
 
 def summarize_qwen_image_qat_training_metrics(metrics_path: str | Path) -> dict[str, object]:
@@ -3725,6 +3850,16 @@ def _validate_rollout_training_config(config: QwenImageRolloutQatTrainingConfig)
         raise ValueError("lora_alpha must be positive")
     if config.teacher_target_mode not in ("on_policy", "captured_tuple"):
         raise ValueError("teacher_target_mode must be 'on_policy' or 'captured_tuple'")
+    if config.teacher_target_mode == "captured_tuple" and not config.diagnostic_only:
+        raise ValueError(
+            "teacher_target_mode='captured_tuple' is diagnostic-only for "
+            "closed_set_rollout_qat_v1; use on_policy for counted Stage B runs"
+        )
+    if (
+        config.resume_checkpoint_path is not None
+        and not Path(config.resume_checkpoint_path).is_file()
+    ):
+        raise ValueError(f"resume_checkpoint_path does not exist: {config.resume_checkpoint_path}")
     expected_num_layers = _optional_int(config.expected_num_layers)
     expected_target_count = _optional_int(config.expected_target_count)
     if (
@@ -3870,6 +4005,10 @@ def _save_qwen_image_qat_checkpoint_from_config(
     config: Mapping[str, object],
     injections: tuple[QwenImageQatInjectionInfo, ...],
     train_steps: int,
+    optimizer: torch.optim.Optimizer | None = None,
+    completed_steps: int | None = None,
+    checkpoint_kind: str = "adapter",
+    dataset_size: int | None = None,
 ) -> None:
     trainable_names = qwen_image_qat_trainable_parameter_names(injections)
     trainable_state_dict = {
@@ -3882,12 +4021,23 @@ def _save_qwen_image_qat_checkpoint_from_config(
         raise RuntimeError(f"QAT checkpoint is missing trainable tensors: {missing}")
     checkpoint = {
         "format": TRAINING_FORMAT,
+        "checkpoint_kind": checkpoint_kind,
         "config": dict(config),
         "train_steps": int(train_steps),
+        "completed_steps": int(train_steps if completed_steps is None else completed_steps),
         "trainable_state_dict": trainable_state_dict,
         "trainable_parameter_names": sorted(trainable_state_dict),
         "injections": [_injection_to_dict(injection) for injection in injections],
     }
+    if dataset_size is not None:
+        checkpoint["sampling_state"] = {
+            "dataset_size": int(dataset_size),
+            "window_stride": _optional_int(config.get("window_stride")),
+            "window_start_index": _optional_int(config.get("window_start_index")),
+        }
+    if optimizer is not None:
+        checkpoint["optimizer_class"] = optimizer.__class__.__name__
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
     torch.save(checkpoint, path)
 
 
@@ -3951,6 +4101,11 @@ def _rollout_training_config_to_dict(
         "log_interval_steps": config.log_interval_steps,
         "checkpoint_name": config.checkpoint_name,
         "checkpoint_interval_steps": config.checkpoint_interval_steps,
+        "resume_checkpoint_path": (
+            str(config.resume_checkpoint_path)
+            if config.resume_checkpoint_path is not None
+            else None
+        ),
         "metrics_name": config.metrics_name,
         "compute_lora_delta_norm": config.compute_lora_delta_norm,
         "scale_multipliers": dict(config.scale_multipliers or {}),
