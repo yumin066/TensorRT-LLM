@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,7 @@ except ModuleNotFoundError as error:
 TRAINING_FORMAT = "qwen_image_mxfp8_qat_adapter_v1"
 PROBE_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_probe_summary_v1"
 MONITOR_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_checkpoint_monitor_v1"
+ROLLOUT_MONITOR_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_rollout_monitor_v1"
 QWEN_BLOCK_LINEAR_TARGET = "qwen_block_linears"
 TARGET_OUTPUT_KEY = "target_output"
 QWEN_IMAGE_QAT_PROBE_RECIPES = (
@@ -138,6 +139,9 @@ class QwenImageTupleSample:
     entry: Mapping[str, object]
     target_output: torch.Tensor
     hidden_states: torch.Tensor
+    latent_before_step: torch.Tensor | None
+    latent_after_step: torch.Tensor | None
+    scheduler_state: Mapping[str, object] | None
     timestep: torch.Tensor
     additional_t_cond: torch.Tensor | None
     encoder_hidden_states: torch.Tensor
@@ -158,6 +162,20 @@ class QwenImageTupleLossConfig:
     lambda_mse: float = 1.0
     lambda_dir: float = 0.0
     timestep_weights: Mapping[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class QwenImageRolloutLossConfig:
+    """K-step latent rollout loss config for closed-set trajectory repair."""
+
+    rollout_k: int = 4
+    lambda_output_mse: float = 1.0
+    lambda_dir: float = 0.1
+    lambda_latent: float = 1.0
+    lambda_anchor: float = 0.2
+    timestep_weights: Mapping[str, float] | None = None
+    teacher_no_grad: bool = True
+    student_latent_detach: bool = False
 
 
 @dataclass(frozen=True)
@@ -339,6 +357,9 @@ def load_qwen_image_tuple_sample(
         entry=tuple_entry,
         target_output=_expect_tensor(payload, TARGET_OUTPUT_KEY, tuple_path),
         hidden_states=_expect_tensor(payload, "hidden_states", tuple_path),
+        latent_before_step=_optional_tensor(payload, "latent_before_step", tuple_path),
+        latent_after_step=_optional_tensor(payload, "latent_after_step", tuple_path),
+        scheduler_state=_optional_mapping(payload, "scheduler_state", tuple_path),
         timestep=_expect_tensor(payload, "timestep", tuple_path),
         additional_t_cond=_optional_tensor(payload, "additional_t_cond", tuple_path),
         encoder_hidden_states=_expect_tensor(payload, "encoder_hidden_states", tuple_path),
@@ -363,9 +384,25 @@ def forward_qwen_image_tuple(
     device: torch.device | str,
 ) -> torch.Tensor:
     """Replay one captured tuple through ``QwenImageTransformer2DModel.forward``."""
+    return _forward_qwen_image_tuple_with_hidden_states(
+        transformer,
+        sample,
+        device,
+        hidden_states=sample.hidden_states,
+    )
+
+
+def _forward_qwen_image_tuple_with_hidden_states(
+    transformer: nn.Module,
+    sample: QwenImageTupleSample,
+    device: torch.device | str,
+    *,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Replay one tuple while overriding the latent/hidden state."""
     target_device = torch.device(device)
     forward_kwargs = {
-        "hidden_states": sample.hidden_states.to(device=target_device),
+        "hidden_states": hidden_states.to(device=target_device),
         "encoder_hidden_states": sample.encoder_hidden_states.to(device=target_device),
         "encoder_hidden_states_mask": _move_value(sample.encoder_hidden_states_mask, target_device),
         "timestep": sample.timestep.to(device=target_device),
@@ -432,6 +469,230 @@ def compute_qwen_image_tuple_loss(
     components["unweighted_total"] = total
     components["timestep_weight"] = output.float().new_tensor(timestep_weight)
     return total * timestep_weight, components
+
+
+def validate_qwen_image_rollout_tuple_sample(sample: QwenImageTupleSample) -> None:
+    """Validate one sample has the latent fields required for rollout training."""
+    if sample.latent_before_step is None:
+        raise ValueError(f"rollout tuple missing latent_before_step: {sample.path}")
+    if sample.latent_after_step is None:
+        raise ValueError(f"rollout tuple missing latent_after_step: {sample.path}")
+    if tuple(sample.latent_before_step.shape) != tuple(sample.hidden_states.shape):
+        raise ValueError(
+            "rollout tuple latent_before_step shape must match hidden_states, got "
+            f"{tuple(sample.latent_before_step.shape)} vs {tuple(sample.hidden_states.shape)}: "
+            f"{sample.path}"
+        )
+    if tuple(sample.latent_after_step.shape) != tuple(sample.hidden_states.shape):
+        raise ValueError(
+            "rollout tuple latent_after_step shape must match hidden_states, got "
+            f"{tuple(sample.latent_after_step.shape)} vs {tuple(sample.hidden_states.shape)}: "
+            f"{sample.path}"
+        )
+
+
+def compute_qwen_image_rollout_loss(
+    student_transformer: nn.Module,
+    samples: Sequence[QwenImageTupleSample],
+    *,
+    scheduler_step_fn: Callable[[torch.Tensor, torch.Tensor, QwenImageTupleSample], torch.Tensor],
+    device: torch.device | str,
+    config: QwenImageRolloutLossConfig | None = None,
+    teacher_transformer: nn.Module | None = None,
+    teacher_forward_fn: Callable[[torch.Tensor, QwenImageTupleSample], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[dict[str, object]]]:
+    """Compute K-step latent rollout loss with differentiable student trajectory."""
+    loss_config = config or QwenImageRolloutLossConfig()
+    _validate_rollout_loss_config(loss_config)
+    if (teacher_transformer is None) == (teacher_forward_fn is None):
+        raise ValueError("exactly one of teacher_transformer or teacher_forward_fn must be set")
+    window = _validate_rollout_window(samples, loss_config.rollout_k)
+    target_device = torch.device(device)
+    for sample in window:
+        validate_qwen_image_rollout_tuple_sample(sample)
+
+    first_latent = window[0].latent_before_step
+    if first_latent is None:
+        raise ValueError(f"rollout tuple missing latent_before_step: {window[0].path}")
+    current_latent = first_latent.to(device=target_device)
+    total = current_latent.float().new_zeros(())
+    aggregate: dict[str, torch.Tensor] = {
+        "output_mse": total.clone(),
+        "direction": total.clone(),
+        "latent_mse": total.clone(),
+        "anchor_mse": total.clone(),
+        "unweighted_total": total.clone(),
+        "timestep_weighted_total": total.clone(),
+    }
+    records: list[dict[str, object]] = []
+
+    for rollout_index, sample in enumerate(window):
+        student_output = _forward_qwen_image_tuple_with_hidden_states(
+            student_transformer,
+            sample,
+            target_device,
+            hidden_states=current_latent,
+        )
+        teacher_input = current_latent.detach()
+        if teacher_forward_fn is not None:
+            with torch.no_grad():
+                teacher_output = teacher_forward_fn(teacher_input, sample)
+        else:
+            if teacher_transformer is None:
+                raise ValueError("teacher_transformer unexpectedly missing")
+            with torch.no_grad():
+                teacher_output = _forward_qwen_image_tuple_with_hidden_states(
+                    teacher_transformer,
+                    sample,
+                    target_device,
+                    hidden_states=teacher_input,
+                )
+        teacher_output = teacher_output.to(device=student_output.device, dtype=student_output.dtype)
+        student_next_latent = scheduler_step_fn(current_latent, student_output, sample)
+        with torch.no_grad():
+            teacher_next_latent = scheduler_step_fn(teacher_input, teacher_output, sample)
+        step_loss, step_components = compute_qwen_image_rollout_step_loss(
+            student_output=student_output,
+            teacher_output=teacher_output,
+            student_next_latent=student_next_latent,
+            teacher_next_latent=teacher_next_latent,
+            teacher_reference_next_latent=sample.latent_after_step,
+            sample=sample,
+            config=loss_config,
+        )
+        total = total + step_loss
+        for name in aggregate:
+            aggregate[name] = aggregate[name] + step_components[name]
+        records.append(
+            _build_rollout_step_record(
+                rollout_index=rollout_index,
+                sample=sample,
+                components=step_components,
+            )
+        )
+        current_latent = student_next_latent
+
+    aggregate["loss_total"] = total
+    aggregate["rollout_steps"] = total.new_tensor(float(len(window)))
+    return total, aggregate, records
+
+
+def compute_qwen_image_rollout_step_loss(
+    *,
+    student_output: torch.Tensor,
+    teacher_output: torch.Tensor,
+    student_next_latent: torch.Tensor,
+    teacher_next_latent: torch.Tensor,
+    teacher_reference_next_latent: torch.Tensor | None,
+    sample: QwenImageTupleSample,
+    config: QwenImageRolloutLossConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute one rollout step's output, direction, latent, and anchor losses."""
+    if teacher_reference_next_latent is None:
+        raise ValueError(f"rollout tuple missing latent_after_step: {sample.path}")
+    if tuple(student_output.shape) != tuple(teacher_output.shape):
+        raise ValueError(
+            "student and teacher output shapes must match, got "
+            f"{tuple(student_output.shape)} vs {tuple(teacher_output.shape)}"
+        )
+    if tuple(student_next_latent.shape) != tuple(teacher_next_latent.shape):
+        raise ValueError(
+            "student and teacher next latent shapes must match, got "
+            f"{tuple(student_next_latent.shape)} vs {tuple(teacher_next_latent.shape)}"
+        )
+    anchor = teacher_reference_next_latent.to(
+        device=student_next_latent.device,
+        dtype=student_next_latent.dtype,
+    )
+    if tuple(anchor.shape) != tuple(student_next_latent.shape):
+        raise ValueError(
+            "student next latent and teacher reference latent shapes must match, got "
+            f"{tuple(student_next_latent.shape)} vs {tuple(anchor.shape)}"
+        )
+
+    output_mse = F.mse_loss(student_output.float(), teacher_output.float())
+    direction = (
+        1.0
+        - F.cosine_similarity(
+            student_output.float().reshape(1, -1),
+            teacher_output.float().reshape(1, -1),
+            dim=1,
+            eps=1.0e-8,
+        ).mean()
+    )
+    latent_mse = F.mse_loss(student_next_latent.float(), teacher_next_latent.float())
+    anchor_mse = F.mse_loss(student_next_latent.float(), anchor.float())
+    unweighted = (
+        output_mse * float(config.lambda_output_mse)
+        + direction * float(config.lambda_dir)
+        + latent_mse * float(config.lambda_latent)
+        + anchor_mse * float(config.lambda_anchor)
+    )
+    timestep_weight = _rollout_timestep_weight(sample, config)
+    weighted = unweighted * timestep_weight
+    components = {
+        "output_mse": output_mse,
+        "direction": direction,
+        "latent_mse": latent_mse,
+        "anchor_mse": anchor_mse,
+        "unweighted_total": unweighted,
+        "timestep_weight": student_output.float().new_tensor(timestep_weight),
+        "timestep_weighted_total": weighted,
+    }
+    return weighted, components
+
+
+def monitor_qwen_image_rollout_no_grad(
+    student_transformer: nn.Module,
+    samples: Sequence[QwenImageTupleSample],
+    *,
+    scheduler_step_fn: Callable[[torch.Tensor, torch.Tensor, QwenImageTupleSample], torch.Tensor],
+    output_json: str | Path,
+    device: torch.device | str,
+    config: QwenImageRolloutLossConfig | None = None,
+    teacher_transformer: nn.Module | None = None,
+    teacher_forward_fn: Callable[[torch.Tensor, QwenImageTupleSample], torch.Tensor] | None = None,
+    records_jsonl: str | Path | None = None,
+    provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Run a no-grad rollout monitor and write JSON summary artifacts."""
+    output_path = Path(output_json)
+    records_path = Path(records_jsonl) if records_jsonl is not None else None
+    if records_path is not None:
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+    with torch.no_grad():
+        loss, components, records = compute_qwen_image_rollout_loss(
+            student_transformer,
+            samples,
+            scheduler_step_fn=scheduler_step_fn,
+            device=device,
+            config=config,
+            teacher_transformer=teacher_transformer,
+            teacher_forward_fn=teacher_forward_fn,
+        )
+    if records_path is not None:
+        records_path.write_text(
+            "\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n",
+            encoding="utf-8",
+        )
+    summary = {
+        "format": ROLLOUT_MONITOR_SUMMARY_FORMAT,
+        "output_json": str(output_path),
+        "records_jsonl": str(records_path) if records_path is not None else None,
+        "rollout_config": _rollout_loss_config_to_dict(config or QwenImageRolloutLossConfig()),
+        "sample_count": len(samples),
+        "metrics_summary": {
+            "loss_total": _tensor_scalar(loss),
+            "rollout_steps": _tensor_scalar(components["rollout_steps"]),
+            "output_mse_sum": _tensor_scalar(components["output_mse"]),
+            "direction_sum": _tensor_scalar(components["direction"]),
+            "latent_mse_sum": _tensor_scalar(components["latent_mse"]),
+            "anchor_mse_sum": _tensor_scalar(components["anchor_mse"]),
+        },
+        "provenance": dict(provenance or {}),
+    }
+    write_json(output_path, summary)
+    return summary
 
 
 def prepare_qwen_image_qat_model(
@@ -1554,6 +1815,19 @@ def _optional_tensor(
     return value
 
 
+def _optional_mapping(
+    payload: Mapping[str, object],
+    field_name: str,
+    path: Path,
+) -> Mapping[str, object] | None:
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"teacher tuple field {field_name} must be a mapping when present: {path}")
+    return value
+
+
 def _expect_field(payload: Mapping[str, object], field_name: str, path: Path) -> object:
     if field_name not in payload:
         raise ValueError(f"teacher tuple payload missing field {field_name}: {path}")
@@ -1579,6 +1853,91 @@ def _timestep_weight(
     if config.timestep_weights is None:
         return 1.0
     return float(config.timestep_weights.get(sample.timestep_bin, 1.0))
+
+
+def _rollout_timestep_weight(
+    sample: QwenImageTupleSample,
+    config: QwenImageRolloutLossConfig,
+) -> float:
+    if config.timestep_weights is None:
+        return 1.0
+    return float(config.timestep_weights.get(sample.timestep_bin, 1.0))
+
+
+def _validate_rollout_loss_config(config: QwenImageRolloutLossConfig) -> None:
+    if config.rollout_k <= 0:
+        raise ValueError("rollout_k must be positive")
+    weights = (
+        config.lambda_output_mse,
+        config.lambda_dir,
+        config.lambda_latent,
+        config.lambda_anchor,
+    )
+    if any(float(weight) < 0.0 for weight in weights):
+        raise ValueError("rollout loss weights must be non-negative")
+    if all(float(weight) == 0.0 for weight in weights):
+        raise ValueError("at least one rollout loss weight must be positive")
+    if not config.teacher_no_grad:
+        raise ValueError("closed-set rollout teacher targets must use no_grad")
+    if config.student_latent_detach:
+        raise ValueError("closed-set rollout must not detach student intermediate latents")
+
+
+def _validate_rollout_window(
+    samples: Sequence[QwenImageTupleSample],
+    rollout_k: int,
+) -> tuple[QwenImageTupleSample, ...]:
+    window = tuple(samples)
+    if len(window) < rollout_k:
+        raise ValueError(f"rollout window must contain at least {rollout_k} samples")
+    window = window[:rollout_k]
+    first = window[0]
+    for previous, sample in zip(window, window[1:]):
+        if sample.prompt_id != first.prompt_id:
+            raise ValueError("rollout window samples must have the same prompt_id")
+        if sample.split != first.split:
+            raise ValueError("rollout window samples must have the same split")
+        if sample.cfg_branch != first.cfg_branch:
+            raise ValueError("rollout window samples must have the same cfg_branch")
+        if sample.timestep_index != previous.timestep_index + 1:
+            raise ValueError("rollout window timestep_index values must be consecutive")
+    return window
+
+
+def _rollout_loss_config_to_dict(config: QwenImageRolloutLossConfig) -> dict[str, object]:
+    return {
+        "rollout_k": config.rollout_k,
+        "lambda_output_mse": config.lambda_output_mse,
+        "lambda_dir": config.lambda_dir,
+        "lambda_latent": config.lambda_latent,
+        "lambda_anchor": config.lambda_anchor,
+        "timestep_weights": dict(config.timestep_weights or {}),
+        "teacher_no_grad": config.teacher_no_grad,
+        "student_latent_detach": config.student_latent_detach,
+    }
+
+
+def _build_rollout_step_record(
+    *,
+    rollout_index: int,
+    sample: QwenImageTupleSample,
+    components: Mapping[str, torch.Tensor],
+) -> dict[str, object]:
+    return {
+        "rollout_index": int(rollout_index),
+        "prompt_id": sample.prompt_id,
+        "split": sample.split,
+        "timestep_index": sample.timestep_index,
+        "timestep_bin": sample.timestep_bin,
+        "cfg_branch": sample.cfg_branch,
+        "loss_total": _tensor_scalar(components["timestep_weighted_total"]),
+        "loss_unweighted_total": _tensor_scalar(components["unweighted_total"]),
+        "loss_output_mse": _tensor_scalar(components["output_mse"]),
+        "loss_direction": _tensor_scalar(components["direction"]),
+        "loss_latent_mse": _tensor_scalar(components["latent_mse"]),
+        "loss_anchor_mse": _tensor_scalar(components["anchor_mse"]),
+        "timestep_weight": _tensor_scalar(components["timestep_weight"]),
+    }
 
 
 def _filter_targets(
@@ -2061,10 +2420,12 @@ __all__ = [
     "PROBE_SUMMARY_FORMAT",
     "QWEN_BLOCK_LINEAR_TARGET",
     "QWEN_IMAGE_QAT_PROBE_RECIPES",
+    "ROLLOUT_MONITOR_SUMMARY_FORMAT",
     "QwenImageQatInjectionInfo",
     "QwenImageQatMonitorConfig",
     "QwenImageQatTrainingConfig",
     "QwenImageQatTrainingResult",
+    "QwenImageRolloutLossConfig",
     "QwenImageTupleDataset",
     "QwenImageTupleLossConfig",
     "QwenImageTupleSample",
@@ -2072,6 +2433,8 @@ __all__ = [
     "build_parser",
     "build_qwen_image_qat_probe_config",
     "build_qwen_image_qat_scale_sensitivity_manifest",
+    "compute_qwen_image_rollout_loss",
+    "compute_qwen_image_rollout_step_loss",
     "compute_qwen_image_tuple_loss",
     "compute_scale_aware_lora_multipliers",
     "first_tensor_output",
@@ -2079,6 +2442,7 @@ __all__ = [
     "load_qwen_image_qat_checkpoint",
     "load_qwen_image_tuple_sample",
     "main",
+    "monitor_qwen_image_rollout_no_grad",
     "monitor_qwen_image_qat_checkpoint",
     "normalize_qwen_image_qat_parameter_name",
     "prepare_qwen_image_qat_model",
@@ -2088,6 +2452,7 @@ __all__ = [
     "run_qwen_image_qat_probe",
     "summarize_qwen_image_qat_training_metrics",
     "train_qwen_image_qat",
+    "validate_qwen_image_rollout_tuple_sample",
     "validate_qwen_image_qat_probe_recipe",
 ]
 

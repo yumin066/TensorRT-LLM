@@ -30,16 +30,19 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     Mxfp8LoraAdapterLinear,
     QwenImageQatMonitorConfig,
     QwenImageQatTrainingConfig,
+    QwenImageRolloutLossConfig,
     QwenImageTupleDataset,
     QwenImageTupleLossConfig,
     build_qwen_image_qat_probe_config,
     build_qwen_image_qat_scale_sensitivity_manifest,
+    compute_qwen_image_rollout_loss,
     compute_qwen_image_tuple_loss,
     compute_scale_aware_lora_multipliers,
     forward_qwen_image_tuple,
     load_qwen_image_qat_checkpoint,
     load_qwen_image_tuple_sample,
     monitor_qwen_image_qat_checkpoint,
+    monitor_qwen_image_rollout_no_grad,
     normalize_qwen_image_qat_parameter_name,
     prepare_qwen_image_qat_model,
     qwen_image_qat_trainable_parameter_names,
@@ -47,6 +50,7 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     summarize_qwen_image_qat_training_metrics,
     train_qwen_image_qat,
     validate_qwen_image_qat_probe_recipe,
+    validate_qwen_image_rollout_tuple_sample,
 )
 
 requires_float8 = pytest.mark.skipif(
@@ -130,6 +134,21 @@ class _TinyQwenTransformer(nn.Module):
         return (self.transformer_blocks[0].attn.to_q(hidden_states),)
 
 
+class _IndexedRolloutTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.step0_scale = nn.Parameter(torch.tensor(1.0))
+        self.step1_scale = nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, **kwargs: object) -> tuple[torch.Tensor]:
+        hidden_states = kwargs["hidden_states"]
+        timestep = kwargs["timestep"]
+        if not isinstance(hidden_states, torch.Tensor) or not isinstance(timestep, torch.Tensor):
+            raise TypeError("hidden_states and timestep must be tensors")
+        scale = self.step0_scale if int(timestep.flatten()[0].item()) == 0 else self.step1_scale
+        return (hidden_states * scale,)
+
+
 def _tuple_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "prompt_id": "qwen_image_smoke_0000",
@@ -197,6 +216,14 @@ def _write_prompt_manifest(path: Path, *, split: str = "fast_calibration") -> di
 def _write_placeholder_png(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"placeholder png")
+
+
+def _rollout_scheduler_step(
+    latent: torch.Tensor,
+    output: torch.Tensor,
+    _sample: object,
+) -> torch.Tensor:
+    return latent + output
 
 
 def test_qwen_image_tuple_dataset_loads_captured_schema(tmp_path: Path) -> None:
@@ -305,6 +332,125 @@ def test_compute_qwen_image_tuple_loss_rejects_shape_mismatch(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="shapes must match"):
         compute_qwen_image_tuple_loss(torch.zeros(1, 1, 4), sample)
+
+
+def test_rollout_tuple_validation_requires_latent_fields(tmp_path: Path) -> None:
+    tuple_path = tmp_path / "tuple.pt"
+    _write_tuple(tuple_path)
+    sample = load_qwen_image_tuple_sample(tuple_path)
+
+    with pytest.raises(ValueError, match="latent_before_step"):
+        validate_qwen_image_rollout_tuple_sample(sample)
+
+    _write_tuple(
+        tuple_path,
+        latent_before_step=torch.ones(1, 2, 4, dtype=torch.bfloat16),
+        latent_after_step=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+        scheduler_state={"sigma": 0.5},
+    )
+    sample = load_qwen_image_tuple_sample(tuple_path)
+
+    validate_qwen_image_rollout_tuple_sample(sample)
+    assert sample.latent_before_step is not None
+    assert sample.latent_after_step is not None
+    assert sample.scheduler_state == {"sigma": 0.5}
+
+
+def test_compute_qwen_image_rollout_loss_backprops_through_previous_step(
+    tmp_path: Path,
+) -> None:
+    tuple_paths = [tmp_path / "tuples" / f"tuple_{index}.pt" for index in range(2)]
+    samples = []
+    for index, tuple_path in enumerate(tuple_paths):
+        _write_tuple(
+            tuple_path,
+            timestep_index=index,
+            timestep_bin="late",
+            timestep=torch.tensor([float(index)], dtype=torch.bfloat16),
+            hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            target_output=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+            encoder_hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            latent_before_step=torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            latent_after_step=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+        )
+        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    student = _IndexedRolloutTransformer()
+
+    loss, components, records = compute_qwen_image_rollout_loss(
+        student,
+        samples,
+        scheduler_step_fn=_rollout_scheduler_step,
+        device="cpu",
+        config=QwenImageRolloutLossConfig(
+            rollout_k=2,
+            lambda_output_mse=1.0,
+            lambda_dir=0.0,
+            lambda_latent=0.0,
+            lambda_anchor=0.0,
+        ),
+        teacher_forward_fn=lambda latent, sample: latent
+        if sample.timestep_index == 0
+        else torch.zeros_like(latent),
+    )
+    loss.backward()
+
+    assert records[0]["loss_total"] == pytest.approx(0.0)
+    assert records[1]["loss_output_mse"] > 0.0
+    assert components["rollout_steps"].item() == pytest.approx(2.0)
+    assert student.step0_scale.grad is not None
+    assert student.step0_scale.grad.abs().item() > 0.0
+    assert student.step1_scale.grad is not None
+    assert student.step1_scale.grad.abs().item() > 0.0
+
+
+def test_monitor_qwen_image_rollout_no_grad_writes_summary(tmp_path: Path) -> None:
+    tuple_paths = [tmp_path / "tuples" / f"tuple_{index}.pt" for index in range(2)]
+    samples = []
+    for index, tuple_path in enumerate(tuple_paths):
+        _write_tuple(
+            tuple_path,
+            timestep_index=index,
+            timestep_bin="late",
+            timestep=torch.tensor([float(index)], dtype=torch.bfloat16),
+            hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            target_output=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+            encoder_hidden_states=torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            latent_before_step=torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            latent_after_step=torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+        )
+        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    output_json = tmp_path / "rollout_monitor" / "summary.json"
+    records_jsonl = tmp_path / "rollout_monitor" / "records.jsonl"
+
+    summary = monitor_qwen_image_rollout_no_grad(
+        _IndexedRolloutTransformer(),
+        samples,
+        scheduler_step_fn=_rollout_scheduler_step,
+        output_json=output_json,
+        records_jsonl=records_jsonl,
+        device="cpu",
+        config=QwenImageRolloutLossConfig(
+            rollout_k=2,
+            lambda_output_mse=1.0,
+            lambda_dir=0.0,
+            lambda_latent=0.0,
+            lambda_anchor=0.0,
+        ),
+        teacher_forward_fn=lambda latent, sample: latent
+        if sample.timestep_index == 0
+        else torch.zeros_like(latent),
+        provenance={"mode": "unit"},
+    )
+
+    assert output_json.is_file()
+    assert records_jsonl.is_file()
+    assert summary["format"] == "qwen_image_mxfp8_qat_rollout_monitor_v1"
+    assert summary["metrics_summary"]["rollout_steps"] == pytest.approx(2.0)
+    assert summary["provenance"] == {"mode": "unit"}
+    records = [
+        json.loads(line) for line in records_jsonl.read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert [record["rollout_index"] for record in records] == [0, 1]
 
 
 def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:
