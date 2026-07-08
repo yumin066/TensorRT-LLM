@@ -1210,6 +1210,25 @@ def _selected_records_from_tuple_entries(
     return [record for record in records if _expect_string(record, "prompt_id") in prompt_ids]
 
 
+def _is_formal_closed_set_manifest(records: list[dict[str, object]]) -> bool:
+    return any(_is_formal_closed_set_prompt(record) for record in records)
+
+
+def _validate_formal_tuple_prompt_ids(
+    records: list[dict[str, object]],
+    tuple_entries: list[dict[str, object]],
+) -> None:
+    manifest_prompt_ids = {_expect_string(record, "prompt_id") for record in records}
+    tuple_prompt_ids = {_expect_string(entry, "prompt_id") for entry in tuple_entries}
+    missing_prompt_ids = sorted(manifest_prompt_ids - tuple_prompt_ids)
+    extra_prompt_ids = sorted(tuple_prompt_ids - manifest_prompt_ids)
+    if missing_prompt_ids or extra_prompt_ids:
+        raise ValueError(
+            "formal closed-set tuple prompt ids must exactly match the target manifest "
+            f"prompt ids; missing={missing_prompt_ids}, extra={extra_prompt_ids}"
+        )
+
+
 def _expected_tuple_keys(
     records_by_prompt: dict[str, dict[str, object]],
 ) -> set[tuple[str, int, str]]:
@@ -1361,7 +1380,11 @@ def _generate_rollout_metadata_command(args: argparse.Namespace) -> None:
     records = read_rollout_metadata_prompt_jsonl(Path(args.prompt_manifest_jsonl))
     capture_summary = read_json(Path(args.capture_summary_json))
     tuple_entries = read_tuple_index_jsonl(Path(args.tuple_index_jsonl))
-    selected_records = _selected_records_from_tuple_entries(records, tuple_entries)
+    if _is_formal_closed_set_manifest(records):
+        _validate_formal_tuple_prompt_ids(records, tuple_entries)
+        selected_records = records
+    else:
+        selected_records = _selected_records_from_tuple_entries(records, tuple_entries)
     provenance = build_rollout_metadata_runtime_provenance(
         args,
         capture_summary=capture_summary,

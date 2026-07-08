@@ -708,6 +708,58 @@ def test_rollout_metadata_prompt_manifest_rejects_wrong_formal_prompt_count(
         teacher_capture.read_rollout_metadata_prompt_jsonl(prompt_manifest)
 
 
+def test_generate_rollout_metadata_cli_rejects_incomplete_formal_prompt_set(
+    tmp_path: Path,
+) -> None:
+    prompt_manifest = tmp_path / "closed_set_targets.jsonl"
+    capture_summary_json = tmp_path / "capture_summary.json"
+    tuple_index_jsonl = tmp_path / "tuple_index.jsonl"
+    _write_formal_closed_set_manifest(prompt_manifest)
+    write_json(
+        capture_summary_json,
+        _rollout_metadata_capture_summary(tmp_path, num_steps=50),
+    )
+
+    tuple_entries = []
+    for index in range(31):
+        tuple_path = tmp_path / "tuples" / f"prompt{index:04d}_cond.pt"
+        entry = _torch_tuple_entry(tuple_path, branch="cond")
+        entry["prompt_id"] = f"qwen_image_formal_{index:04d}"
+        entry["tuple_id"] = f"qwen_image_formal_{index:04d}_step000_cond"
+        entry["reference_image_path"] = f"/durable/references/qwen_image_formal_{index:04d}.png"
+        tuple_entries.append(entry)
+    write_jsonl(tuple_index_jsonl, tuple_entries)
+
+    with pytest.raises(ValueError, match="formal closed-set tuple prompt ids"):
+        teacher_capture.main(
+            [
+                "generate-rollout-metadata",
+                "--prompt-manifest-jsonl",
+                str(prompt_manifest),
+                "--capture-summary-json",
+                str(capture_summary_json),
+                "--tuple-index-jsonl",
+                str(tuple_index_jsonl),
+                "--output-metadata-root",
+                str(tmp_path / "rollout_metadata"),
+                "--output-metadata-jsonl",
+                str(tmp_path / "rollout_metadata.jsonl"),
+                "--summary-json",
+                str(tmp_path / "rollout_metadata_summary.json"),
+                "--closed-set-target-manifest",
+                str(prompt_manifest),
+                "--model-snapshot-path",
+                "/durable/Qwen-Image",
+                "--allocation-id",
+                "alloc-unit",
+                "--node-list",
+                "pool0-unit",
+                "--command",
+                "ssh-gw task submit alloc --enroot rc20 -- python generate-rollout-metadata",
+            ]
+        )
+
+
 def test_generate_rollout_metadata_cli_writes_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
