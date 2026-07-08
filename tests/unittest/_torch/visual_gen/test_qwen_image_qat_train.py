@@ -1137,6 +1137,37 @@ def test_load_rollout_qat_config_requires_diagnostic_for_non_840(tmp_path: Path)
     assert config.diagnostic_only is True
 
 
+def test_formal_rollout_defaults_match_prepare_target_count(tmp_path: Path) -> None:
+    config_path = tmp_path / "rollout_qat.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "tuple_index_jsonl": str(tmp_path / "rollout.jsonl"),
+                "output_dir": str(tmp_path / "out"),
+                "max_steps": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_qwen_image_rollout_qat_config(config_path)
+    model = _TinyQwenTransformer(num_layers=60)
+
+    injections = prepare_qwen_image_qat_model(
+        model,
+        target_layers=config.target_layers,
+        lora_rank=1,
+        lora_alpha=1.0,
+        lora_dropout=0.0,
+        expected_num_layers=config.expected_num_layers,
+        expected_target_count=config.expected_target_count,
+        linear_cls=nn.Linear,
+    )
+
+    assert config.expected_num_layers == 60
+    assert config.expected_target_count == 840
+    assert len(injections) == 840
+
+
 def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:
     tuple_index = tmp_path / "index.jsonl"
     output_dir = tmp_path / "probe"

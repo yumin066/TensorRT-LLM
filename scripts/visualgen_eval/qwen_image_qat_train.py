@@ -108,6 +108,9 @@ ROLLOUT_QAT_SUMMARY_FORMAT = "qwen_image_closed_set_rollout_qat_summary_v1"
 ROLLOUT_TUPLE_SCHEMA_VERSION = "qwen_image_closed_set_rollout_tuple_v1"
 ROLLOUT_SCHEDULER_STEP_IMPLEMENTATION = "qwen_image_flowmatch_euler_sigma_delta_v1"
 FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT = 60
+FORMAL_QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT = (
+    FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT * QWEN_IMAGE_BLOCK_LINEAR_COUNT
+)
 SUPPORTED_ROLLOUT_SCHEDULER_NAMES = frozenset(
     {
         "flowmatcheulerdiscrete",
@@ -349,7 +352,7 @@ class QwenImageRolloutQatTrainingConfig:
     lora_alpha: float = 128.0
     lora_dropout: float = 0.0
     expected_num_layers: int | None = FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT
-    expected_target_count: int | None = QWEN_IMAGE_BLOCK_LINEAR_COUNT
+    expected_target_count: int | None = FORMAL_QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT
     diagnostic_only: bool = False
     loss: QwenImageRolloutLossConfig = field(default_factory=QwenImageRolloutLossConfig)
     log_interval_steps: int = 1
@@ -1575,7 +1578,12 @@ def load_qwen_image_rollout_qat_config(
         expected_num_layers=int(
             data.get("expected_num_layers", FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT)
         ),
-        expected_target_count=int(data.get("expected_target_count", QWEN_IMAGE_BLOCK_LINEAR_COUNT)),
+        expected_target_count=int(
+            data.get(
+                "expected_target_count",
+                FORMAL_QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT,
+            )
+        ),
         diagnostic_only=bool(data.get("diagnostic_only", False)),
         loss=loss,
         log_interval_steps=int(data.get("log_interval_steps", 1)),
@@ -3657,12 +3665,13 @@ def _validate_rollout_training_config(config: QwenImageRolloutQatTrainingConfig)
     expected_target_count = _optional_int(config.expected_target_count)
     if (
         expected_num_layers != FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT
-        or expected_target_count != QWEN_IMAGE_BLOCK_LINEAR_COUNT
+        or expected_target_count != FORMAL_QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT
     ) and not config.diagnostic_only:
         raise ValueError(
             "closed-set rollout QAT formal runs must target all "
             f"{FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT} layers and "
-            f"{QWEN_IMAGE_BLOCK_LINEAR_COUNT} block Linears; set diagnostic_only=true "
+            f"{FORMAL_QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT} block Linears; "
+            "set diagnostic_only=true "
             "for explicit tiny/partial test runs"
         )
     _validate_rollout_loss_config(config.loss)
