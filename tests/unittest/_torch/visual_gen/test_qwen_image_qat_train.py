@@ -1111,6 +1111,7 @@ def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> N
     assert config.teacher_target_mode == "on_policy"
     assert config.loss.rollout_k == 4
     assert config.loss.timestep_weights["late"] == pytest.approx(8.0)
+    assert config.loss.student_activation_checkpoint is False
     assert config.checkpoint_interval_steps == 250
 
 
@@ -1544,6 +1545,7 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
             loss=QwenImageRolloutLossConfig(
                 rollout_k=1,
                 cfg_normalize=False,
+                student_activation_checkpoint=True,
             ),
             checkpoint_name="rollout_last.pt",
             checkpoint_interval_steps=1,
@@ -1571,6 +1573,7 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
     assert checkpoint["config"]["teacher_target_mode"] == "captured_tuple"
     assert checkpoint["config"]["checkpoint_interval_steps"] == 1
     assert checkpoint["config"]["loss"]["timestep_weights"]["late"] == pytest.approx(8.0)
+    assert checkpoint["config"]["loss"]["student_activation_checkpoint"] is True
     step_checkpoint = result.output_dir / "rollout_last_step0001.pt"
     assert step_checkpoint.exists()
     assert torch.load(step_checkpoint, map_location="cpu", weights_only=True)["train_steps"] == 1

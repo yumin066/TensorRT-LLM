@@ -31,6 +31,7 @@ from typing import Any, Callable, Mapping, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from scripts.visualgen_eval.qwen_image_capture_manifest import (
     BF16_TEACHER_TRAJECTORY_SOURCE,
@@ -253,6 +254,7 @@ class QwenImageRolloutLossConfig:
     teacher_no_grad: bool = True
     student_latent_detach: bool = False
     cfg_normalize: bool = True
+    student_activation_checkpoint: bool = False
 
 
 @dataclass(frozen=True)
@@ -779,6 +781,7 @@ def _forward_qwen_image_tuple_with_hidden_states(
     device: torch.device | str,
     *,
     hidden_states: torch.Tensor,
+    activation_checkpoint: bool = False,
 ) -> torch.Tensor:
     """Replay one tuple while overriding the latent/hidden state."""
     target_device = torch.device(device)
@@ -793,6 +796,18 @@ def _forward_qwen_image_tuple_with_hidden_states(
     }
     if sample.additional_t_cond is not None:
         forward_kwargs["additional_t_cond"] = sample.additional_t_cond.to(device=target_device)
+    if activation_checkpoint:
+
+        def _forward(checkpoint_hidden_states: torch.Tensor) -> torch.Tensor:
+            checkpoint_kwargs = dict(forward_kwargs)
+            checkpoint_kwargs["hidden_states"] = checkpoint_hidden_states
+            return first_tensor_output(transformer(**checkpoint_kwargs))
+
+        return torch_checkpoint(
+            _forward,
+            forward_kwargs["hidden_states"],
+            use_reentrant=False,
+        )
     output = transformer(**forward_kwargs)
     return first_tensor_output(output)
 
@@ -933,12 +948,14 @@ def compute_qwen_image_rollout_loss(
             step.cond,
             target_device,
             hidden_states=current_latent,
+            activation_checkpoint=loss_config.student_activation_checkpoint,
         )
         negative_student_output = _forward_qwen_image_tuple_with_hidden_states(
             student_transformer,
             step.negative,
             target_device,
             hidden_states=current_latent,
+            activation_checkpoint=loss_config.student_activation_checkpoint,
         )
         teacher_input = current_latent.detach()
         with torch.no_grad():
@@ -1576,6 +1593,7 @@ def load_qwen_image_rollout_qat_config(
         teacher_no_grad=bool(loss_data.get("teacher_no_grad", True)),
         student_latent_detach=bool(loss_data.get("student_latent_detach", False)),
         cfg_normalize=bool(loss_data.get("cfg_normalize", True)),
+        student_activation_checkpoint=bool(loss_data.get("student_activation_checkpoint", False)),
     )
     config = QwenImageRolloutQatTrainingConfig(
         tuple_index_jsonl=_required_config_value(data, "tuple_index_jsonl", config_path),
@@ -3493,6 +3511,7 @@ def _rollout_loss_config_to_dict(config: QwenImageRolloutLossConfig) -> dict[str
         "teacher_no_grad": config.teacher_no_grad,
         "student_latent_detach": config.student_latent_detach,
         "cfg_normalize": config.cfg_normalize,
+        "student_activation_checkpoint": config.student_activation_checkpoint,
     }
 
 
