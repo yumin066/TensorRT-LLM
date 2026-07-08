@@ -57,6 +57,19 @@ CAPTURED_STATUS = "captured"
 ROLLOUT_METADATA_ENTRY_FORMAT = "qwen_image_rollout_metadata_entry_v1"
 ROLLOUT_METADATA_SUMMARY_FORMAT = "qwen_image_rollout_metadata_manifest_summary_v1"
 ROLLOUT_METADATA_DERIVATION_METHOD = "bf16_teacher_tuple_next_latent_or_cfg_scheduler_step_v1"
+CLOSED_SET_TARGET_PROMPT_FORMAT = "qwen_image_closed_set_target_prompt_v1"
+CLOSED_SET_ROLLOUT_RECIPE = "closed_set_rollout_qat_v1"
+CLOSED_SET_PROMPT_COUNTS = (32, 64)
+CLOSED_SET_HEIGHT = 1024
+CLOSED_SET_WIDTH = 1024
+CLOSED_SET_NUM_INFERENCE_STEPS = 50
+SUPPORTED_ROLLOUT_SCHEDULER_NAMES = frozenset(("flowmatcheulerdiscretescheduler", "flowmatcheuler"))
+UNSUPPORTED_ROLLOUT_SCHEDULER_FLAGS = (
+    "per_token_sigmas",
+    "per_token_timesteps",
+    "stochastic_sampling",
+    "use_stochastic_sampling",
+)
 BF16_TENSOR_FIELDS = (
     "hidden_states",
     "timestep",
@@ -555,6 +568,7 @@ def write_rollout_metadata_from_captured_tuples(
 
     records_by_prompt = {_expect_string(record, "prompt_id"): record for record in records}
     grouped_entries = _group_rollout_tuple_entries(tuple_entries)
+    _validate_rollout_tuple_completeness(records_by_prompt, grouped_entries)
     scheduler = _rollout_scheduler_spec(capture_summary)
     scheduler_config_signature = _stable_hash(scheduler["scheduler_config"])
     sigmas = scheduler["sigmas"]
@@ -715,6 +729,34 @@ def _group_rollout_tuple_entries(
     return grouped
 
 
+def _validate_rollout_tuple_completeness(
+    records_by_prompt: dict[str, dict[str, object]],
+    grouped_entries: dict[tuple[str, int], dict[str, dict[str, object]]],
+) -> None:
+    observed_keys: set[tuple[str, int, str]] = set()
+    for (prompt_id, timestep_index), branch_entries in grouped_entries.items():
+        if prompt_id not in records_by_prompt:
+            raise ValueError(f"rollout metadata tuple references unknown prompt_id {prompt_id}")
+        record = records_by_prompt[prompt_id]
+        num_steps = _expect_positive_int(record, "num_inference_steps")
+        if timestep_index >= num_steps:
+            raise ValueError(
+                f"rollout metadata tuple timestep exceeds prompt num_inference_steps: "
+                f"{prompt_id} timestep {timestep_index}"
+            )
+        for branch_name in branch_entries:
+            observed_keys.add((prompt_id, timestep_index, branch_name))
+
+    expected_keys = _expected_tuple_keys(records_by_prompt)
+    missing_keys = expected_keys - observed_keys
+    extra_keys = observed_keys - expected_keys
+    if missing_keys or extra_keys:
+        raise ValueError(
+            "rollout metadata tuple key coverage does not match selected prompt records: "
+            f"missing={sorted(missing_keys)}, extra={sorted(extra_keys)}"
+        )
+
+
 def _next_latent_before_from_captured_tuple(
     grouped_entries: dict[tuple[str, int], dict[str, dict[str, object]]],
     *,
@@ -738,13 +780,39 @@ def _rollout_scheduler_spec(capture_summary: dict[str, object]) -> dict[str, obj
     scheduler_provenance = _capture_scheduler_provenance(capture_summary)
     scheduler_config = _expect_mapping(scheduler_provenance, "scheduler_config")
     scheduler_class = _expect_string(scheduler_provenance, "scheduler_class")
+    scheduler_name = _rollout_scheduler_identifier(scheduler_class)
+    if scheduler_name not in SUPPORTED_ROLLOUT_SCHEDULER_NAMES:
+        raise ValueError(
+            "rollout metadata supports only FlowMatch/Euler scheduler metadata, "
+            f"got {scheduler_class}"
+        )
+    unsupported_flags = [
+        flag_name
+        for flag_name in UNSUPPORTED_ROLLOUT_SCHEDULER_FLAGS
+        if scheduler_provenance.get(flag_name) is True or scheduler_config.get(flag_name) is True
+    ]
+    if unsupported_flags:
+        raise ValueError(
+            "rollout metadata does not support stochastic/per-token scheduler modes "
+            f"{unsupported_flags}"
+        )
     num_train_timesteps = int(scheduler_config.get("num_train_timesteps", 1000))
     timesteps = _expect_number_list(scheduler_provenance, "timesteps")
     if len(timesteps) != _expect_positive_int(capture_summary, "num_inference_steps"):
         raise ValueError("scheduler timesteps length must match num_inference_steps")
-    sigmas = [float(timestep) / float(num_train_timesteps) for timestep in timesteps]
+    sigmas_source = "timesteps_div_num_train_timesteps_fallback"
+    raw_sigmas = scheduler_provenance.get("sigmas")
+    if raw_sigmas is not None:
+        sigmas = _expect_number_list(scheduler_provenance, "sigmas")
+        sigmas_source = "captured_scheduler_sigmas"
+    else:
+        sigmas = [float(timestep) / float(num_train_timesteps) for timestep in timesteps]
     if not sigmas:
         raise ValueError("scheduler timesteps must not be empty")
+    if len(sigmas) not in (len(timesteps), len(timesteps) + 1):
+        raise ValueError(
+            "scheduler sigmas length must match timesteps length or include one terminal sigma"
+        )
     if any(left < right for left, right in zip(sigmas, sigmas[1:])):
         raise ValueError("scheduler sigmas must be monotonically non-increasing")
     return {
@@ -753,7 +821,12 @@ def _rollout_scheduler_spec(capture_summary: dict[str, object]) -> dict[str, obj
         "num_train_timesteps": num_train_timesteps,
         "timesteps": timesteps,
         "sigmas": sigmas,
+        "sigmas_source": sigmas_source,
     }
+
+
+def _rollout_scheduler_identifier(scheduler_class: str) -> str:
+    return "".join(ch for ch in scheduler_class.lower() if ch.isalnum())
 
 
 def _capture_scheduler_provenance(capture_summary: dict[str, object]) -> dict[str, object]:
@@ -779,8 +852,8 @@ def _rollout_scheduler_state_for_step(
     sigmas = scheduler["sigmas"]
     if not isinstance(timesteps, list) or not isinstance(sigmas, list):
         raise ValueError("scheduler spec timesteps/sigmas must be lists")
-    if timestep_index >= len(sigmas):
-        raise ValueError(f"timestep_index exceeds scheduler sigmas: {timestep_index}")
+    if timestep_index >= len(timesteps) or timestep_index >= len(sigmas):
+        raise ValueError(f"timestep_index exceeds scheduler spec: {timestep_index}")
     sigma = float(sigmas[timestep_index])
     next_sigma = float(sigmas[timestep_index + 1]) if timestep_index + 1 < len(sigmas) else 0.0
     return {
@@ -788,13 +861,14 @@ def _rollout_scheduler_state_for_step(
         "timestep": float(timesteps[timestep_index]),
         "step_index": timestep_index,
         "timestep_index": timestep_index,
-        "num_inference_steps": len(sigmas),
+        "num_inference_steps": len(timesteps),
         "num_train_timesteps": int(scheduler["num_train_timesteps"]),
         "sigma": sigma,
         "next_sigma": next_sigma,
         "sigma_next": next_sigma,
         "sigma_delta": next_sigma - sigma,
         "dt": next_sigma - sigma,
+        "sigmas_source": str(scheduler["sigmas_source"]),
         "order": 1,
         "begin_index": 0,
         "scheduler_config_signature": scheduler_config_signature,
@@ -885,6 +959,7 @@ def _build_rollout_metadata_summary(
         "summary_json": str(summary_json) if summary_json is not None else None,
         "scheduler_config_signature": scheduler_config_signature,
         "sigmas_hash": sigmas_hash,
+        "sigmas_source": _rollout_scheduler_spec(capture_summary)["sigmas_source"],
         "runtime_provenance": dict(runtime_provenance),
         "record_prompt_count": len(records),
     }
@@ -1013,10 +1088,12 @@ def collect_scheduler_provenance(pipeline: Any) -> dict[str, object]:
         return {}
     config = getattr(scheduler, "config", {})
     timesteps = getattr(scheduler, "timesteps", None)
+    sigmas = getattr(scheduler, "sigmas", None)
     return {
         "scheduler_class": scheduler.__class__.__name__,
         "scheduler_config": _jsonable(config),
         "timesteps": _jsonable(timesteps),
+        "sigmas": _jsonable(sigmas),
     }
 
 
@@ -1284,12 +1361,13 @@ def _generate_rollout_metadata_command(args: argparse.Namespace) -> None:
     records = read_rollout_metadata_prompt_jsonl(Path(args.prompt_manifest_jsonl))
     capture_summary = read_json(Path(args.capture_summary_json))
     tuple_entries = read_tuple_index_jsonl(Path(args.tuple_index_jsonl))
+    selected_records = _selected_records_from_tuple_entries(records, tuple_entries)
     provenance = build_rollout_metadata_runtime_provenance(
         args,
         capture_summary=capture_summary,
     )
     write_rollout_metadata_from_captured_tuples(
-        records=records,
+        records=selected_records,
         capture_summary=capture_summary,
         tuple_entries=tuple_entries,
         output_metadata_root=Path(args.output_metadata_root),
@@ -1297,6 +1375,118 @@ def _generate_rollout_metadata_command(args: argparse.Namespace) -> None:
         summary_json=Path(args.summary_json),
         provenance=provenance,
     )
+
+
+def _validate_rollout_prompt_record(record: dict[str, object]) -> None:
+    prompt_id = _expect_string(record, "prompt_id")
+    for field_name in ("prompt", "negative_prompt", "source"):
+        _expect_string(record, field_name)
+    if not (
+        isinstance(record.get("split"), str)
+        or isinstance(record.get("source_split"), str)
+        or isinstance(record.get("closed_set_split"), str)
+    ):
+        raise ValueError(f"rollout metadata prompt {prompt_id} requires split/source_split")
+
+    seed = record.get("seed")
+    if not isinstance(seed, int) or seed < 0:
+        raise ValueError(f"rollout metadata prompt {prompt_id} seed must be a non-negative integer")
+    height = _expect_positive_int(record, "height")
+    width = _expect_positive_int(record, "width")
+    num_steps = _expect_positive_int(record, "num_inference_steps")
+    guidance_scale = float(_expect_number(record, "guidance_scale"))
+    if guidance_scale <= 0.0:
+        raise ValueError(f"rollout metadata prompt {prompt_id} guidance_scale must be positive")
+    cfg_branches = _expect_string_list(record, "cfg_branches")
+    if tuple(cfg_branches) != tuple(DEFAULT_CFG_BRANCHES):
+        raise ValueError(
+            f"rollout metadata prompt {prompt_id} cfg_branches must be {list(DEFAULT_CFG_BRANCHES)}"
+        )
+    expected_tuple_count = record.get("expected_tuple_count")
+    if expected_tuple_count is not None and expected_tuple_count != num_steps * len(cfg_branches):
+        raise ValueError(
+            f"rollout metadata prompt {prompt_id} expected_tuple_count must equal "
+            "num_inference_steps x cfg_branch_count"
+        )
+    if height <= 0 or width <= 0:
+        raise ValueError(f"rollout metadata prompt {prompt_id} resolution must be positive")
+
+
+def _validate_formal_closed_set_prompt_records(records: list[dict[str, object]]) -> None:
+    formal_records = [record for record in records if _is_formal_closed_set_prompt(record)]
+    if not formal_records:
+        return
+    if len(formal_records) != len(records):
+        raise ValueError("formal closed-set target prompt manifests must not mix record formats")
+    if len(records) not in CLOSED_SET_PROMPT_COUNTS:
+        raise ValueError("formal closed-set target prompt manifest must contain 32 or 64 prompts")
+    for record in records:
+        _validate_formal_closed_set_prompt_record(record)
+
+
+def _is_formal_closed_set_prompt(record: dict[str, object]) -> bool:
+    return (
+        record.get("format") == CLOSED_SET_TARGET_PROMPT_FORMAT
+        or record.get("recipe") == CLOSED_SET_ROLLOUT_RECIPE
+    )
+
+
+def _validate_formal_closed_set_prompt_record(record: dict[str, object]) -> None:
+    prompt_id = _expect_string(record, "prompt_id")
+    if record.get("format") != CLOSED_SET_TARGET_PROMPT_FORMAT:
+        raise ValueError(
+            f"closed-set target prompt {prompt_id} format must be {CLOSED_SET_TARGET_PROMPT_FORMAT}"
+        )
+    if record.get("recipe") != CLOSED_SET_ROLLOUT_RECIPE:
+        raise ValueError(
+            f"closed-set target prompt {prompt_id} recipe must be {CLOSED_SET_ROLLOUT_RECIPE}"
+        )
+    if _expect_positive_int(record, "height") != CLOSED_SET_HEIGHT:
+        raise ValueError(f"closed-set target prompt {prompt_id} height must be {CLOSED_SET_HEIGHT}")
+    if _expect_positive_int(record, "width") != CLOSED_SET_WIDTH:
+        raise ValueError(f"closed-set target prompt {prompt_id} width must be {CLOSED_SET_WIDTH}")
+    if _expect_positive_int(record, "num_inference_steps") != CLOSED_SET_NUM_INFERENCE_STEPS:
+        raise ValueError(
+            f"closed-set target prompt {prompt_id} num_inference_steps must be "
+            f"{CLOSED_SET_NUM_INFERENCE_STEPS}"
+        )
+    if record.get("expected_tuple_count") != (
+        CLOSED_SET_NUM_INFERENCE_STEPS * len(DEFAULT_CFG_BRANCHES)
+    ):
+        raise ValueError(f"closed-set target prompt {prompt_id} expected_tuple_count must be 100")
+    for field_name in (
+        "source_split",
+        "selection_reason",
+        "bf16_reference_image",
+        "original_dynamic_mxfp8_image",
+        "non_generalization_statement",
+    ):
+        _expect_string(record, field_name)
+    for field_name in (
+        "original_dynamic_mxfp8_psnr",
+        "original_dynamic_mxfp8_ssim",
+        "original_dynamic_mxfp8_mse",
+    ):
+        _expect_number(record, field_name)
+    for field_name in ("teacher_attention_backend", "evaluation_attention_backend"):
+        _validate_sage_attention_field(record, field_name)
+    if record.get("all_target_prompts_used_for_training") is not True:
+        raise ValueError(
+            f"closed-set target prompt {prompt_id} must be marked for closed-set training"
+        )
+    if record.get("all_target_prompts_used_for_final_validation") is not True:
+        raise ValueError(
+            f"closed-set target prompt {prompt_id} must be marked for final validation"
+        )
+
+
+def _validate_sage_attention_field(record: dict[str, object], field_name: str) -> None:
+    prompt_id = _expect_string(record, "prompt_id")
+    normalized = "".join(ch for ch in _expect_string(record, field_name).lower() if ch.isalnum())
+    if normalized not in ("sageattentionfp8", "trtllmfp8"):
+        raise ValueError(
+            f"closed-set target prompt {prompt_id} {field_name} must use SageAttention FP8"
+        )
 
 
 def read_rollout_metadata_prompt_jsonl(path: Path) -> list[dict[str, object]]:
@@ -1315,21 +1505,11 @@ def read_rollout_metadata_prompt_jsonl(path: Path) -> list[dict[str, object]]:
                 f"duplicate prompt_id in rollout metadata prompt manifest: {prompt_id}"
             )
         prompt_ids.add(prompt_id)
-        for field_name in (
-            "seed",
-            "height",
-            "width",
-            "num_inference_steps",
-            "guidance_scale",
-        ):
-            if record.get(field_name) is None:
-                raise ValueError(
-                    "rollout metadata prompt manifest missing required field "
-                    f"{field_name} for prompt_id {prompt_id}"
-                )
+        _validate_rollout_prompt_record(record)
         records.append(record)
     if not records:
         raise ValueError(f"rollout metadata prompt manifest is empty: {path}")
+    _validate_formal_closed_set_prompt_records(records)
     return records
 
 

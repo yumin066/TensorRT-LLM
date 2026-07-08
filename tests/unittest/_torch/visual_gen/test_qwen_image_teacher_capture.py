@@ -96,6 +96,7 @@ class DummyTransformer:
 class DummyScheduler:
     config = {"name": "dummy-flow-match"}
     timesteps = [1000, 500]
+    sigmas = [1.0, 0.5, 0.0]
 
 
 class DummyPipeline:
@@ -230,7 +231,7 @@ def _torch_tuple_entry(path: Path, *, branch: str, timestep_index: int = 0) -> d
     }
 
 
-def _rollout_metadata_record() -> dict[str, object]:
+def _rollout_metadata_record(*, num_steps: int = 1) -> dict[str, object]:
     return {
         "prompt_id": "qwen_image_closed_0000",
         "split": "closed_set_train_eval",
@@ -241,35 +242,46 @@ def _rollout_metadata_record() -> dict[str, object]:
         "seed": 123,
         "height": 1024,
         "width": 1024,
-        "num_inference_steps": 2,
+        "num_inference_steps": num_steps,
         "guidance_scale": 4.0,
         "max_sequence_length": 512,
         "model": "Qwen/Qwen-Image",
         "cfg_branches": ["cond", "negative"],
-        "expected_tuple_count": 4,
+        "expected_tuple_count": num_steps * 2,
     }
 
 
-def _rollout_metadata_capture_summary(root: Path) -> dict[str, object]:
+def _rollout_metadata_capture_summary(
+    root: Path,
+    *,
+    num_steps: int = 1,
+    timesteps: list[float] | None = None,
+    sigmas: list[float] | None = None,
+    scheduler_class: str = "FlowMatchEulerDiscreteScheduler",
+) -> dict[str, object]:
+    timesteps = timesteps or [1000.0 - 250.0 * index for index in range(num_steps)]
+    scheduler_provenance: dict[str, object] = {
+        "scheduler_class": scheduler_class,
+        "scheduler_config": {
+            "_class_name": scheduler_class,
+            "num_train_timesteps": 1000,
+            "stochastic_sampling": False,
+        },
+        "timesteps": timesteps,
+    }
+    if sigmas is not None:
+        scheduler_provenance["sigmas"] = sigmas
     return {
         "format": "qwen_image_teacher_capture_manifest_v1",
         "capture_status": "captured",
         "task3_input_ready": True,
         "git_head": "capture-git-head",
-        "num_inference_steps": 2,
+        "num_inference_steps": num_steps,
         "durable_paths": {
             "bf16_references": "/durable/references",
             "teacher_tuples": str(root / "tuples"),
         },
-        "scheduler_provenance": {
-            "scheduler_class": "FlowMatchEulerDiscreteScheduler",
-            "scheduler_config": {
-                "_class_name": "FlowMatchEulerDiscreteScheduler",
-                "num_train_timesteps": 1000,
-                "stochastic_sampling": False,
-            },
-            "timesteps": [1000.0, 750.0],
-        },
+        "scheduler_provenance": scheduler_provenance,
         "capture_provenance": {
             "container_runtime": "enroot",
             "enroot_image": DEFAULT_ENROOT_IMAGE,
@@ -298,6 +310,58 @@ def _rollout_metadata_runtime_provenance(
         "scheduler_metadata_source": str(root / "capture_summary.json"),
         "reference_image_root": "/durable/references",
     }
+
+
+def _formal_closed_set_record(index: int = 0) -> dict[str, object]:
+    return {
+        "format": "qwen_image_closed_set_target_prompt_v1",
+        "recipe": "closed_set_rollout_qat_v1",
+        "prompt_id": f"qwen_image_formal_{index:04d}",
+        "prompt": f"formal unit test prompt {index}",
+        "negative_prompt": "bad",
+        "source": "unit_test",
+        "source_split": "fast_calibration",
+        "closed_set_split": "closed_set_train_eval",
+        "categories": ["photorealistic_scene"],
+        "seed": 2026070800 + index,
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "max_sequence_length": 512,
+        "cfg_branches": ["cond", "negative"],
+        "expected_tuple_count": 100,
+        "selection_reason": "lowest original all-layer dynamic MXFP8 RGB PSNR",
+        "original_dynamic_mxfp8_psnr": 12.0 + index * 0.01,
+        "original_dynamic_mxfp8_ssim": 0.4,
+        "original_dynamic_mxfp8_mse": 0.08,
+        "teacher_attention_backend": "SageAttention FP8",
+        "evaluation_attention_backend": "SageAttention FP8",
+        "teacher_linear_precision": "BF16",
+        "student_linear_precision": "all-layer MXFP8",
+        "trajectory_source": "bf16_teacher",
+        "bf16_reference_image": f"/durable/references/qwen_image_formal_{index:04d}.png",
+        "original_dynamic_mxfp8_image": (f"/durable/baselines/qwen_image_formal_{index:04d}.png"),
+        "all_target_prompts_used_for_training": True,
+        "all_target_prompts_used_for_final_validation": True,
+        "non_generalization_statement": "closed-set proof only",
+    }
+
+
+def _write_formal_closed_set_manifest(
+    path: Path,
+    *,
+    override_index: int | None = None,
+    updates: dict[str, object] | None = None,
+    drop_field: str | None = None,
+) -> None:
+    records = [_formal_closed_set_record(index) for index in range(32)]
+    if override_index is not None:
+        if updates:
+            records[override_index].update(updates)
+        if drop_field is not None:
+            records[override_index].pop(drop_field, None)
+    write_jsonl(path, records)
 
 
 def _capture_with_dummy_pipeline(
@@ -414,8 +478,8 @@ def test_rollout_metadata_generation_derives_latent_after_from_teacher_tuples(
     first_record = metadata_records[0]
     assert first_record["format"] == ROLLOUT_METADATA_ENTRY_FORMAT
     assert first_record["scheduler_state"]["sigma"] == pytest.approx(1.0)
-    assert first_record["scheduler_state"]["next_sigma"] == pytest.approx(0.75)
-    assert first_record["scheduler_state"]["sigma_delta"] == pytest.approx(-0.25)
+    assert first_record["scheduler_state"]["next_sigma"] == pytest.approx(0.0)
+    assert first_record["scheduler_state"]["sigma_delta"] == pytest.approx(-1.0)
     assert (
         first_record["rollout_provenance"]["derivation_method"]
         == ROLLOUT_METADATA_DERIVATION_METHOD
@@ -424,7 +488,7 @@ def test_rollout_metadata_generation_derives_latent_after_from_teacher_tuples(
     latent_after = torch.load(first_record["latent_after_step_path"], map_location="cpu")
     assert torch.allclose(
         latent_after.float(),
-        torch.full((1, 1, 2), 0.5),
+        torch.full((1, 1, 2), -1.0),
     )
 
 
@@ -451,8 +515,10 @@ def test_rollout_metadata_generation_prefers_next_step_hidden_states(
             )
 
     metadata_records, _summary = write_rollout_metadata_from_captured_tuples(
-        records=[_rollout_metadata_record()],
-        capture_summary=_rollout_metadata_capture_summary(tmp_path),
+        records=[_rollout_metadata_record(num_steps=2)],
+        capture_summary=_rollout_metadata_capture_summary(
+            tmp_path, num_steps=2, timesteps=[1000.0, 750.0]
+        ),
         tuple_entries=entries,
         output_metadata_root=tmp_path / "rollout_metadata",
         output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
@@ -467,6 +533,179 @@ def test_rollout_metadata_generation_prefers_next_step_hidden_states(
     latent_after = torch.load(step0_cond["latent_after_step_path"], map_location="cpu")
     assert torch.allclose(latent_after.float(), torch.full((1, 1, 2), 7.0))
     assert step0_cond["rollout_provenance"]["latent_after_source"] == "bf16_next_step_hidden_states"
+
+
+def test_rollout_metadata_generation_prefers_captured_sigmas(
+    tmp_path: Path,
+) -> None:
+    entries = []
+    for timestep_index, hidden_value in ((0, 1.0), (1, 7.0)):
+        for branch, target_value in (("cond", 2.0), ("negative", 0.0)):
+            tuple_path = tmp_path / "tuples" / f"sigma_step{timestep_index}_{branch}.pt"
+            _write_torch_teacher_tuple(
+                tuple_path,
+                branch=branch,
+                target_value=target_value,
+                timestep_index=timestep_index,
+                hidden_value=hidden_value,
+            )
+            entries.append(
+                _torch_tuple_entry(
+                    tuple_path,
+                    branch=branch,
+                    timestep_index=timestep_index,
+                )
+            )
+
+    metadata_records, summary = write_rollout_metadata_from_captured_tuples(
+        records=[_rollout_metadata_record(num_steps=2)],
+        capture_summary=_rollout_metadata_capture_summary(
+            tmp_path,
+            num_steps=2,
+            timesteps=[1000.0, 750.0],
+            sigmas=[0.9, 0.4, 0.0],
+        ),
+        tuple_entries=entries,
+        output_metadata_root=tmp_path / "rollout_metadata",
+        output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
+        provenance=_rollout_metadata_runtime_provenance(root=tmp_path),
+    )
+
+    step0_cond = next(
+        record
+        for record in metadata_records
+        if record["timestep_index"] == 0 and record["cfg_branch"] == "cond"
+    )
+    assert step0_cond["scheduler_state"]["sigma"] == pytest.approx(0.9)
+    assert step0_cond["scheduler_state"]["next_sigma"] == pytest.approx(0.4)
+    assert step0_cond["scheduler_state"]["sigmas_source"] == "captured_scheduler_sigmas"
+    assert summary["sigmas_source"] == "captured_scheduler_sigmas"
+
+
+def test_rollout_metadata_generation_rejects_missing_prompt_step(tmp_path: Path) -> None:
+    cond_path = tmp_path / "tuples" / "cond.pt"
+    negative_path = tmp_path / "tuples" / "negative.pt"
+    _write_torch_teacher_tuple(cond_path, branch="cond", target_value=2.0)
+    _write_torch_teacher_tuple(negative_path, branch="negative", target_value=0.0)
+
+    with pytest.raises(ValueError, match="missing"):
+        write_rollout_metadata_from_captured_tuples(
+            records=[_rollout_metadata_record(num_steps=2)],
+            capture_summary=_rollout_metadata_capture_summary(
+                tmp_path, num_steps=2, timesteps=[1000.0, 750.0]
+            ),
+            tuple_entries=[
+                _torch_tuple_entry(cond_path, branch="cond"),
+                _torch_tuple_entry(negative_path, branch="negative"),
+            ],
+            output_metadata_root=tmp_path / "rollout_metadata",
+            output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
+            provenance=_rollout_metadata_runtime_provenance(root=tmp_path),
+        )
+
+
+def test_rollout_metadata_generation_rejects_missing_cfg_branch(tmp_path: Path) -> None:
+    cond_path = tmp_path / "tuples" / "cond.pt"
+    _write_torch_teacher_tuple(cond_path, branch="cond", target_value=2.0)
+
+    with pytest.raises(ValueError, match="missing"):
+        write_rollout_metadata_from_captured_tuples(
+            records=[_rollout_metadata_record()],
+            capture_summary=_rollout_metadata_capture_summary(tmp_path),
+            tuple_entries=[_torch_tuple_entry(cond_path, branch="cond")],
+            output_metadata_root=tmp_path / "rollout_metadata",
+            output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
+            provenance=_rollout_metadata_runtime_provenance(root=tmp_path),
+        )
+
+
+def test_rollout_metadata_generation_rejects_unknown_prompt_tuple(tmp_path: Path) -> None:
+    cond_path = tmp_path / "tuples" / "cond.pt"
+    _write_torch_teacher_tuple(cond_path, branch="cond", target_value=2.0)
+    entry = _torch_tuple_entry(cond_path, branch="cond")
+    entry["prompt_id"] = "qwen_image_closed_unknown"
+
+    with pytest.raises(ValueError, match="unknown prompt_id"):
+        write_rollout_metadata_from_captured_tuples(
+            records=[_rollout_metadata_record()],
+            capture_summary=_rollout_metadata_capture_summary(tmp_path),
+            tuple_entries=[entry],
+            output_metadata_root=tmp_path / "rollout_metadata",
+            output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
+            provenance=_rollout_metadata_runtime_provenance(root=tmp_path),
+        )
+
+
+def test_rollout_metadata_generation_rejects_unsupported_scheduler(
+    tmp_path: Path,
+) -> None:
+    cond_path = tmp_path / "tuples" / "cond.pt"
+    negative_path = tmp_path / "tuples" / "negative.pt"
+    _write_torch_teacher_tuple(cond_path, branch="cond", target_value=2.0)
+    _write_torch_teacher_tuple(negative_path, branch="negative", target_value=0.0)
+
+    with pytest.raises(ValueError, match="supports only FlowMatch/Euler"):
+        write_rollout_metadata_from_captured_tuples(
+            records=[_rollout_metadata_record()],
+            capture_summary=_rollout_metadata_capture_summary(
+                tmp_path, scheduler_class="DDIMScheduler"
+            ),
+            tuple_entries=[
+                _torch_tuple_entry(cond_path, branch="cond"),
+                _torch_tuple_entry(negative_path, branch="negative"),
+            ],
+            output_metadata_root=tmp_path / "rollout_metadata",
+            output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
+            provenance=_rollout_metadata_runtime_provenance(root=tmp_path),
+        )
+
+
+def test_rollout_metadata_prompt_manifest_rejects_missing_formal_baseline_psnr(
+    tmp_path: Path,
+) -> None:
+    prompt_manifest = tmp_path / "closed_set_targets.jsonl"
+    _write_formal_closed_set_manifest(
+        prompt_manifest,
+        override_index=0,
+        drop_field="original_dynamic_mxfp8_psnr",
+    )
+
+    with pytest.raises(ValueError, match="original_dynamic_mxfp8_psnr"):
+        teacher_capture.read_rollout_metadata_prompt_jsonl(prompt_manifest)
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"height": 768}, "height must be 1024"),
+        ({"num_inference_steps": 40, "expected_tuple_count": 80}, "num_inference_steps"),
+        ({"teacher_attention_backend": "VANILLA"}, "teacher_attention_backend"),
+    ],
+)
+def test_rollout_metadata_prompt_manifest_rejects_wrong_formal_values(
+    tmp_path: Path,
+    updates: dict[str, object],
+    match: str,
+) -> None:
+    prompt_manifest = tmp_path / "closed_set_targets.jsonl"
+    _write_formal_closed_set_manifest(
+        prompt_manifest,
+        override_index=0,
+        updates=updates,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        teacher_capture.read_rollout_metadata_prompt_jsonl(prompt_manifest)
+
+
+def test_rollout_metadata_prompt_manifest_rejects_wrong_formal_prompt_count(
+    tmp_path: Path,
+) -> None:
+    prompt_manifest = tmp_path / "closed_set_targets.jsonl"
+    write_jsonl(prompt_manifest, [_formal_closed_set_record(index) for index in range(31)])
+
+    with pytest.raises(ValueError, match="32 or 64 prompts"):
+        teacher_capture.read_rollout_metadata_prompt_jsonl(prompt_manifest)
 
 
 def test_generate_rollout_metadata_cli_writes_summary(
