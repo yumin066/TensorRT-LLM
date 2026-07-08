@@ -56,7 +56,7 @@ CAPTURED_TUPLE_STATUS = "captured"
 CAPTURED_STATUS = "captured"
 ROLLOUT_METADATA_ENTRY_FORMAT = "qwen_image_rollout_metadata_entry_v1"
 ROLLOUT_METADATA_SUMMARY_FORMAT = "qwen_image_rollout_metadata_manifest_summary_v1"
-ROLLOUT_METADATA_DERIVATION_METHOD = "bf16_teacher_tuple_cfg_scheduler_step_v1"
+ROLLOUT_METADATA_DERIVATION_METHOD = "bf16_teacher_tuple_next_latent_or_cfg_scheduler_step_v1"
 BF16_TENSOR_FIELDS = (
     "hidden_states",
     "timestep",
@@ -599,10 +599,26 @@ def write_rollout_metadata_from_captured_tuples(
             scheduler_config_signature=scheduler_config_signature,
             sigmas_hash=sigmas_hash,
         )
-        sigma_delta = float(scheduler_state["sigma_delta"])
-        latent_after = (latent_before.float() + guided_output.float() * sigma_delta).to(
-            dtype=latent_before.dtype
+        latent_after_source = "bf16_next_step_hidden_states"
+        latent_after = _next_latent_before_from_captured_tuple(
+            grouped_entries,
+            prompt_id=prompt_id,
+            timestep_index=timestep_index,
+            torch_module=torch_module,
         )
+        if latent_after is None:
+            latent_after_source = "cfg_scheduler_step"
+            sigma_delta = float(scheduler_state["sigma_delta"])
+            latent_after = (latent_before.float() + guided_output.float() * sigma_delta).to(
+                dtype=latent_before.dtype
+            )
+        elif tuple(latent_after.shape) != tuple(latent_before.shape):
+            raise ValueError(
+                "next-step latent shape must match current latent shape for "
+                f"{prompt_id} timestep {timestep_index}"
+            )
+        else:
+            latent_after = latent_after.to(dtype=latent_before.dtype)
 
         step_dir = output_metadata_root / _expect_string(cond_entry, "split") / prompt_id
         step_dir.mkdir(parents=True, exist_ok=True)
@@ -633,6 +649,7 @@ def write_rollout_metadata_from_captured_tuples(
                         scheduler_config_signature=scheduler_config_signature,
                         sigmas_hash=sigmas_hash,
                         reference_image_path=reference_image_path,
+                        latent_after_source=latent_after_source,
                     ),
                     "guidance_scale": guidance_scale,
                     "reference_image_path": reference_image_path,
@@ -696,6 +713,25 @@ def _group_rollout_tuple_entries(
     if not grouped:
         raise ValueError("rollout metadata requires at least one tuple entry")
     return grouped
+
+
+def _next_latent_before_from_captured_tuple(
+    grouped_entries: dict[tuple[str, int], dict[str, dict[str, object]]],
+    *,
+    prompt_id: str,
+    timestep_index: int,
+    torch_module: Any,
+) -> Any | None:
+    next_entries = grouped_entries.get((prompt_id, timestep_index + 1))
+    if next_entries is None:
+        return None
+    cond_entry = next_entries.get("cond")
+    if cond_entry is None:
+        raise ValueError(
+            f"next-step cond tuple missing for {prompt_id} timestep {timestep_index + 1}"
+        )
+    next_payload = _load_and_validate_tuple(cond_entry, torch_module)
+    return _expect_tensor_field(next_payload, "hidden_states", torch_module)
 
 
 def _rollout_scheduler_spec(capture_summary: dict[str, object]) -> dict[str, object]:
@@ -795,6 +831,7 @@ def _build_rollout_metadata_provenance(
     scheduler_config_signature: str,
     sigmas_hash: str,
     reference_image_path: str,
+    latent_after_source: str,
 ) -> dict[str, object]:
     prompt_id = _expect_string(record, "prompt_id")
     return {
@@ -816,6 +853,7 @@ def _build_rollout_metadata_provenance(
         "scheduler_metadata_source": runtime_provenance.get("scheduler_metadata_source"),
         "cfg_normalize": True,
         "scheduler_state_equivalent": False,
+        "latent_after_source": latent_after_source,
     }
 
 

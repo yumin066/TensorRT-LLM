@@ -176,18 +176,20 @@ def _write_torch_teacher_tuple(
     *,
     branch: str,
     target_value: float,
+    timestep_index: int = 0,
+    hidden_value: float = 1.0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "prompt_id": "qwen_image_closed_0000",
             "split": "closed_set_train_eval",
-            "timestep_index": 0,
+            "timestep_index": timestep_index,
             "timestep_bin": "early",
             "cfg_branch": branch,
             "trajectory_source": "bf16_teacher",
             "status": "captured",
-            "hidden_states": torch.ones(1, 1, 2, dtype=torch.bfloat16),
+            "hidden_states": torch.full((1, 1, 2), hidden_value, dtype=torch.bfloat16),
             "timestep": torch.tensor([1.0], dtype=torch.bfloat16),
             "encoder_hidden_states": torch.ones(1, 1, 2, dtype=torch.bfloat16),
             "encoder_hidden_states_mask": torch.tensor([[True]]),
@@ -199,15 +201,15 @@ def _write_torch_teacher_tuple(
     )
 
 
-def _torch_tuple_entry(path: Path, *, branch: str) -> dict[str, object]:
+def _torch_tuple_entry(path: Path, *, branch: str, timestep_index: int = 0) -> dict[str, object]:
     return {
         "format": "qwen_image_teacher_tuple_index_v1",
-        "tuple_id": f"qwen_image_closed_0000_step000_{branch}",
+        "tuple_id": f"qwen_image_closed_0000_step{timestep_index:03d}_{branch}",
         "prompt_id": "qwen_image_closed_0000",
         "split": "closed_set_train_eval",
         "reference_image_path": "/durable/references/qwen_image_closed_0000.png",
         "tuple_path": str(path),
-        "timestep_index": 0,
+        "timestep_index": timestep_index,
         "timestep_bin": "early",
         "cfg_branch": branch,
         "required_fields": [
@@ -424,6 +426,47 @@ def test_rollout_metadata_generation_derives_latent_after_from_teacher_tuples(
         latent_after.float(),
         torch.full((1, 1, 2), 0.5),
     )
+
+
+def test_rollout_metadata_generation_prefers_next_step_hidden_states(
+    tmp_path: Path,
+) -> None:
+    entries = []
+    for timestep_index, hidden_value in ((0, 1.0), (1, 7.0)):
+        for branch, target_value in (("cond", 2.0), ("negative", 0.0)):
+            tuple_path = tmp_path / "tuples" / f"step{timestep_index}_{branch}.pt"
+            _write_torch_teacher_tuple(
+                tuple_path,
+                branch=branch,
+                target_value=target_value,
+                timestep_index=timestep_index,
+                hidden_value=hidden_value,
+            )
+            entries.append(
+                _torch_tuple_entry(
+                    tuple_path,
+                    branch=branch,
+                    timestep_index=timestep_index,
+                )
+            )
+
+    metadata_records, _summary = write_rollout_metadata_from_captured_tuples(
+        records=[_rollout_metadata_record()],
+        capture_summary=_rollout_metadata_capture_summary(tmp_path),
+        tuple_entries=entries,
+        output_metadata_root=tmp_path / "rollout_metadata",
+        output_metadata_jsonl=tmp_path / "rollout_metadata.jsonl",
+        provenance=_rollout_metadata_runtime_provenance(root=tmp_path),
+    )
+
+    step0_cond = next(
+        record
+        for record in metadata_records
+        if record["timestep_index"] == 0 and record["cfg_branch"] == "cond"
+    )
+    latent_after = torch.load(step0_cond["latent_after_step_path"], map_location="cpu")
+    assert torch.allclose(latent_after.float(), torch.full((1, 1, 2), 7.0))
+    assert step0_cond["rollout_provenance"]["latent_after_source"] == "bf16_next_step_hidden_states"
 
 
 def test_generate_rollout_metadata_cli_writes_summary(
