@@ -317,6 +317,28 @@ def _rollout_provenance(**overrides: object) -> dict[str, object]:
     return provenance
 
 
+def _rollout_command_provenance(**overrides: object) -> dict[str, object]:
+    provenance: dict[str, object] = {
+        "cluster_alias": "B300-mars",
+        "allocation_id": "alloc-unit",
+        "job_id": "job-unit",
+        "node_list": "b300-unit-[0-7]",
+        "container_runtime": "enroot",
+        "enroot_image": "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20",
+        "command": "unit rollout command",
+        "model_snapshot_path": "/durable/Qwen-Image",
+        "git_head": "unit_git_head",
+        "teacher_attention_backend": "TRTLLM_FP8",
+        "training_attention_backend": "TRTLLM_FP8",
+        "evaluation_attention_backend": "TRTLLM_FP8",
+        "closed_set_target_manifest": "/durable/closed_set_targets.jsonl",
+        "scheduler_metadata_source": "/durable/scheduler_metadata.jsonl",
+        "reference_image_root": "/durable/bf16_reference",
+    }
+    provenance.update(overrides)
+    return provenance
+
+
 def _rollout_metadata(
     *,
     timestep_index: int,
@@ -639,6 +661,39 @@ def test_qwen_image_rollout_scheduler_step_rejects_missing_delta(tmp_path: Path)
         )
 
 
+def test_qwen_image_rollout_scheduler_step_rejects_unsupported_scheduler(
+    tmp_path: Path,
+) -> None:
+    samples = []
+    for branch in ("cond", "negative"):
+        tuple_path = tmp_path / "tuples" / f"tuple_0_{branch}.pt"
+        fields = _rollout_tuple_fields(branch=branch, timestep_index=0)
+        fields["scheduler_state"] = {
+            "scheduler_class": "DDIMScheduler",
+            "timestep": 0.0,
+            "step_index": 0,
+            "num_inference_steps": 50,
+            "sigma": 1.0,
+            "next_sigma": 0.75,
+        }
+        _write_tuple(tuple_path, **fields)
+        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    step = QwenImageRolloutStepSamples(
+        timestep_index=0,
+        timestep_bin="late",
+        cond=samples[0],
+        negative=samples[1],
+        guidance_scale=4.0,
+    )
+
+    with pytest.raises(ValueError, match="FlowMatch/Euler"):
+        qwen_image_rollout_scheduler_step(
+            torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            step,
+        )
+
+
 def test_compute_qwen_image_rollout_loss_rejects_adjacent_latent_discontinuity(
     tmp_path: Path,
 ) -> None:
@@ -795,7 +850,7 @@ def test_rollout_tuple_augmentation_writes_valid_schema(tmp_path: Path) -> None:
     for entry in output_entries:
         assert entry["rollout_tuple_schema"] == ROLLOUT_TUPLE_SCHEMA_VERSION
         assert "latent_after_step" in entry["required_fields"]
-        sample = load_qwen_image_tuple_sample(entry["tuple_path"], entry=entry)
+        sample = load_qwen_image_tuple_sample(tmp_path / entry["tuple_path"], entry=entry)
         validate_qwen_image_rollout_tuple_sample(sample)
 
 
@@ -889,13 +944,75 @@ def test_run_rollout_tuple_augmentation_writes_summary_from_manifest(tmp_path: P
         output_tuple_root=tmp_path / "rollout_tuples",
         output_tuple_index_jsonl=tmp_path / "rollout.jsonl",
         summary_json=summary_json,
-        provenance={"cluster_alias": "B300-mars"},
+        provenance=_rollout_command_provenance(),
     )
 
     assert summary_json.is_file()
     assert summary["format"] == "qwen_image_rollout_tuple_augmentation_summary_v1"
     assert summary["tuple_count"] == 2
     assert summary["provenance"]["cluster_alias"] == "B300-mars"
+    assert summary["provenance"]["closed_set_target_manifest"]
+
+
+def test_run_rollout_tuple_augmentation_rejects_incomplete_provenance(
+    tmp_path: Path,
+) -> None:
+    metadata_manifest = tmp_path / "metadata.jsonl"
+    metadata_manifest.write_text("", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="closed_set_target_manifest"):
+        run_qwen_image_rollout_tuple_augmentation(
+            source_tuple_index_jsonl=tmp_path / "source.jsonl",
+            rollout_metadata_jsonl=metadata_manifest,
+            output_tuple_root=tmp_path / "rollout_tuples",
+            output_tuple_index_jsonl=tmp_path / "rollout.jsonl",
+            summary_json=tmp_path / "summary.json",
+            provenance=_rollout_command_provenance(closed_set_target_manifest=None),
+        )
+
+
+def test_rollout_tuple_augmentation_relative_paths_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source_index = Path("source.jsonl")
+    source_entries = []
+    metadata_by_tuple_id = {}
+    for branch in ("cond", "negative"):
+        tuple_path = Path("source_tuples") / f"tuple_0_{branch}.pt"
+        _write_tuple(tuple_path, cfg_branch=branch, timestep_index=0)
+        entry = _write_index(
+            source_index,
+            tuple_path,
+            tuple_id=f"qwen_image_smoke_0000_step000_{branch}",
+            cfg_branch=branch,
+            timestep_index=0,
+        )
+        source_entries.append(entry)
+        metadata_by_tuple_id[entry["tuple_id"]] = _rollout_metadata(timestep_index=0)
+    source_index.write_text(
+        "\n".join(json.dumps(entry) for entry in source_entries) + "\n",
+        encoding="utf-8",
+    )
+
+    output_entries = augment_qwen_image_rollout_tuple_dataset(
+        QwenImageRolloutTupleAugmentationConfig(
+            source_tuple_index_jsonl=source_index,
+            output_tuple_index_jsonl=Path("runs/foo/rollout.jsonl"),
+            output_tuple_root=Path("runs/foo/tuples"),
+            metadata_by_tuple_id=metadata_by_tuple_id,
+        )
+    )
+
+    for entry in output_entries:
+        assert not Path(entry["tuple_path"]).is_absolute()
+        assert not str(entry["tuple_path"]).startswith("runs/foo/runs/foo")
+        sample = load_qwen_image_tuple_sample(
+            Path("runs/foo") / str(entry["tuple_path"]),
+            entry=entry,
+        )
+        validate_qwen_image_rollout_tuple_sample(sample)
 
 
 def test_rollout_window_dataset_builds_consecutive_cfg_windows(tmp_path: Path) -> None:
@@ -987,8 +1104,37 @@ def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> N
     assert config.lora_rank == 64
     assert config.lora_alpha == pytest.approx(128.0)
     assert config.learning_rate == pytest.approx(2.0e-5)
+    assert config.expected_num_layers == 60
+    assert config.expected_target_count == 840
+    assert config.diagnostic_only is False
     assert config.loss.rollout_k == 4
     assert config.loss.timestep_weights["late"] == pytest.approx(8.0)
+
+
+def test_load_rollout_qat_config_requires_diagnostic_for_non_840(tmp_path: Path) -> None:
+    config_path = tmp_path / "rollout_qat.json"
+    base_config = {
+        "tuple_index_jsonl": str(tmp_path / "rollout.jsonl"),
+        "output_dir": str(tmp_path / "out"),
+        "max_steps": 2,
+        "expected_num_layers": 1,
+        "expected_target_count": 1,
+    }
+    config_path.write_text(json.dumps(base_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="diagnostic_only=true"):
+        load_qwen_image_rollout_qat_config(config_path)
+
+    config_path.write_text(
+        json.dumps({**base_config, "diagnostic_only": True}),
+        encoding="utf-8",
+    )
+
+    config = load_qwen_image_rollout_qat_config(config_path)
+
+    assert config.expected_num_layers == 1
+    assert config.expected_target_count == 1
+    assert config.diagnostic_only is True
 
 
 def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:
@@ -1359,6 +1505,8 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
             lora_rank=4,
             lora_alpha=8.0,
             expected_num_layers=1,
+            expected_target_count=1,
+            diagnostic_only=True,
             loss=QwenImageRolloutLossConfig(
                 rollout_k=1,
                 cfg_normalize=False,
@@ -1383,6 +1531,7 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
     checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=True)
     assert checkpoint["config"]["recipe"] == "closed_set_rollout_qat_v1"
     assert checkpoint["config"]["lora_rank"] == 4
+    assert checkpoint["config"]["diagnostic_only"] is True
     assert checkpoint["config"]["loss"]["timestep_weights"]["late"] == pytest.approx(8.0)
     trainable_state = checkpoint["trainable_state_dict"]
     lora_up_tensors = [

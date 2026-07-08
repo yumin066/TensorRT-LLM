@@ -107,6 +107,20 @@ ROLLOUT_AUGMENTATION_SUMMARY_FORMAT = "qwen_image_rollout_tuple_augmentation_sum
 ROLLOUT_QAT_SUMMARY_FORMAT = "qwen_image_closed_set_rollout_qat_summary_v1"
 ROLLOUT_TUPLE_SCHEMA_VERSION = "qwen_image_closed_set_rollout_tuple_v1"
 ROLLOUT_SCHEDULER_STEP_IMPLEMENTATION = "qwen_image_flowmatch_euler_sigma_delta_v1"
+FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT = 60
+SUPPORTED_ROLLOUT_SCHEDULER_NAMES = frozenset(
+    {
+        "flowmatcheulerdiscrete",
+        "flowmatcheulerdiscretescheduler",
+        "qwenimageflowmatcheulerdiscretescheduler",
+    }
+)
+UNSUPPORTED_ROLLOUT_SCHEDULER_FLAGS = (
+    "per_token_sigmas",
+    "per_token_timesteps",
+    "stochastic_sampling",
+    "use_stochastic_sampling",
+)
 QWEN_BLOCK_LINEAR_TARGET = "qwen_block_linears"
 TARGET_OUTPUT_KEY = "target_output"
 ROLLOUT_COND_BRANCH = "cond"
@@ -334,8 +348,9 @@ class QwenImageRolloutQatTrainingConfig:
     lora_rank: int = 64
     lora_alpha: float = 128.0
     lora_dropout: float = 0.0
-    expected_num_layers: int | None = None
-    expected_target_count: int | None = None
+    expected_num_layers: int | None = FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT
+    expected_target_count: int | None = QWEN_IMAGE_BLOCK_LINEAR_COUNT
+    diagnostic_only: bool = False
     loss: QwenImageRolloutLossConfig = field(default_factory=QwenImageRolloutLossConfig)
     log_interval_steps: int = 1
     checkpoint_name: str = "qwen_image_closed_set_rollout_qat_lora_last.pt"
@@ -529,6 +544,7 @@ def augment_qwen_image_rollout_tuple_dataset(
             source_entry,
             metadata=metadata,
             output_tuple_path=output_tuple_path,
+            output_index_dir=output_index_path.parent,
         )
         load_sample = load_qwen_image_tuple_sample(output_tuple_path, entry=output_entry)
         validate_qwen_image_rollout_tuple_sample(load_sample)
@@ -1556,8 +1572,11 @@ def load_qwen_image_rollout_qat_config(
         lora_rank=int(data.get("lora_rank", 64)),
         lora_alpha=float(data.get("lora_alpha", 128.0)),
         lora_dropout=float(data.get("lora_dropout", 0.0)),
-        expected_num_layers=_optional_int_config_value(data, "expected_num_layers"),
-        expected_target_count=_optional_int_config_value(data, "expected_target_count"),
+        expected_num_layers=int(
+            data.get("expected_num_layers", FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT)
+        ),
+        expected_target_count=int(data.get("expected_target_count", QWEN_IMAGE_BLOCK_LINEAR_COUNT)),
+        diagnostic_only=bool(data.get("diagnostic_only", False)),
         loss=loss,
         log_interval_steps=int(data.get("log_interval_steps", 1)),
         checkpoint_name=str(
@@ -1586,6 +1605,10 @@ def run_qwen_image_rollout_tuple_augmentation(
     provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Run durable rollout tuple augmentation from a JSONL metadata manifest."""
+    validated_provenance = _validate_rollout_command_provenance(
+        provenance,
+        command_name="augment-rollout-tuples",
+    )
     metadata = load_qwen_image_rollout_metadata_manifest(rollout_metadata_jsonl)
     augmentation_config = QwenImageRolloutTupleAugmentationConfig(
         source_tuple_index_jsonl=source_tuple_index_jsonl,
@@ -1595,7 +1618,7 @@ def run_qwen_image_rollout_tuple_augmentation(
         summary_json=None,
         validate_prompt_continuity=True,
         provenance={
-            **dict(provenance or {}),
+            **validated_provenance,
             "rollout_metadata_jsonl": str(rollout_metadata_jsonl),
         },
     )
@@ -1631,6 +1654,10 @@ def run_qwen_image_rollout_qat(
     provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Load Qwen-Image student/teacher transformers and run closed-set rollout QAT."""
+    validated_provenance = _validate_rollout_command_provenance(
+        provenance,
+        command_name="run-rollout-qat",
+    )
     config = load_qwen_image_rollout_qat_config(config_path)
     output_path = Path(config.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1678,9 +1705,10 @@ def run_qwen_image_rollout_qat(
         "rollout_window_count": result.rollout_window_count,
         "injection_count": len(result.injections),
         "training_config": _rollout_training_config_to_dict(config),
+        "formal_task12c_eligible": not config.diagnostic_only,
         "scheduler_step_implementation": ROLLOUT_SCHEDULER_STEP_IMPLEMENTATION,
         "metrics_summary": summarize_qwen_image_qat_training_metrics(result.metrics_path),
-        "provenance": dict(provenance or {}),
+        "provenance": validated_provenance,
     }
     write_json(summary_path, summary)
     return summary
@@ -2553,14 +2581,6 @@ def _required_config_value(
     return value
 
 
-def _optional_int_config_value(
-    data: Mapping[str, object],
-    field_name: str,
-) -> int | None:
-    value = data.get(field_name)
-    return None if value is None else int(value)
-
-
 def _optional_mapping_config_value(
     data: Mapping[str, object],
     field_name: str,
@@ -2659,6 +2679,7 @@ def _build_rollout_tuple_index_entry(
     *,
     metadata: Mapping[str, object],
     output_tuple_path: Path,
+    output_index_dir: Path,
 ) -> dict[str, object]:
     entry = dict(source_entry)
     tuple_id = _tuple_id_for_entry(entry)
@@ -2673,7 +2694,7 @@ def _build_rollout_tuple_index_entry(
     entry.update(
         {
             "tuple_id": tuple_id,
-            "tuple_path": str(output_tuple_path),
+            "tuple_path": _manifest_relative_path(output_tuple_path, output_index_dir),
             "required_fields": required_fields,
             "rollout_tuple_schema": ROLLOUT_TUPLE_SCHEMA_VERSION,
             "rollout_provenance": _json_safe_metadata(dict(rollout_provenance)),
@@ -2685,6 +2706,10 @@ def _build_rollout_tuple_index_entry(
         }
     )
     return entry
+
+
+def _manifest_relative_path(path: Path, manifest_dir: Path) -> str:
+    return os.path.relpath(path.resolve(), start=manifest_dir.resolve())
 
 
 def _metadata_tensor(
@@ -2884,6 +2909,22 @@ def _validate_rollout_scheduler_step_contract(
             "rollout scheduler_state missing required scheduler contract fields "
             f"{missing_groups} for timestep {step.timestep_index}"
         )
+    scheduler_name = _rollout_scheduler_identifier(scheduler_state)
+    if scheduler_name not in SUPPORTED_ROLLOUT_SCHEDULER_NAMES:
+        raise ValueError(
+            "rollout scheduler_step supports only FlowMatch/Euler scheduler metadata, "
+            f"got {scheduler_state.get('scheduler_class') or scheduler_state.get('scheduler_name')}"
+        )
+    unsupported_flags = [
+        flag_name
+        for flag_name in UNSUPPORTED_ROLLOUT_SCHEDULER_FLAGS
+        if scheduler_state.get(flag_name) is True
+    ]
+    if unsupported_flags:
+        raise ValueError(
+            "rollout scheduler_step does not support stochastic/per-token scheduler modes "
+            f"{unsupported_flags}"
+        )
     provenance = step.cond.rollout_provenance
     if not isinstance(provenance, Mapping):
         raise ValueError("rollout scheduler contract requires rollout_provenance")
@@ -2897,6 +2938,11 @@ def _validate_rollout_scheduler_step_contract(
             "rollout scheduler contract missing provenance fields "
             f"{missing_provenance} for timestep {step.timestep_index}"
         )
+
+
+def _rollout_scheduler_identifier(scheduler_state: Mapping[str, object]) -> str:
+    raw_name = scheduler_state.get("scheduler_class") or scheduler_state.get("scheduler_name")
+    return "".join(ch for ch in str(raw_name).lower() if ch.isalnum())
 
 
 def _build_rollout_augmentation_summary(
@@ -3607,6 +3653,18 @@ def _validate_rollout_training_config(config: QwenImageRolloutQatTrainingConfig)
         raise ValueError("lora_rank must be positive")
     if config.lora_alpha <= 0.0:
         raise ValueError("lora_alpha must be positive")
+    expected_num_layers = _optional_int(config.expected_num_layers)
+    expected_target_count = _optional_int(config.expected_target_count)
+    if (
+        expected_num_layers != FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT
+        or expected_target_count != QWEN_IMAGE_BLOCK_LINEAR_COUNT
+    ) and not config.diagnostic_only:
+        raise ValueError(
+            "closed-set rollout QAT formal runs must target all "
+            f"{FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT} layers and "
+            f"{QWEN_IMAGE_BLOCK_LINEAR_COUNT} block Linears; set diagnostic_only=true "
+            "for explicit tiny/partial test runs"
+        )
     _validate_rollout_loss_config(config.loss)
     _validate_closed_set_rollout_timestep_weights(config.loss.timestep_weights)
     if config.scale_multipliers is not None:
@@ -3814,6 +3872,7 @@ def _rollout_training_config_to_dict(
         "lora_dropout": config.lora_dropout,
         "expected_num_layers": config.expected_num_layers,
         "expected_target_count": config.expected_target_count,
+        "diagnostic_only": config.diagnostic_only,
         "loss": _rollout_loss_config_to_dict(config.loss),
         "log_interval_steps": config.log_interval_steps,
         "checkpoint_name": config.checkpoint_name,
@@ -3958,6 +4017,41 @@ def _run_rollout_qat_command(args: argparse.Namespace) -> None:
         summary_json=Path(args.summary_json) if args.summary_json else None,
         provenance=_build_probe_runtime_provenance(args),
     )
+
+
+def _validate_rollout_command_provenance(
+    provenance: Mapping[str, object] | None,
+    *,
+    command_name: str,
+) -> dict[str, object]:
+    if not isinstance(provenance, Mapping):
+        raise ValueError(f"{command_name} requires rollout command provenance")
+    data = dict(provenance)
+    required_fields = (
+        "cluster_alias",
+        "container_runtime",
+        "enroot_image",
+        "git_head",
+        "model_snapshot_path",
+        "closed_set_target_manifest",
+        "scheduler_metadata_source",
+        "reference_image_root",
+        "node_list",
+    )
+    missing = [field_name for field_name in required_fields if data.get(field_name) in (None, "")]
+    if missing:
+        raise ValueError(f"{command_name} provenance missing required fields {missing}")
+    if data["cluster_alias"] != DEFAULT_CLUSTER_ALIAS:
+        raise ValueError(f"{command_name} provenance cluster_alias must be {DEFAULT_CLUSTER_ALIAS}")
+    if data["container_runtime"] != DEFAULT_CONTAINER_RUNTIME:
+        raise ValueError(
+            f"{command_name} provenance container_runtime must be {DEFAULT_CONTAINER_RUNTIME}"
+        )
+    if data["enroot_image"] != DEFAULT_ENROOT_IMAGE:
+        raise ValueError(f"{command_name} provenance enroot_image must be {DEFAULT_ENROOT_IMAGE}")
+    if data.get("allocation_id") in (None, "") and data.get("job_id") in (None, ""):
+        raise ValueError(f"{command_name} provenance requires allocation_id or job_id")
+    return data
 
 
 def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, object]:
