@@ -357,6 +357,7 @@ class QwenImageRolloutQatTrainingConfig:
     loss: QwenImageRolloutLossConfig = field(default_factory=QwenImageRolloutLossConfig)
     log_interval_steps: int = 1
     checkpoint_name: str = "qwen_image_closed_set_rollout_qat_lora_last.pt"
+    checkpoint_interval_steps: int | None = None
     metrics_name: str = "qwen_image_closed_set_rollout_qat_train_metrics.jsonl"
     compute_lora_delta_norm: bool = False
     scale_multipliers: Mapping[str, float] | None = None
@@ -1340,7 +1341,6 @@ def train_qwen_image_qat(
                 )
                 metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
                 metrics_file.flush()
-
     _save_qwen_image_qat_checkpoint(
         checkpoint_path,
         transformer=transformer,
@@ -1462,6 +1462,21 @@ def train_qwen_image_rollout_qat(
                 )
                 metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
                 metrics_file.flush()
+            if (
+                config.checkpoint_interval_steps is not None
+                and step % config.checkpoint_interval_steps == 0
+            ):
+                _save_qwen_image_qat_checkpoint_from_config(
+                    _rollout_interval_checkpoint_path(
+                        output_dir=output_dir,
+                        checkpoint_name=config.checkpoint_name,
+                        step=step,
+                    ),
+                    transformer=student_transformer,
+                    config=_rollout_training_config_to_dict(config),
+                    injections=injections,
+                    train_steps=step,
+                )
 
     _save_qwen_image_qat_checkpoint_from_config(
         checkpoint_path,
@@ -1589,6 +1604,11 @@ def load_qwen_image_rollout_qat_config(
         log_interval_steps=int(data.get("log_interval_steps", 1)),
         checkpoint_name=str(
             data.get("checkpoint_name", "qwen_image_closed_set_rollout_qat_lora_last.pt")
+        ),
+        checkpoint_interval_steps=(
+            int(data["checkpoint_interval_steps"])
+            if data.get("checkpoint_interval_steps") is not None
+            else None
         ),
         metrics_name=str(
             data.get("metrics_name", "qwen_image_closed_set_rollout_qat_train_metrics.jsonl")
@@ -3653,6 +3673,8 @@ def _validate_rollout_training_config(config: QwenImageRolloutQatTrainingConfig)
         raise ValueError("grad_clip_norm must be non-negative")
     if config.log_interval_steps <= 0:
         raise ValueError("log_interval_steps must be positive")
+    if config.checkpoint_interval_steps is not None and config.checkpoint_interval_steps <= 0:
+        raise ValueError("checkpoint_interval_steps must be positive when set")
     if config.window_stride <= 0:
         raise ValueError("window_stride must be positive")
     if config.window_start_index < 0:
@@ -3885,6 +3907,7 @@ def _rollout_training_config_to_dict(
         "loss": _rollout_loss_config_to_dict(config.loss),
         "log_interval_steps": config.log_interval_steps,
         "checkpoint_name": config.checkpoint_name,
+        "checkpoint_interval_steps": config.checkpoint_interval_steps,
         "metrics_name": config.metrics_name,
         "compute_lora_delta_norm": config.compute_lora_delta_norm,
         "scale_multipliers": dict(config.scale_multipliers or {}),
@@ -3892,6 +3915,16 @@ def _rollout_training_config_to_dict(
         "window_stride": config.window_stride,
         "window_start_index": config.window_start_index,
     }
+
+
+def _rollout_interval_checkpoint_path(
+    *,
+    output_dir: Path,
+    checkpoint_name: str,
+    step: int,
+) -> Path:
+    checkpoint_path = Path(checkpoint_name)
+    return output_dir / f"{checkpoint_path.stem}_step{int(step):04d}{checkpoint_path.suffix}"
 
 
 def _injection_to_dict(injection: QwenImageQatInjectionInfo) -> dict[str, object]:

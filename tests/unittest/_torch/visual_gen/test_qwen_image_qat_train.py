@@ -1092,6 +1092,7 @@ def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> N
                 "tuple_index_jsonl": str(tmp_path / "rollout.jsonl"),
                 "output_dir": str(tmp_path / "out"),
                 "max_steps": 500,
+                "checkpoint_interval_steps": 250,
                 "loss": {"rollout_k": 4},
             }
         ),
@@ -1109,6 +1110,7 @@ def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> N
     assert config.diagnostic_only is False
     assert config.loss.rollout_k == 4
     assert config.loss.timestep_weights["late"] == pytest.approx(8.0)
+    assert config.checkpoint_interval_steps == 250
 
 
 def test_load_rollout_qat_config_requires_diagnostic_for_non_840(tmp_path: Path) -> None:
@@ -1541,6 +1543,8 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
                 rollout_k=1,
                 cfg_normalize=False,
             ),
+            checkpoint_name="rollout_last.pt",
+            checkpoint_interval_steps=1,
             compute_lora_delta_norm=True,
         ),
         scheduler_step_fn=_rollout_scheduler_step,
@@ -1562,7 +1566,12 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
     assert checkpoint["config"]["recipe"] == "closed_set_rollout_qat_v1"
     assert checkpoint["config"]["lora_rank"] == 4
     assert checkpoint["config"]["diagnostic_only"] is True
+    assert checkpoint["config"]["checkpoint_interval_steps"] == 1
     assert checkpoint["config"]["loss"]["timestep_weights"]["late"] == pytest.approx(8.0)
+    step_checkpoint = result.output_dir / "rollout_last_step0001.pt"
+    assert step_checkpoint.exists()
+    assert torch.load(step_checkpoint, map_location="cpu", weights_only=True)["train_steps"] == 1
+    assert (result.output_dir / "rollout_last_step0002.pt").exists()
     trainable_state = checkpoint["trainable_state_dict"]
     lora_up_tensors = [
         tensor for name, tensor in trainable_state.items() if str(name).endswith("lora_up.weight")
