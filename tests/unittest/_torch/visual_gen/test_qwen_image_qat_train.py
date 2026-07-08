@@ -34,11 +34,13 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     QwenImageQatTrainingConfig,
     QwenImageRolloutLossConfig,
     QwenImageRolloutQatTrainingConfig,
+    QwenImageRolloutStepSamples,
     QwenImageRolloutTupleAugmentationConfig,
     QwenImageRolloutWindowDataset,
     QwenImageTupleDataset,
     QwenImageTupleLossConfig,
     augment_qwen_image_rollout_tuple_dataset,
+    build_parser,
     build_qwen_image_qat_probe_config,
     build_qwen_image_qat_scale_sensitivity_manifest,
     compute_qwen_image_rollout_loss,
@@ -46,13 +48,17 @@ from scripts.visualgen_eval.qwen_image_qat_train import (
     compute_scale_aware_lora_multipliers,
     forward_qwen_image_tuple,
     load_qwen_image_qat_checkpoint,
+    load_qwen_image_rollout_metadata_manifest,
+    load_qwen_image_rollout_qat_config,
     load_qwen_image_tuple_sample,
     monitor_qwen_image_qat_checkpoint,
     monitor_qwen_image_rollout_no_grad,
     normalize_qwen_image_qat_parameter_name,
     prepare_qwen_image_qat_model,
     qwen_image_qat_trainable_parameter_names,
+    qwen_image_rollout_scheduler_step,
     run_qwen_image_qat_checkpoint_rgb_eval,
+    run_qwen_image_rollout_tuple_augmentation,
     summarize_qwen_image_qat_training_metrics,
     train_qwen_image_qat,
     train_qwen_image_rollout_qat,
@@ -253,6 +259,8 @@ def _rollout_tuple_fields(
     text_seq_len: int = 1,
 ) -> dict[str, object]:
     branch_indicator = 1.0 if branch == "cond" else -1.0
+    latent_before_value = 1.0 - float(timestep_index)
+    latent_after_value = -float(timestep_index)
     return {
         "cfg_branch": branch,
         "timestep_index": timestep_index,
@@ -265,9 +273,25 @@ def _rollout_tuple_fields(
             branch_indicator,
             dtype=torch.bfloat16,
         ),
-        "latent_before_step": torch.ones(1, image_seq_len, hidden_size, dtype=torch.bfloat16),
-        "latent_after_step": torch.zeros(1, image_seq_len, hidden_size, dtype=torch.bfloat16),
-        "scheduler_state": {"sigma": float(timestep_index), "order": 1},
+        "latent_before_step": torch.full(
+            (1, image_seq_len, hidden_size),
+            latent_before_value,
+            dtype=torch.bfloat16,
+        ),
+        "latent_after_step": torch.full(
+            (1, image_seq_len, hidden_size),
+            latent_after_value,
+            dtype=torch.bfloat16,
+        ),
+        "scheduler_state": {
+            "scheduler_class": "FlowMatchEulerDiscreteScheduler",
+            "timestep": float(timestep_index),
+            "step_index": timestep_index,
+            "num_inference_steps": 50,
+            "sigma": float(timestep_index),
+            "next_sigma": float(timestep_index) - 1.0,
+            "order": 1,
+        },
         "rollout_tuple_schema": ROLLOUT_TUPLE_SCHEMA_VERSION,
         "rollout_provenance": _rollout_provenance(),
         "guidance_scale": 4.0,
@@ -299,10 +323,28 @@ def _rollout_metadata(
     hidden_size: int = 4,
     image_seq_len: int = 2,
 ) -> dict[str, object]:
+    latent_before_value = 1.0 - float(timestep_index)
+    latent_after_value = -float(timestep_index)
     return {
-        "latent_before_step": torch.ones(1, image_seq_len, hidden_size, dtype=torch.bfloat16),
-        "latent_after_step": torch.zeros(1, image_seq_len, hidden_size, dtype=torch.bfloat16),
-        "scheduler_state": {"sigma": float(timestep_index), "order": 1},
+        "latent_before_step": torch.full(
+            (1, image_seq_len, hidden_size),
+            latent_before_value,
+            dtype=torch.bfloat16,
+        ),
+        "latent_after_step": torch.full(
+            (1, image_seq_len, hidden_size),
+            latent_after_value,
+            dtype=torch.bfloat16,
+        ),
+        "scheduler_state": {
+            "scheduler_class": "FlowMatchEulerDiscreteScheduler",
+            "timestep": float(timestep_index),
+            "step_index": timestep_index,
+            "num_inference_steps": 50,
+            "sigma": float(timestep_index),
+            "next_sigma": float(timestep_index) - 1.0,
+            "order": 1,
+        },
         "rollout_provenance": _rollout_provenance(),
         "guidance_scale": 4.0,
         "reference_image_path": "/durable/qwen_image_smoke_0000.png",
@@ -434,7 +476,9 @@ def test_rollout_tuple_validation_requires_latent_fields(tmp_path: Path) -> None
     validate_qwen_image_rollout_tuple_sample(sample)
     assert sample.latent_before_step is not None
     assert sample.latent_after_step is not None
-    assert sample.scheduler_state == {"sigma": 0.0, "order": 1}
+    assert sample.scheduler_state is not None
+    assert sample.scheduler_state["sigma"] == 0.0
+    assert sample.scheduler_state["next_sigma"] == -1.0
 
     fields = _rollout_tuple_fields(timestep_index=0)
     fields["scheduler_state"] = None
@@ -531,6 +575,94 @@ def test_compute_qwen_image_rollout_loss_rejects_cfg_pair_schedule_provenance_mi
             scheduler_step_fn=_rollout_scheduler_step,
             device="cpu",
             config=QwenImageRolloutLossConfig(rollout_k=1),
+            teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
+        )
+
+
+def test_qwen_image_rollout_scheduler_step_uses_captured_sigmas(tmp_path: Path) -> None:
+    samples = []
+    for branch in ("cond", "negative"):
+        tuple_path = tmp_path / "tuples" / f"tuple_0_{branch}.pt"
+        fields = _rollout_tuple_fields(branch=branch, timestep_index=0)
+        fields["scheduler_state"] = {
+            "scheduler_class": "FlowMatchEulerDiscreteScheduler",
+            "timestep": 0.0,
+            "sigma": 1.0,
+            "next_sigma": 0.75,
+            "step_index": 0,
+            "num_inference_steps": 50,
+        }
+        _write_tuple(tuple_path, **fields)
+        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    step = QwenImageRolloutStepSamples(
+        timestep_index=0,
+        timestep_bin="late",
+        cond=samples[0],
+        negative=samples[1],
+        guidance_scale=4.0,
+    )
+    latent = torch.ones(1, 1, 1, dtype=torch.bfloat16)
+    output = torch.full_like(latent, 2.0)
+
+    next_latent = qwen_image_rollout_scheduler_step(latent, output, step)
+
+    assert next_latent.item() == pytest.approx(0.5)
+
+
+def test_qwen_image_rollout_scheduler_step_rejects_missing_delta(tmp_path: Path) -> None:
+    samples = []
+    for branch in ("cond", "negative"):
+        tuple_path = tmp_path / "tuples" / f"tuple_0_{branch}.pt"
+        fields = _rollout_tuple_fields(branch=branch, timestep_index=0)
+        fields["scheduler_state"] = {
+            "scheduler_class": "FlowMatchEulerDiscreteScheduler",
+            "timestep": 0.0,
+            "step_index": 0,
+            "num_inference_steps": 50,
+            "sigma": 1.0,
+        }
+        _write_tuple(tuple_path, **fields)
+        samples.append(load_qwen_image_tuple_sample(tuple_path))
+    step = QwenImageRolloutStepSamples(
+        timestep_index=0,
+        timestep_bin="late",
+        cond=samples[0],
+        negative=samples[1],
+        guidance_scale=4.0,
+    )
+
+    with pytest.raises(ValueError, match="next_sigma"):
+        qwen_image_rollout_scheduler_step(
+            torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            torch.ones(1, 1, 1, dtype=torch.bfloat16),
+            step,
+        )
+
+
+def test_compute_qwen_image_rollout_loss_rejects_adjacent_latent_discontinuity(
+    tmp_path: Path,
+) -> None:
+    samples = []
+    for timestep_index in range(2):
+        for branch in ("cond", "negative"):
+            tuple_path = tmp_path / "tuples" / f"tuple_{timestep_index}_{branch}.pt"
+            fields = _rollout_tuple_fields(branch=branch, timestep_index=timestep_index)
+            if timestep_index == 1:
+                fields["latent_before_step"] = torch.full(
+                    (1, 1, 1),
+                    7.0,
+                    dtype=torch.bfloat16,
+                )
+            _write_tuple(tuple_path, **fields)
+            samples.append(load_qwen_image_tuple_sample(tuple_path))
+
+    with pytest.raises(ValueError, match="adjacent latent continuity mismatch"):
+        compute_qwen_image_rollout_loss(
+            _IndexedRolloutTransformer(),
+            samples,
+            scheduler_step_fn=_rollout_scheduler_step,
+            device="cpu",
+            config=QwenImageRolloutLossConfig(rollout_k=2),
             teacher_forward_fn=lambda latent, _sample: torch.zeros_like(latent),
         )
 
@@ -667,6 +799,105 @@ def test_rollout_tuple_augmentation_writes_valid_schema(tmp_path: Path) -> None:
         validate_qwen_image_rollout_tuple_sample(sample)
 
 
+def test_rollout_metadata_manifest_loader_reads_tensor_paths(tmp_path: Path) -> None:
+    before_path = tmp_path / "metadata" / "before.pt"
+    after_path = tmp_path / "metadata" / "after.pt"
+    before_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.ones(1, 2, 4, dtype=torch.bfloat16), before_path)
+    torch.save(torch.zeros(1, 2, 4, dtype=torch.bfloat16), after_path)
+    manifest_path = tmp_path / "metadata.jsonl"
+    record = {
+        "format": "qwen_image_rollout_metadata_entry_v1",
+        "tuple_id": "qwen_image_smoke_0000_step000_cond",
+        "latent_before_step_path": str(before_path),
+        "latent_after_step_path": str(after_path),
+        "scheduler_state": {
+            "scheduler_class": "FlowMatchEulerDiscreteScheduler",
+            "timestep": 0.0,
+            "step_index": 0,
+            "num_inference_steps": 50,
+            "sigma": 1.0,
+            "next_sigma": 0.75,
+        },
+        "rollout_provenance": _rollout_provenance(),
+        "guidance_scale": 4.0,
+        "reference_image_path": "/durable/qwen_image_smoke_0000.png",
+    }
+    manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    loaded = load_qwen_image_rollout_metadata_manifest(manifest_path)
+
+    metadata = loaded["qwen_image_smoke_0000_step000_cond"]
+    assert torch.equal(metadata["latent_before_step"], torch.ones(1, 2, 4, dtype=torch.bfloat16))
+    assert metadata["scheduler_state"]["next_sigma"] == pytest.approx(0.75)
+
+
+def test_run_rollout_tuple_augmentation_writes_summary_from_manifest(tmp_path: Path) -> None:
+    source_index = tmp_path / "source.jsonl"
+    source_entries = []
+    metadata_records = []
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    for branch in ("cond", "negative"):
+        tuple_id = f"qwen_image_smoke_0000_step000_{branch}"
+        tuple_path = tmp_path / "source_tuples" / f"tuple_0_{branch}.pt"
+        _write_tuple(tuple_path, cfg_branch=branch, timestep_index=0)
+        entry = _write_index(
+            source_index,
+            tuple_path,
+            tuple_id=tuple_id,
+            cfg_branch=branch,
+            timestep_index=0,
+        )
+        source_entries.append(entry)
+        before_path = metadata_dir / f"{tuple_id}_before.pt"
+        after_path = metadata_dir / f"{tuple_id}_after.pt"
+        torch.save(torch.ones(1, 2, 4, dtype=torch.bfloat16), before_path)
+        torch.save(torch.zeros(1, 2, 4, dtype=torch.bfloat16), after_path)
+        metadata_records.append(
+            {
+                "tuple_id": tuple_id,
+                "latent_before_step_path": str(before_path),
+                "latent_after_step_path": str(after_path),
+                "scheduler_state": {
+                    "scheduler_class": "FlowMatchEulerDiscreteScheduler",
+                    "timestep": 0.0,
+                    "step_index": 0,
+                    "num_inference_steps": 50,
+                    "sigma": 1.0,
+                    "next_sigma": 0.75,
+                },
+                "rollout_provenance": _rollout_provenance(),
+                "guidance_scale": 4.0,
+                "reference_image_path": "/durable/qwen_image_smoke_0000.png",
+            }
+        )
+    source_index.write_text(
+        "\n".join(json.dumps(entry) for entry in source_entries) + "\n",
+        encoding="utf-8",
+    )
+    metadata_manifest = tmp_path / "metadata.jsonl"
+    metadata_manifest.write_text(
+        "\n".join(json.dumps(record) for record in metadata_records) + "\n",
+        encoding="utf-8",
+    )
+    summary_json = tmp_path / "summary.json"
+
+    summary = run_qwen_image_rollout_tuple_augmentation(
+        source_tuple_index_jsonl=source_index,
+        rollout_metadata_jsonl=metadata_manifest,
+        output_tuple_root=tmp_path / "rollout_tuples",
+        output_tuple_index_jsonl=tmp_path / "rollout.jsonl",
+        summary_json=summary_json,
+        provenance={"cluster_alias": "B300-mars"},
+    )
+
+    assert summary_json.is_file()
+    assert summary["format"] == "qwen_image_rollout_tuple_augmentation_summary_v1"
+    assert summary["tuple_count"] == 2
+    assert summary["provenance"]["cluster_alias"] == "B300-mars"
+
+
 def test_rollout_window_dataset_builds_consecutive_cfg_windows(tmp_path: Path) -> None:
     index_path = tmp_path / "rollout.jsonl"
     entries = []
@@ -698,6 +929,66 @@ def test_rollout_window_dataset_builds_consecutive_cfg_windows(tmp_path: Path) -
 
     assert len(dataset) == 1
     assert [sample.timestep_index for sample in dataset[0]] == [0, 0, 1, 1]
+
+
+def test_build_parser_accepts_rollout_commands(tmp_path: Path) -> None:
+    parser = build_parser()
+
+    augment_args = parser.parse_args(
+        [
+            "augment-rollout-tuples",
+            "--source-tuple-index-jsonl",
+            str(tmp_path / "source.jsonl"),
+            "--rollout-metadata-jsonl",
+            str(tmp_path / "metadata.jsonl"),
+            "--output-tuple-root",
+            str(tmp_path / "tuples"),
+            "--output-tuple-index-jsonl",
+            str(tmp_path / "rollout.jsonl"),
+            "--summary-json",
+            str(tmp_path / "summary.json"),
+        ]
+    )
+    rollout_args = parser.parse_args(
+        [
+            "run-rollout-qat",
+            "--config",
+            str(tmp_path / "rollout_qat.json"),
+            "--model",
+            "Qwen/Qwen-Image",
+            "--visual-gen-args",
+            str(tmp_path / "bf16.yaml"),
+        ]
+    )
+
+    assert augment_args.command == "augment-rollout-tuples"
+    assert augment_args.func.__name__ == "_run_augment_rollout_tuples_command"
+    assert rollout_args.command == "run-rollout-qat"
+    assert rollout_args.func.__name__ == "_run_rollout_qat_command"
+
+
+def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> None:
+    config_path = tmp_path / "rollout_qat.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "tuple_index_jsonl": str(tmp_path / "rollout.jsonl"),
+                "output_dir": str(tmp_path / "out"),
+                "max_steps": 500,
+                "loss": {"rollout_k": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_qwen_image_rollout_qat_config(config_path)
+
+    assert config.max_steps == 500
+    assert config.lora_rank == 64
+    assert config.lora_alpha == pytest.approx(128.0)
+    assert config.learning_rate == pytest.approx(2.0e-5)
+    assert config.loss.rollout_k == 4
+    assert config.loss.timestep_weights["late"] == pytest.approx(8.0)
 
 
 def test_qwen_image_qat_probe_config_recipes(tmp_path: Path) -> None:

@@ -102,7 +102,11 @@ TRAINING_FORMAT = "qwen_image_mxfp8_qat_adapter_v1"
 PROBE_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_probe_summary_v1"
 MONITOR_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_checkpoint_monitor_v1"
 ROLLOUT_MONITOR_SUMMARY_FORMAT = "qwen_image_mxfp8_qat_rollout_monitor_v1"
+ROLLOUT_METADATA_MANIFEST_FORMAT = "qwen_image_rollout_metadata_manifest_v1"
+ROLLOUT_AUGMENTATION_SUMMARY_FORMAT = "qwen_image_rollout_tuple_augmentation_summary_v1"
+ROLLOUT_QAT_SUMMARY_FORMAT = "qwen_image_closed_set_rollout_qat_summary_v1"
 ROLLOUT_TUPLE_SCHEMA_VERSION = "qwen_image_closed_set_rollout_tuple_v1"
+ROLLOUT_SCHEDULER_STEP_IMPLEMENTATION = "qwen_image_flowmatch_euler_sigma_delta_v1"
 QWEN_BLOCK_LINEAR_TARGET = "qwen_block_linears"
 TARGET_OUTPUT_KEY = "target_output"
 ROLLOUT_COND_BRANCH = "cond"
@@ -155,7 +159,11 @@ ROLLOUT_PER_STEP_SCHEDULER_FIELDS = frozenset(
         "begin_index",
         "index",
         "sigma",
+        "sigma_delta",
+        "sigma_next",
         "sigmas",
+        "dt",
+        "next_sigma",
         "step_index",
         "timestep",
         "timestep_index",
@@ -304,6 +312,9 @@ class QwenImageRolloutTupleAugmentationConfig:
     output_tuple_index_jsonl: str | Path
     output_tuple_root: str | Path
     metadata_by_tuple_id: Mapping[str, Mapping[str, object]]
+    summary_json: str | Path | None = None
+    validate_prompt_continuity: bool = True
+    provenance: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -528,7 +539,96 @@ def augment_qwen_image_rollout_tuple_dataset(
         "\n".join(json.dumps(entry, sort_keys=True) for entry in output_entries) + "\n",
         encoding="utf-8",
     )
+    if config.validate_prompt_continuity and output_entries:
+        _validate_rollout_prompt_continuity(
+            tuple(
+                load_qwen_image_tuple_sample(
+                    _tuple_path_from_entry(entry, manifest_dir=output_index_path.parent),
+                    entry=entry,
+                )
+                for entry in output_entries
+            )
+        )
+    if config.summary_json is not None:
+        write_json(
+            Path(config.summary_json),
+            _build_rollout_augmentation_summary(
+                config=config,
+                output_entries=output_entries,
+                source_index_path=source_index_path,
+                output_index_path=output_index_path,
+                output_tuple_root=output_tuple_root,
+            ),
+        )
     return output_entries
+
+
+def load_qwen_image_rollout_metadata_manifest(
+    path: str | Path,
+) -> dict[str, dict[str, object]]:
+    """Load durable rollout metadata keyed by tuple_id from a JSONL manifest."""
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        raise ValueError(f"rollout metadata manifest does not exist: {manifest_path}")
+    metadata_by_tuple_id: dict[str, dict[str, object]] = {}
+    for line_number, line in enumerate(
+        manifest_path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise ValueError(f"metadata manifest line {line_number} must be a mapping")
+        tuple_id = record.get("tuple_id")
+        if not isinstance(tuple_id, str) or not tuple_id:
+            raise ValueError(f"metadata manifest line {line_number} missing tuple_id")
+        if tuple_id in metadata_by_tuple_id:
+            raise ValueError(f"duplicate rollout metadata tuple_id={tuple_id}")
+        metadata_payload = _load_rollout_metadata_payload(record, manifest_path.parent, tuple_id)
+        metadata_by_tuple_id[tuple_id] = {
+            "latent_before_step": _rollout_metadata_tensor_from_record(
+                record,
+                metadata_payload,
+                "latent_before_step",
+                manifest_path.parent,
+                tuple_id,
+            ),
+            "latent_after_step": _rollout_metadata_tensor_from_record(
+                record,
+                metadata_payload,
+                "latent_after_step",
+                manifest_path.parent,
+                tuple_id,
+            ),
+            "scheduler_state": _rollout_metadata_mapping_from_record(
+                record,
+                metadata_payload,
+                "scheduler_state",
+                tuple_id,
+            ),
+            "rollout_provenance": _rollout_metadata_mapping_from_record(
+                record,
+                metadata_payload,
+                "rollout_provenance",
+                tuple_id,
+            ),
+            "guidance_scale": _rollout_metadata_float_from_record(
+                record,
+                metadata_payload,
+                "guidance_scale",
+                tuple_id,
+            ),
+            "reference_image_path": _rollout_metadata_string_from_record(
+                record,
+                metadata_payload,
+                "reference_image_path",
+                tuple_id,
+            ),
+        }
+    if not metadata_by_tuple_id:
+        raise ValueError(f"rollout metadata manifest is empty: {manifest_path}")
+    return metadata_by_tuple_id
 
 
 def build_qwen_image_rollout_tuple_payload(
@@ -771,7 +871,8 @@ def compute_qwen_image_rollout_loss(
     scheduler_step_fn: Callable[
         [torch.Tensor, torch.Tensor, QwenImageRolloutStepSamples],
         torch.Tensor,
-    ],
+    ]
+    | None = None,
     device: torch.device | str,
     config: QwenImageRolloutLossConfig | None = None,
     teacher_transformer: nn.Module | None = None,
@@ -782,6 +883,7 @@ def compute_qwen_image_rollout_loss(
     _validate_rollout_loss_config(loss_config)
     if (teacher_transformer is None) == (teacher_forward_fn is None):
         raise ValueError("exactly one of teacher_transformer or teacher_forward_fn must be set")
+    scheduler_step = scheduler_step_fn or qwen_image_rollout_scheduler_step
     window = _build_rollout_window(samples, loss_config.rollout_k)
     target_device = torch.device(device)
 
@@ -854,9 +956,9 @@ def compute_qwen_image_rollout_loss(
             guidance_scale=step.guidance_scale,
             normalize=loss_config.cfg_normalize,
         )
-        student_next_latent = scheduler_step_fn(current_latent, guided_student_output, step)
+        student_next_latent = scheduler_step(current_latent, guided_student_output, step)
         with torch.no_grad():
-            teacher_next_latent = scheduler_step_fn(teacher_input, guided_teacher_output, step)
+            teacher_next_latent = scheduler_step(teacher_input, guided_teacher_output, step)
         step_loss, step_components = compute_qwen_image_rollout_step_loss(
             cond_student_output=cond_student_output,
             cond_teacher_output=cond_teacher_output,
@@ -973,6 +1075,40 @@ def combine_qwen_image_cfg_outputs(
     return guided * (cond_norm / guided_norm)
 
 
+def qwen_image_rollout_scheduler_step(
+    latent: torch.Tensor,
+    guided_output: torch.Tensor,
+    step: QwenImageRolloutStepSamples,
+) -> torch.Tensor:
+    """Side-effect-free FlowMatch/Euler step from captured Qwen-Image scheduler metadata."""
+    scheduler_state = step.cond.scheduler_state
+    if not isinstance(scheduler_state, Mapping):
+        raise ValueError("rollout scheduler_state must be a mapping")
+    _validate_rollout_scheduler_step_contract(scheduler_state, step)
+    current_sigma = _scheduler_state_float(
+        scheduler_state,
+        step,
+        ("sigma", "current_sigma"),
+    )
+    sigma_delta = _scheduler_state_optional_float(
+        scheduler_state,
+        ("sigma_delta", "dt"),
+    )
+    if sigma_delta is None:
+        next_sigma = _scheduler_state_optional_float(
+            scheduler_state,
+            ("next_sigma", "sigma_next"),
+        )
+        if next_sigma is None:
+            raise ValueError(
+                "rollout scheduler_state must include next_sigma/sigma_next or sigma_delta/dt"
+            )
+        sigma_delta = next_sigma - current_sigma
+    delta = guided_output.new_tensor(float(sigma_delta))
+    next_latent = latent + guided_output.to(dtype=latent.dtype) * delta.to(dtype=latent.dtype)
+    return next_latent.to(dtype=latent.dtype)
+
+
 def monitor_qwen_image_rollout_no_grad(
     student_transformer: nn.Module,
     samples: Sequence[QwenImageTupleSample],
@@ -980,7 +1116,8 @@ def monitor_qwen_image_rollout_no_grad(
     scheduler_step_fn: Callable[
         [torch.Tensor, torch.Tensor, QwenImageRolloutStepSamples],
         torch.Tensor,
-    ],
+    ]
+    | None = None,
     output_json: str | Path,
     device: torch.device | str,
     config: QwenImageRolloutLossConfig | None = None,
@@ -1208,7 +1345,8 @@ def train_qwen_image_rollout_qat(
     scheduler_step_fn: Callable[
         [torch.Tensor, torch.Tensor, QwenImageRolloutStepSamples],
         torch.Tensor,
-    ],
+    ]
+    | None = None,
     teacher_transformer: nn.Module | None = None,
     teacher_forward_fn: Callable[[torch.Tensor, QwenImageTupleSample], torch.Tensor] | None = None,
     linear_cls: type[nn.Module] | None = None,
@@ -1379,6 +1517,173 @@ def validate_qwen_image_qat_probe_recipe(recipe: str) -> str:
             f"{recipe!r}; expected one of {QWEN_IMAGE_QAT_PROBE_RECIPES}"
         )
     return recipe
+
+
+def load_qwen_image_rollout_qat_config(
+    path: str | Path,
+) -> QwenImageRolloutQatTrainingConfig:
+    """Load a closed-set rollout QAT training config from JSON or YAML."""
+    config_path = Path(path)
+    data = _read_mapping_config(config_path)
+    loss_data = data.get("loss", {})
+    if loss_data is not None and not isinstance(loss_data, Mapping):
+        raise ValueError(f"rollout QAT config loss must be a mapping: {config_path}")
+    betas = _optimizer_betas_from_config(data.get("betas", (0.9, 0.999)), config_path)
+    loss = QwenImageRolloutLossConfig(
+        rollout_k=int(loss_data.get("rollout_k", 4)),
+        lambda_output_mse=float(loss_data.get("lambda_output_mse", 1.0)),
+        lambda_dir=float(loss_data.get("lambda_dir", 0.1)),
+        lambda_latent=float(loss_data.get("lambda_latent", 1.0)),
+        lambda_anchor=float(loss_data.get("lambda_anchor", 0.2)),
+        timestep_weights=dict(
+            loss_data.get("timestep_weights", CLOSED_SET_ROLLOUT_TIMESTEP_WEIGHTS)
+        ),
+        teacher_no_grad=bool(loss_data.get("teacher_no_grad", True)),
+        student_latent_detach=bool(loss_data.get("student_latent_detach", False)),
+        cfg_normalize=bool(loss_data.get("cfg_normalize", True)),
+    )
+    config = QwenImageRolloutQatTrainingConfig(
+        tuple_index_jsonl=_required_config_value(data, "tuple_index_jsonl", config_path),
+        output_dir=_required_config_value(data, "output_dir", config_path),
+        max_steps=int(_required_config_value(data, "max_steps", config_path)),
+        learning_rate=float(data.get("learning_rate", 2.0e-5)),
+        weight_decay=float(data.get("weight_decay", 0.0)),
+        betas=betas,
+        eps=float(data.get("eps", 1.0e-8)),
+        grad_clip_norm=float(data.get("grad_clip_norm", 1.0)),
+        device=str(data.get("device", "cuda")),
+        target_layers=tuple(data.get("target_layers", (QWEN_BLOCK_LINEAR_TARGET,))),
+        lora_rank=int(data.get("lora_rank", 64)),
+        lora_alpha=float(data.get("lora_alpha", 128.0)),
+        lora_dropout=float(data.get("lora_dropout", 0.0)),
+        expected_num_layers=_optional_int_config_value(data, "expected_num_layers"),
+        expected_target_count=_optional_int_config_value(data, "expected_target_count"),
+        loss=loss,
+        log_interval_steps=int(data.get("log_interval_steps", 1)),
+        checkpoint_name=str(
+            data.get("checkpoint_name", "qwen_image_closed_set_rollout_qat_lora_last.pt")
+        ),
+        metrics_name=str(
+            data.get("metrics_name", "qwen_image_closed_set_rollout_qat_train_metrics.jsonl")
+        ),
+        compute_lora_delta_norm=bool(data.get("compute_lora_delta_norm", False)),
+        scale_multipliers=_optional_mapping_config_value(data, "scale_multipliers"),
+        optimizer_foreach=data.get("optimizer_foreach", False),
+        window_stride=int(data.get("window_stride", 1)),
+        window_start_index=int(data.get("window_start_index", 0)),
+    )
+    _validate_rollout_training_config(config)
+    return config
+
+
+def run_qwen_image_rollout_tuple_augmentation(
+    *,
+    source_tuple_index_jsonl: str | Path,
+    rollout_metadata_jsonl: str | Path,
+    output_tuple_root: str | Path,
+    output_tuple_index_jsonl: str | Path,
+    summary_json: str | Path,
+    provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Run durable rollout tuple augmentation from a JSONL metadata manifest."""
+    metadata = load_qwen_image_rollout_metadata_manifest(rollout_metadata_jsonl)
+    augmentation_config = QwenImageRolloutTupleAugmentationConfig(
+        source_tuple_index_jsonl=source_tuple_index_jsonl,
+        output_tuple_index_jsonl=output_tuple_index_jsonl,
+        output_tuple_root=output_tuple_root,
+        metadata_by_tuple_id=metadata,
+        summary_json=None,
+        validate_prompt_continuity=True,
+        provenance={
+            **dict(provenance or {}),
+            "rollout_metadata_jsonl": str(rollout_metadata_jsonl),
+        },
+    )
+    output_entries = augment_qwen_image_rollout_tuple_dataset(augmentation_config)
+    summary = _build_rollout_augmentation_summary(
+        config=QwenImageRolloutTupleAugmentationConfig(
+            source_tuple_index_jsonl=source_tuple_index_jsonl,
+            output_tuple_index_jsonl=output_tuple_index_jsonl,
+            output_tuple_root=output_tuple_root,
+            metadata_by_tuple_id=metadata,
+            summary_json=summary_json,
+            validate_prompt_continuity=True,
+            provenance=augmentation_config.provenance,
+        ),
+        output_entries=output_entries,
+        source_index_path=Path(source_tuple_index_jsonl),
+        output_index_path=Path(output_tuple_index_jsonl),
+        output_tuple_root=Path(output_tuple_root),
+    )
+    summary["rollout_metadata_jsonl"] = str(rollout_metadata_jsonl)
+    write_json(Path(summary_json), summary)
+    return summary
+
+
+def run_qwen_image_rollout_qat(
+    *,
+    config_path: str | Path,
+    model: str,
+    visual_gen_args: str | Path,
+    teacher_model: str | None = None,
+    teacher_visual_gen_args: str | Path | None = None,
+    summary_json: str | Path | None = None,
+    provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Load Qwen-Image student/teacher transformers and run closed-set rollout QAT."""
+    config = load_qwen_image_rollout_qat_config(config_path)
+    output_path = Path(config.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    student_pipeline = load_single_worker_pipeline(
+        model=model,
+        visual_gen_args=Path(visual_gen_args),
+        device=config.device,
+    )
+    teacher_pipeline = load_single_worker_pipeline(
+        model=teacher_model or model,
+        visual_gen_args=Path(teacher_visual_gen_args or visual_gen_args),
+        device=config.device,
+    )
+    try:
+        student_transformer = getattr(student_pipeline, "transformer", None)
+        teacher_transformer = getattr(teacher_pipeline, "transformer", None)
+        if student_transformer is None or teacher_transformer is None:
+            raise ValueError("Loaded Qwen-Image pipelines must expose transformer components")
+        result = train_qwen_image_rollout_qat(
+            student_transformer,
+            config,
+            teacher_transformer=teacher_transformer,
+        )
+    finally:
+        cleanup_pipeline(teacher_pipeline)
+        cleanup_pipeline(student_pipeline)
+
+    summary_path = (
+        Path(summary_json) if summary_json is not None else output_path / "rollout_qat_summary.json"
+    )
+    summary = {
+        "format": ROLLOUT_QAT_SUMMARY_FORMAT,
+        "recipe": "closed_set_rollout_qat_v1",
+        "model": model,
+        "teacher_model": teacher_model or model,
+        "visual_gen_args": str(visual_gen_args),
+        "teacher_visual_gen_args": str(teacher_visual_gen_args or visual_gen_args),
+        "config_path": str(config_path),
+        "tuple_index_jsonl": str(config.tuple_index_jsonl),
+        "output_dir": str(output_path),
+        "summary_json": str(summary_path),
+        "checkpoint_path": str(result.checkpoint_path),
+        "metrics_path": str(result.metrics_path),
+        "train_steps": result.train_steps,
+        "rollout_window_count": result.rollout_window_count,
+        "injection_count": len(result.injections),
+        "training_config": _rollout_training_config_to_dict(config),
+        "scheduler_step_implementation": ROLLOUT_SCHEDULER_STEP_IMPLEMENTATION,
+        "metrics_summary": summarize_qwen_image_qat_training_metrics(result.metrics_path),
+        "provenance": dict(provenance or {}),
+    }
+    write_json(summary_path, summary)
+    return summary
 
 
 def run_qwen_image_qat_probe(
@@ -2220,6 +2525,61 @@ def _read_tuple_index(path: Path) -> list[dict[str, object]]:
     return entries
 
 
+def _read_mapping_config(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise ValueError(f"config does not exist: {path}")
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError(f"PyYAML is required to load YAML config: {path}") from exc
+        loaded = yaml.safe_load(text) or {}
+    else:
+        loaded = json.loads(text)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"config must be a mapping: {path}")
+    return loaded
+
+
+def _required_config_value(
+    data: Mapping[str, object],
+    field_name: str,
+    path: Path,
+) -> object:
+    value = data.get(field_name)
+    if value in (None, ""):
+        raise ValueError(f"config missing required field {field_name}: {path}")
+    return value
+
+
+def _optional_int_config_value(
+    data: Mapping[str, object],
+    field_name: str,
+) -> int | None:
+    value = data.get(field_name)
+    return None if value is None else int(value)
+
+
+def _optional_mapping_config_value(
+    data: Mapping[str, object],
+    field_name: str,
+) -> Mapping[str, float] | None:
+    value = data.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"config field {field_name} must be a mapping")
+    return {str(key): float(item) for key, item in value.items()}
+
+
+def _optimizer_betas_from_config(value: object, path: Path) -> tuple[float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"config field betas must contain two numeric values: {path}")
+    beta1, beta2 = value
+    return (float(beta1), float(beta2))
+
+
 def _build_rollout_windows_from_samples(
     samples: Sequence[QwenImageTupleSample],
     *,
@@ -2389,6 +2749,178 @@ def _json_safe_metadata(value: object) -> object:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _load_rollout_metadata_payload(
+    record: Mapping[str, object],
+    manifest_dir: Path,
+    tuple_id: str,
+) -> Mapping[str, object]:
+    value = record.get("metadata_path")
+    if value is None:
+        return {}
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"rollout metadata {tuple_id}.metadata_path must be a non-empty string")
+    payload_path = _resolve_manifest_path(manifest_dir, value)
+    payload = torch.load(payload_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"rollout metadata payload must be a mapping: {payload_path}")
+    return payload
+
+
+def _resolve_manifest_path(manifest_dir: Path, value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else manifest_dir / path
+
+
+def _rollout_metadata_tensor_from_record(
+    record: Mapping[str, object],
+    payload: Mapping[str, object],
+    field_name: str,
+    manifest_dir: Path,
+    tuple_id: str,
+) -> torch.Tensor:
+    value = payload.get(field_name, record.get(field_name))
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    path_key = f"{field_name}_path"
+    path_value = record.get(path_key, payload.get(path_key))
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError(f"rollout metadata {tuple_id}.{path_key} must be a non-empty string")
+    tensor_path = _resolve_manifest_path(manifest_dir, path_value)
+    loaded = torch.load(tensor_path, map_location="cpu", weights_only=True)
+    if isinstance(loaded, torch.Tensor):
+        return loaded.detach().cpu()
+    if isinstance(loaded, Mapping):
+        tensor_key = str(
+            record.get(f"{field_name}_key", payload.get(f"{field_name}_key", field_name))
+        )
+        tensor_value = loaded.get(tensor_key)
+        if isinstance(tensor_value, torch.Tensor):
+            return tensor_value.detach().cpu()
+    raise ValueError(f"rollout metadata {tuple_id}.{field_name} tensor not found in {tensor_path}")
+
+
+def _rollout_metadata_mapping_from_record(
+    record: Mapping[str, object],
+    payload: Mapping[str, object],
+    field_name: str,
+    tuple_id: str,
+) -> Mapping[str, object]:
+    value = payload.get(field_name, record.get(field_name))
+    if not isinstance(value, Mapping):
+        raise ValueError(f"rollout metadata {tuple_id}.{field_name} must be a mapping")
+    return value
+
+
+def _rollout_metadata_float_from_record(
+    record: Mapping[str, object],
+    payload: Mapping[str, object],
+    field_name: str,
+    tuple_id: str,
+) -> float:
+    value = payload.get(field_name, record.get(field_name))
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"rollout metadata {tuple_id}.{field_name} must be numeric")
+    return float(value)
+
+
+def _rollout_metadata_string_from_record(
+    record: Mapping[str, object],
+    payload: Mapping[str, object],
+    field_name: str,
+    tuple_id: str,
+) -> str:
+    value = payload.get(field_name, record.get(field_name))
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"rollout metadata {tuple_id}.{field_name} must be a non-empty string")
+    return value
+
+
+def _scheduler_state_float(
+    scheduler_state: Mapping[str, object],
+    step: QwenImageRolloutStepSamples,
+    field_names: tuple[str, ...],
+) -> float:
+    value = _scheduler_state_optional_float(scheduler_state, field_names)
+    if value is None:
+        raise ValueError(
+            "rollout scheduler_state missing "
+            f"{'/'.join(field_names)} for timestep {step.timestep_index}"
+        )
+    return value
+
+
+def _scheduler_state_optional_float(
+    scheduler_state: Mapping[str, object],
+    field_names: tuple[str, ...],
+) -> float | None:
+    for field_name in field_names:
+        value = scheduler_state.get(field_name)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, torch.Tensor) and value.numel() == 1:
+            return float(value.detach().float().cpu())
+    return None
+
+
+def _validate_rollout_scheduler_step_contract(
+    scheduler_state: Mapping[str, object],
+    step: QwenImageRolloutStepSamples,
+) -> None:
+    required_groups = (
+        ("scheduler_class", "scheduler_name"),
+        ("timestep", "timestep_index"),
+        ("step_index", "timestep_index"),
+        ("num_inference_steps", "total_steps"),
+    )
+    missing_groups = [
+        "/".join(field_names)
+        for field_names in required_groups
+        if not any(scheduler_state.get(field_name) not in (None, "") for field_name in field_names)
+    ]
+    if missing_groups:
+        raise ValueError(
+            "rollout scheduler_state missing required scheduler contract fields "
+            f"{missing_groups} for timestep {step.timestep_index}"
+        )
+    provenance = step.cond.rollout_provenance
+    if not isinstance(provenance, Mapping):
+        raise ValueError("rollout scheduler contract requires rollout_provenance")
+    missing_provenance = [
+        field_name
+        for field_name in ("scheduler_config_signature", "sigmas_hash")
+        if provenance.get(field_name) in (None, "")
+    ]
+    if missing_provenance:
+        raise ValueError(
+            "rollout scheduler contract missing provenance fields "
+            f"{missing_provenance} for timestep {step.timestep_index}"
+        )
+
+
+def _build_rollout_augmentation_summary(
+    *,
+    config: QwenImageRolloutTupleAugmentationConfig,
+    output_entries: list[dict[str, object]],
+    source_index_path: Path,
+    output_index_path: Path,
+    output_tuple_root: Path,
+) -> dict[str, object]:
+    prompt_ids = {str(entry.get("prompt_id")) for entry in output_entries}
+    return {
+        "format": ROLLOUT_AUGMENTATION_SUMMARY_FORMAT,
+        "source_tuple_index_jsonl": str(source_index_path),
+        "output_tuple_index_jsonl": str(output_index_path),
+        "output_tuple_root": str(output_tuple_root),
+        "summary_json": str(config.summary_json) if config.summary_json is not None else None,
+        "rollout_tuple_schema": ROLLOUT_TUPLE_SCHEMA_VERSION,
+        "tuple_count": len(output_entries),
+        "prompt_count": len(prompt_ids),
+        "validate_prompt_continuity": bool(config.validate_prompt_continuity),
+        "status": "passed",
+        "provenance": dict(config.provenance or {}),
+    }
 
 
 def _entry_from_payload(payload: Mapping[str, object], path: Path) -> dict[str, object]:
@@ -2602,6 +3134,7 @@ def _build_rollout_window(
         else:
             _validate_rollout_step_matches_first(step, first_step)
         steps.append(step)
+    _validate_rollout_adjacent_step_continuity(tuple(steps))
     return tuple(steps)
 
 
@@ -2660,6 +3193,66 @@ def _validate_rollout_step_matches_first(
         raise ValueError("rollout window samples must have the same reference_image_path")
     if _rollout_schedule_signature(step.cond) != _rollout_schedule_signature(first.cond):
         raise ValueError("rollout window samples must have matching scheduler schedule provenance")
+
+
+def _validate_rollout_adjacent_step_continuity(
+    steps: tuple[QwenImageRolloutStepSamples, ...],
+) -> None:
+    for current, next_step in zip(steps, steps[1:]):
+        _validate_rollout_latent_continuity(
+            current.cond,
+            next_step.cond,
+            branch_name=ROLLOUT_COND_BRANCH,
+        )
+        _validate_rollout_latent_continuity(
+            current.negative,
+            next_step.negative,
+            branch_name=ROLLOUT_NEGATIVE_BRANCH,
+        )
+
+
+def _validate_rollout_latent_continuity(
+    current: QwenImageTupleSample,
+    next_sample: QwenImageTupleSample,
+    *,
+    branch_name: str,
+) -> None:
+    if current.latent_after_step is None or next_sample.latent_before_step is None:
+        raise ValueError("rollout adjacent latent continuity requires latent tensors")
+    if tuple(current.latent_after_step.shape) != tuple(next_sample.latent_before_step.shape):
+        raise ValueError(
+            "rollout adjacent latent continuity shapes must match for "
+            f"{branch_name} step {current.timestep_index}->{next_sample.timestep_index}"
+        )
+    if not torch.equal(current.latent_after_step, next_sample.latent_before_step):
+        raise ValueError(
+            "rollout adjacent latent continuity mismatch for "
+            f"{branch_name} step {current.timestep_index}->{next_sample.timestep_index}"
+        )
+
+
+def _validate_rollout_prompt_continuity(samples: Sequence[QwenImageTupleSample]) -> None:
+    grouped: dict[tuple[str, str], dict[int, dict[str, QwenImageTupleSample]]] = {}
+    for sample in samples:
+        branch_map = grouped.setdefault((sample.prompt_id, sample.split), {}).setdefault(
+            sample.timestep_index,
+            {},
+        )
+        branch_map[sample.cfg_branch] = sample
+    for (_prompt_id, _split), by_step in sorted(grouped.items()):
+        timestep_indices = sorted(by_step)
+        for current_index, next_index in zip(timestep_indices, timestep_indices[1:]):
+            if next_index != current_index + 1:
+                continue
+            for cfg_branch in ROLLOUT_CFG_BRANCHES:
+                current = by_step[current_index].get(cfg_branch)
+                next_sample = by_step[next_index].get(cfg_branch)
+                if current is not None and next_sample is not None:
+                    _validate_rollout_latent_continuity(
+                        current,
+                        next_sample,
+                        branch_name=cfg_branch,
+                    )
 
 
 def _forward_rollout_teacher_branch(
@@ -3342,8 +3935,33 @@ def _run_rgb_eval_command(args: argparse.Namespace) -> None:
     )
 
 
+def _run_augment_rollout_tuples_command(args: argparse.Namespace) -> None:
+    run_qwen_image_rollout_tuple_augmentation(
+        source_tuple_index_jsonl=Path(args.source_tuple_index_jsonl),
+        rollout_metadata_jsonl=Path(args.rollout_metadata_jsonl),
+        output_tuple_root=Path(args.output_tuple_root),
+        output_tuple_index_jsonl=Path(args.output_tuple_index_jsonl),
+        summary_json=Path(args.summary_json),
+        provenance=_build_probe_runtime_provenance(args),
+    )
+
+
+def _run_rollout_qat_command(args: argparse.Namespace) -> None:
+    run_qwen_image_rollout_qat(
+        config_path=Path(args.config),
+        model=args.model,
+        visual_gen_args=Path(args.visual_gen_args),
+        teacher_model=args.teacher_model,
+        teacher_visual_gen_args=Path(args.teacher_visual_gen_args)
+        if args.teacher_visual_gen_args
+        else None,
+        summary_json=Path(args.summary_json) if args.summary_json else None,
+        provenance=_build_probe_runtime_provenance(args),
+    )
+
+
 def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, object]:
-    return {
+    provenance = {
         "cluster_alias": args.cluster_alias,
         "allocation_id": args.allocation_id or os.environ.get("SSH_GW_ALLOC_ID"),
         "job_id": args.job_id or os.environ.get("SLURM_JOB_ID"),
@@ -3357,6 +3975,16 @@ def _build_probe_runtime_provenance(args: argparse.Namespace) -> dict[str, objec
         "training_attention_backend": args.training_attention_backend,
         "evaluation_attention_backend": args.evaluation_attention_backend,
     }
+    for attr_name in (
+        "closed_set_target_manifest",
+        "rollout_metadata_jsonl",
+        "scheduler_metadata_source",
+        "reference_image_root",
+    ):
+        value = getattr(args, attr_name, None)
+        if value:
+            provenance[attr_name] = str(value)
+    return provenance
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3442,6 +4070,50 @@ def build_parser() -> argparse.ArgumentParser:
     rgb_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
     rgb_parser.add_argument("--command")
     rgb_parser.set_defaults(func=_run_rgb_eval_command)
+
+    augment_parser = subparsers.add_parser("augment-rollout-tuples")
+    augment_parser.add_argument("--source-tuple-index-jsonl", required=True)
+    augment_parser.add_argument("--rollout-metadata-jsonl", required=True)
+    augment_parser.add_argument("--output-tuple-root", required=True)
+    augment_parser.add_argument("--output-tuple-index-jsonl", required=True)
+    augment_parser.add_argument("--summary-json", required=True)
+    augment_parser.add_argument("--closed-set-target-manifest")
+    augment_parser.add_argument("--scheduler-metadata-source")
+    augment_parser.add_argument("--reference-image-root")
+    augment_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
+    augment_parser.add_argument("--allocation-id")
+    augment_parser.add_argument("--job-id")
+    augment_parser.add_argument("--node-list")
+    augment_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    augment_parser.add_argument("--model-snapshot-path")
+    augment_parser.add_argument("--teacher-attention-backend", default="TRTLLM_FP8")
+    augment_parser.add_argument("--training-attention-backend", default="TRTLLM_FP8")
+    augment_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
+    augment_parser.add_argument("--command")
+    augment_parser.set_defaults(func=_run_augment_rollout_tuples_command)
+
+    rollout_parser = subparsers.add_parser("run-rollout-qat")
+    rollout_parser.add_argument("--config", required=True)
+    rollout_parser.add_argument("--model", required=True)
+    rollout_parser.add_argument("--visual-gen-args", required=True)
+    rollout_parser.add_argument("--teacher-model")
+    rollout_parser.add_argument("--teacher-visual-gen-args")
+    rollout_parser.add_argument("--summary-json")
+    rollout_parser.add_argument("--closed-set-target-manifest")
+    rollout_parser.add_argument("--rollout-metadata-jsonl")
+    rollout_parser.add_argument("--scheduler-metadata-source")
+    rollout_parser.add_argument("--reference-image-root")
+    rollout_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
+    rollout_parser.add_argument("--allocation-id")
+    rollout_parser.add_argument("--job-id")
+    rollout_parser.add_argument("--node-list")
+    rollout_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    rollout_parser.add_argument("--model-snapshot-path")
+    rollout_parser.add_argument("--teacher-attention-backend", default="TRTLLM_FP8")
+    rollout_parser.add_argument("--training-attention-backend", default="TRTLLM_FP8")
+    rollout_parser.add_argument("--evaluation-attention-backend", default="TRTLLM_FP8")
+    rollout_parser.add_argument("--command")
+    rollout_parser.set_defaults(func=_run_rollout_qat_command)
     return parser
 
 
@@ -3461,7 +4133,11 @@ __all__ = [
     "PROBE_SUMMARY_FORMAT",
     "QWEN_BLOCK_LINEAR_TARGET",
     "QWEN_IMAGE_QAT_PROBE_RECIPES",
+    "ROLLOUT_AUGMENTATION_SUMMARY_FORMAT",
+    "ROLLOUT_METADATA_MANIFEST_FORMAT",
     "ROLLOUT_MONITOR_SUMMARY_FORMAT",
+    "ROLLOUT_QAT_SUMMARY_FORMAT",
+    "ROLLOUT_SCHEDULER_STEP_IMPLEMENTATION",
     "ROLLOUT_TUPLE_SCHEMA_VERSION",
     "QwenImageQatInjectionInfo",
     "QwenImageQatMonitorConfig",
@@ -3490,13 +4166,18 @@ __all__ = [
     "first_tensor_output",
     "forward_qwen_image_tuple",
     "load_qwen_image_qat_checkpoint",
+    "load_qwen_image_rollout_metadata_manifest",
+    "load_qwen_image_rollout_qat_config",
     "load_qwen_image_tuple_sample",
     "main",
     "monitor_qwen_image_rollout_no_grad",
     "monitor_qwen_image_qat_checkpoint",
     "normalize_qwen_image_qat_parameter_name",
     "prepare_qwen_image_qat_model",
+    "qwen_image_rollout_scheduler_step",
     "qwen_image_qat_trainable_parameter_names",
+    "run_qwen_image_rollout_qat",
+    "run_qwen_image_rollout_tuple_augmentation",
     "run_qwen_image_qat_checkpoint_monitor",
     "run_qwen_image_qat_checkpoint_rgb_eval",
     "run_qwen_image_qat_probe",
