@@ -18,14 +18,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+import json
 import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 from scripts.visualgen_eval.qwen_image_capture_manifest import (
     BF16_TEACHER_TRAJECTORY_SOURCE,
@@ -52,6 +54,9 @@ from scripts.visualgen_eval.qwen_image_prompt_manifest import read_jsonl as read
 
 CAPTURED_TUPLE_STATUS = "captured"
 CAPTURED_STATUS = "captured"
+ROLLOUT_METADATA_ENTRY_FORMAT = "qwen_image_rollout_metadata_entry_v1"
+ROLLOUT_METADATA_SUMMARY_FORMAT = "qwen_image_rollout_metadata_manifest_summary_v1"
+ROLLOUT_METADATA_DERIVATION_METHOD = "bf16_teacher_tuple_cfg_scheduler_step_v1"
 BF16_TENSOR_FIELDS = (
     "hidden_states",
     "timestep",
@@ -524,6 +529,387 @@ def validate_teacher_tuple_payload(
         raise ValueError("teacher tuple payload trajectory_source must be bf16_teacher")
 
 
+def write_rollout_metadata_from_captured_tuples(
+    *,
+    records: list[dict[str, object]],
+    capture_summary: dict[str, object],
+    tuple_entries: list[dict[str, object]],
+    output_metadata_root: Path,
+    output_metadata_jsonl: Path,
+    summary_json: Path | None = None,
+    provenance: Mapping[str, object] | None = None,
+    torch_module: Any | None = None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Derive rollout latent metadata from captured BF16 teacher tuples.
+
+    Existing teacher tuples already contain the packed latent before the scheduler step
+    as ``hidden_states`` plus BF16 cond/negative transformer outputs. This helper rebuilds
+    the Qwen-Image true-CFG output and applies the same first-order FlowMatch/Euler
+    scheduler step used by the rollout trainer, producing durable metadata that can be
+    consumed by ``augment-rollout-tuples``.
+    """
+    torch_module = torch_module or _load_torch()
+    runtime_provenance = dict(provenance or {})
+    _validate_rollout_metadata_runtime_provenance(runtime_provenance)
+    _validate_rollout_capture_summary(capture_summary)
+
+    records_by_prompt = {_expect_string(record, "prompt_id"): record for record in records}
+    grouped_entries = _group_rollout_tuple_entries(tuple_entries)
+    scheduler = _rollout_scheduler_spec(capture_summary)
+    scheduler_config_signature = _stable_hash(scheduler["scheduler_config"])
+    sigmas = scheduler["sigmas"]
+    sigmas_hash = _stable_hash(sigmas)
+
+    metadata_records: list[dict[str, object]] = []
+    output_metadata_root.mkdir(parents=True, exist_ok=True)
+    for (prompt_id, timestep_index), branch_entries in sorted(grouped_entries.items()):
+        record = records_by_prompt.get(prompt_id)
+        if record is None:
+            raise ValueError(f"rollout metadata tuple references unknown prompt_id {prompt_id}")
+        cond_entry = branch_entries.get("cond")
+        negative_entry = branch_entries.get("negative")
+        if cond_entry is None or negative_entry is None:
+            raise ValueError(
+                "rollout metadata requires paired cond/negative tuple entries for "
+                f"{prompt_id} timestep {timestep_index}"
+            )
+        cond_payload = _load_and_validate_tuple(cond_entry, torch_module)
+        negative_payload = _load_and_validate_tuple(negative_entry, torch_module)
+        latent_before = _expect_tensor_field(cond_payload, "hidden_states", torch_module)
+        negative_latent_before = _expect_tensor_field(
+            negative_payload, "hidden_states", torch_module
+        )
+        if not bool(torch_module.equal(latent_before, negative_latent_before)):
+            raise ValueError(
+                "rollout metadata requires cond/negative hidden_states to match for "
+                f"{prompt_id} timestep {timestep_index}"
+            )
+        cond_output = _expect_tensor_field(cond_payload, "target_output", torch_module)
+        negative_output = _expect_tensor_field(negative_payload, "target_output", torch_module)
+        guidance_scale = float(_expect_number(record, "guidance_scale"))
+        guided_output = _combine_qwen_image_cfg_outputs(
+            cond_output,
+            negative_output,
+            guidance_scale=guidance_scale,
+            torch_module=torch_module,
+        )
+        scheduler_state = _rollout_scheduler_state_for_step(
+            scheduler=scheduler,
+            timestep_index=timestep_index,
+            scheduler_config_signature=scheduler_config_signature,
+            sigmas_hash=sigmas_hash,
+        )
+        sigma_delta = float(scheduler_state["sigma_delta"])
+        latent_after = (latent_before.float() + guided_output.float() * sigma_delta).to(
+            dtype=latent_before.dtype
+        )
+
+        step_dir = output_metadata_root / _expect_string(cond_entry, "split") / prompt_id
+        step_dir.mkdir(parents=True, exist_ok=True)
+        latent_before_path = step_dir / f"step{timestep_index:03d}_latent_before.pt"
+        latent_after_path = step_dir / f"step{timestep_index:03d}_latent_after.pt"
+        torch_module.save(latent_before.detach().cpu(), latent_before_path)
+        torch_module.save(latent_after.detach().cpu(), latent_after_path)
+
+        for entry in (cond_entry, negative_entry):
+            reference_image_path = _expect_string(entry, "reference_image_path")
+            metadata_records.append(
+                {
+                    "format": ROLLOUT_METADATA_ENTRY_FORMAT,
+                    "tuple_id": _expect_string(entry, "tuple_id"),
+                    "prompt_id": prompt_id,
+                    "split": _expect_string(entry, "split"),
+                    "timestep_index": timestep_index,
+                    "timestep_bin": _expect_string(entry, "timestep_bin"),
+                    "cfg_branch": _expect_string(entry, "cfg_branch"),
+                    "latent_before_step_path": str(latent_before_path),
+                    "latent_after_step_path": str(latent_after_path),
+                    "scheduler_state": dict(scheduler_state),
+                    "rollout_provenance": _build_rollout_metadata_provenance(
+                        record=record,
+                        entry=entry,
+                        capture_summary=capture_summary,
+                        runtime_provenance=runtime_provenance,
+                        scheduler_config_signature=scheduler_config_signature,
+                        sigmas_hash=sigmas_hash,
+                        reference_image_path=reference_image_path,
+                    ),
+                    "guidance_scale": guidance_scale,
+                    "reference_image_path": reference_image_path,
+                }
+            )
+
+    output_metadata_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    write_jsonl(output_metadata_jsonl, metadata_records)
+    summary = _build_rollout_metadata_summary(
+        records=records,
+        tuple_entries=tuple_entries,
+        metadata_records=metadata_records,
+        capture_summary=capture_summary,
+        output_metadata_root=output_metadata_root,
+        output_metadata_jsonl=output_metadata_jsonl,
+        summary_json=summary_json,
+        runtime_provenance=runtime_provenance,
+        scheduler_config_signature=scheduler_config_signature,
+        sigmas_hash=sigmas_hash,
+    )
+    if summary_json is not None:
+        write_json(summary_json, summary)
+    return metadata_records, summary
+
+
+def _load_and_validate_tuple(entry: dict[str, object], torch_module: Any) -> dict[str, object]:
+    tuple_path = Path(_expect_string(entry, "tuple_path"))
+    payload = _torch_load(tuple_path, torch_module)
+    validate_teacher_tuple_payload(payload, entry=entry, torch_module=torch_module)
+    if not isinstance(payload, dict):
+        raise ValueError(f"teacher tuple payload must be a mapping: {tuple_path}")
+    return payload
+
+
+def _expect_tensor_field(payload: dict[str, object], field_name: str, torch_module: Any) -> Any:
+    value = payload.get(field_name)
+    if not _is_tensor(value, torch_module):
+        raise ValueError(f"teacher tuple field {field_name} must be a tensor")
+    return value
+
+
+def _group_rollout_tuple_entries(
+    tuple_entries: list[dict[str, object]],
+) -> dict[tuple[str, int], dict[str, dict[str, object]]]:
+    grouped: dict[tuple[str, int], dict[str, dict[str, object]]] = defaultdict(dict)
+    for entry in tuple_entries:
+        if _expect_string(entry, "status") != CAPTURED_TUPLE_STATUS:
+            raise ValueError("rollout metadata requires captured tuple entries")
+        prompt_id = _expect_string(entry, "prompt_id")
+        timestep_index = _expect_non_negative_int(entry, "timestep_index")
+        cfg_branch = _expect_string(entry, "cfg_branch")
+        if cfg_branch not in DEFAULT_CFG_BRANCHES:
+            raise ValueError(f"unsupported cfg_branch for rollout metadata: {cfg_branch}")
+        branch_entries = grouped[(prompt_id, timestep_index)]
+        if cfg_branch in branch_entries:
+            raise ValueError(
+                "duplicate rollout metadata tuple entry for "
+                f"{prompt_id} timestep {timestep_index} branch {cfg_branch}"
+            )
+        branch_entries[cfg_branch] = entry
+    if not grouped:
+        raise ValueError("rollout metadata requires at least one tuple entry")
+    return grouped
+
+
+def _rollout_scheduler_spec(capture_summary: dict[str, object]) -> dict[str, object]:
+    scheduler_provenance = _capture_scheduler_provenance(capture_summary)
+    scheduler_config = _expect_mapping(scheduler_provenance, "scheduler_config")
+    scheduler_class = _expect_string(scheduler_provenance, "scheduler_class")
+    num_train_timesteps = int(scheduler_config.get("num_train_timesteps", 1000))
+    timesteps = _expect_number_list(scheduler_provenance, "timesteps")
+    if len(timesteps) != _expect_positive_int(capture_summary, "num_inference_steps"):
+        raise ValueError("scheduler timesteps length must match num_inference_steps")
+    sigmas = [float(timestep) / float(num_train_timesteps) for timestep in timesteps]
+    if not sigmas:
+        raise ValueError("scheduler timesteps must not be empty")
+    if any(left < right for left, right in zip(sigmas, sigmas[1:])):
+        raise ValueError("scheduler sigmas must be monotonically non-increasing")
+    return {
+        "scheduler_class": scheduler_class,
+        "scheduler_config": scheduler_config,
+        "num_train_timesteps": num_train_timesteps,
+        "timesteps": timesteps,
+        "sigmas": sigmas,
+    }
+
+
+def _capture_scheduler_provenance(capture_summary: dict[str, object]) -> dict[str, object]:
+    scheduler = capture_summary.get("scheduler_provenance")
+    if isinstance(scheduler, dict):
+        return scheduler
+    capture_provenance = capture_summary.get("capture_provenance")
+    if isinstance(capture_provenance, dict) and isinstance(
+        capture_provenance.get("scheduler"), dict
+    ):
+        return capture_provenance["scheduler"]
+    raise ValueError("capture summary missing scheduler_provenance")
+
+
+def _rollout_scheduler_state_for_step(
+    *,
+    scheduler: dict[str, object],
+    timestep_index: int,
+    scheduler_config_signature: str,
+    sigmas_hash: str,
+) -> dict[str, object]:
+    timesteps = scheduler["timesteps"]
+    sigmas = scheduler["sigmas"]
+    if not isinstance(timesteps, list) or not isinstance(sigmas, list):
+        raise ValueError("scheduler spec timesteps/sigmas must be lists")
+    if timestep_index >= len(sigmas):
+        raise ValueError(f"timestep_index exceeds scheduler sigmas: {timestep_index}")
+    sigma = float(sigmas[timestep_index])
+    next_sigma = float(sigmas[timestep_index + 1]) if timestep_index + 1 < len(sigmas) else 0.0
+    return {
+        "scheduler_class": str(scheduler["scheduler_class"]),
+        "timestep": float(timesteps[timestep_index]),
+        "step_index": timestep_index,
+        "timestep_index": timestep_index,
+        "num_inference_steps": len(sigmas),
+        "num_train_timesteps": int(scheduler["num_train_timesteps"]),
+        "sigma": sigma,
+        "next_sigma": next_sigma,
+        "sigma_next": next_sigma,
+        "sigma_delta": next_sigma - sigma,
+        "dt": next_sigma - sigma,
+        "order": 1,
+        "begin_index": 0,
+        "scheduler_config_signature": scheduler_config_signature,
+        "sigmas_hash": sigmas_hash,
+        "stochastic_sampling": False,
+        "per_token_sigmas": False,
+        "per_token_timesteps": False,
+    }
+
+
+def _combine_qwen_image_cfg_outputs(
+    cond_output: Any,
+    negative_output: Any,
+    *,
+    guidance_scale: float,
+    torch_module: Any,
+) -> Any:
+    if tuple(cond_output.shape) != tuple(negative_output.shape):
+        raise ValueError("cond and negative target_output tensors must have matching shapes")
+    guided = negative_output.float() + float(guidance_scale) * (
+        cond_output.float() - negative_output.float()
+    )
+    cond_norm = torch_module.norm(cond_output.float(), dim=-1, keepdim=True)
+    guided_norm = torch_module.norm(guided, dim=-1, keepdim=True).clamp_min(1.0e-8)
+    return guided * (cond_norm / guided_norm)
+
+
+def _build_rollout_metadata_provenance(
+    *,
+    record: dict[str, object],
+    entry: dict[str, object],
+    capture_summary: dict[str, object],
+    runtime_provenance: dict[str, object],
+    scheduler_config_signature: str,
+    sigmas_hash: str,
+    reference_image_path: str,
+) -> dict[str, object]:
+    prompt_id = _expect_string(record, "prompt_id")
+    return {
+        "derivation_method": ROLLOUT_METADATA_DERIVATION_METHOD,
+        "scheduler_config_signature": scheduler_config_signature,
+        "sigmas_hash": sigmas_hash,
+        "git_head": _expect_string(runtime_provenance, "git_head"),
+        "prompt_id": prompt_id,
+        "seed": _expect_positive_int(record, "seed"),
+        "height": _expect_positive_int(record, "height"),
+        "width": _expect_positive_int(record, "width"),
+        "num_inference_steps": _expect_positive_int(record, "num_inference_steps"),
+        "guidance_scale": float(_expect_number(record, "guidance_scale")),
+        "reference_image_path": reference_image_path,
+        "source_tuple_id": _expect_string(entry, "tuple_id"),
+        "source_capture_git_head": capture_summary.get("git_head"),
+        "source_capture_status": capture_summary.get("capture_status"),
+        "closed_set_target_manifest": runtime_provenance.get("closed_set_target_manifest"),
+        "scheduler_metadata_source": runtime_provenance.get("scheduler_metadata_source"),
+        "cfg_normalize": True,
+        "scheduler_state_equivalent": False,
+    }
+
+
+def _build_rollout_metadata_summary(
+    *,
+    records: list[dict[str, object]],
+    tuple_entries: list[dict[str, object]],
+    metadata_records: list[dict[str, object]],
+    capture_summary: dict[str, object],
+    output_metadata_root: Path,
+    output_metadata_jsonl: Path,
+    summary_json: Path | None,
+    runtime_provenance: dict[str, object],
+    scheduler_config_signature: str,
+    sigmas_hash: str,
+) -> dict[str, object]:
+    prompt_ids = sorted({_expect_string(entry, "prompt_id") for entry in tuple_entries})
+    return {
+        "format": ROLLOUT_METADATA_SUMMARY_FORMAT,
+        "derivation_method": ROLLOUT_METADATA_DERIVATION_METHOD,
+        "prompt_count": len(prompt_ids),
+        "tuple_count": len(tuple_entries),
+        "metadata_record_count": len(metadata_records),
+        "prompt_ids": prompt_ids,
+        "source_capture_summary_status": capture_summary.get("capture_status"),
+        "source_capture_git_head": capture_summary.get("git_head"),
+        "output_metadata_root": str(output_metadata_root),
+        "output_metadata_jsonl": str(output_metadata_jsonl),
+        "summary_json": str(summary_json) if summary_json is not None else None,
+        "scheduler_config_signature": scheduler_config_signature,
+        "sigmas_hash": sigmas_hash,
+        "runtime_provenance": dict(runtime_provenance),
+        "record_prompt_count": len(records),
+    }
+
+
+def _validate_rollout_capture_summary(capture_summary: dict[str, object]) -> None:
+    if capture_summary.get("format") != CAPTURE_MANIFEST_FORMAT:
+        raise ValueError(f"capture summary format must be {CAPTURE_MANIFEST_FORMAT}")
+    if capture_summary.get("capture_status") != CAPTURED_STATUS:
+        raise ValueError("rollout metadata requires a captured teacher capture summary")
+    if _contains_forbidden_runtime(capture_summary):
+        raise ValueError("rollout metadata capture summary must not include Docker/no-enroot")
+    _rollout_scheduler_spec(capture_summary)
+
+
+def _validate_rollout_metadata_runtime_provenance(
+    provenance: dict[str, object],
+) -> None:
+    required_fields = (
+        "cluster_alias",
+        "container_runtime",
+        "enroot_image",
+        "command",
+        "model_snapshot_path",
+        "git_head",
+        "closed_set_target_manifest",
+        "scheduler_metadata_source",
+        "reference_image_root",
+        "node_list",
+    )
+    missing = [
+        field_name for field_name in required_fields if provenance.get(field_name) in (None, "")
+    ]
+    if missing:
+        raise ValueError(f"rollout metadata provenance missing required fields {missing}")
+    if provenance["cluster_alias"] != DEFAULT_CLUSTER_ALIAS:
+        raise ValueError(
+            f"rollout metadata provenance cluster_alias must be {DEFAULT_CLUSTER_ALIAS}"
+        )
+    if provenance["container_runtime"] != DEFAULT_CONTAINER_RUNTIME:
+        raise ValueError(
+            f"rollout metadata provenance container_runtime must be {DEFAULT_CONTAINER_RUNTIME}"
+        )
+    if provenance["enroot_image"] != DEFAULT_ENROOT_IMAGE:
+        raise ValueError(f"rollout metadata provenance enroot_image must be {DEFAULT_ENROOT_IMAGE}")
+    if provenance.get("allocation_id") in (None, "") and provenance.get("job_id") in (None, ""):
+        raise ValueError("rollout metadata provenance requires allocation_id or job_id")
+    if _contains_forbidden_runtime(provenance):
+        raise ValueError("rollout metadata provenance must not include Docker/no-enroot")
+
+
+def _expect_number_list(value: dict[str, object], field_name: str) -> list[float]:
+    field = value.get(field_name)
+    if not isinstance(field, list) or not all(isinstance(item, (int, float)) for item in field):
+        raise ValueError(f"{field_name} must be a list of numbers")
+    return [float(item) for item in field]
+
+
+def _stable_hash(value: object) -> str:
+    encoded = json.dumps(_jsonable(value), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _is_bfloat16_tensor(value: object, torch_module: Any) -> bool:
     dtype = getattr(value, "dtype", None)
     bfloat16 = getattr(torch_module, "bfloat16", None)
@@ -614,6 +1000,28 @@ def build_runtime_provenance(
     if pipeline is not None:
         provenance["scheduler"] = collect_scheduler_provenance(pipeline)
     return provenance
+
+
+def build_rollout_metadata_runtime_provenance(
+    args: argparse.Namespace,
+    *,
+    capture_summary: dict[str, object],
+) -> dict[str, object]:
+    durable_paths = _expect_mapping(capture_summary, "durable_paths")
+    return {
+        "cluster_alias": args.cluster_alias,
+        "allocation_id": args.allocation_id or os.environ.get("SSH_GW_ALLOC_ID"),
+        "job_id": args.job_id or os.environ.get("SLURM_JOB_ID"),
+        "node_list": args.node_list or os.environ.get("SLURM_NODELIST"),
+        "container_runtime": DEFAULT_CONTAINER_RUNTIME,
+        "enroot_image": args.enroot_image,
+        "command": args.command or " ".join(sys.argv),
+        "model_snapshot_path": args.model_snapshot_path,
+        "git_head": git_commit(Path.cwd()),
+        "closed_set_target_manifest": str(args.closed_set_target_manifest),
+        "scheduler_metadata_source": str(args.capture_summary_json),
+        "reference_image_root": _expect_string(durable_paths, "bf16_references"),
+    }
 
 
 def _jsonable(value: object) -> object:
@@ -834,6 +1242,25 @@ def _validate_captured_command(args: argparse.Namespace) -> None:
     )
 
 
+def _generate_rollout_metadata_command(args: argparse.Namespace) -> None:
+    records = read_prompt_jsonl(Path(args.prompt_manifest_jsonl))
+    capture_summary = read_json(Path(args.capture_summary_json))
+    tuple_entries = read_tuple_index_jsonl(Path(args.tuple_index_jsonl))
+    provenance = build_rollout_metadata_runtime_provenance(
+        args,
+        capture_summary=capture_summary,
+    )
+    write_rollout_metadata_from_captured_tuples(
+        records=records,
+        capture_summary=capture_summary,
+        tuple_entries=tuple_entries,
+        output_metadata_root=Path(args.output_metadata_root),
+        output_metadata_jsonl=Path(args.output_metadata_jsonl),
+        summary_json=Path(args.summary_json),
+        provenance=provenance,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -853,6 +1280,23 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--capture-summary-json", required=True)
     validate_parser.add_argument("--tuple-index-jsonl", required=True)
     validate_parser.set_defaults(func=_validate_captured_command)
+
+    rollout_metadata_parser = subparsers.add_parser("generate-rollout-metadata")
+    rollout_metadata_parser.add_argument("--prompt-manifest-jsonl", required=True)
+    rollout_metadata_parser.add_argument("--capture-summary-json", required=True)
+    rollout_metadata_parser.add_argument("--tuple-index-jsonl", required=True)
+    rollout_metadata_parser.add_argument("--output-metadata-root", required=True)
+    rollout_metadata_parser.add_argument("--output-metadata-jsonl", required=True)
+    rollout_metadata_parser.add_argument("--summary-json", required=True)
+    rollout_metadata_parser.add_argument("--closed-set-target-manifest", required=True)
+    rollout_metadata_parser.add_argument("--cluster-alias", default=DEFAULT_CLUSTER_ALIAS)
+    rollout_metadata_parser.add_argument("--allocation-id")
+    rollout_metadata_parser.add_argument("--job-id")
+    rollout_metadata_parser.add_argument("--node-list")
+    rollout_metadata_parser.add_argument("--enroot-image", default=DEFAULT_ENROOT_IMAGE)
+    rollout_metadata_parser.add_argument("--model-snapshot-path", required=True)
+    rollout_metadata_parser.add_argument("--command")
+    rollout_metadata_parser.set_defaults(func=_generate_rollout_metadata_command)
     return parser
 
 
