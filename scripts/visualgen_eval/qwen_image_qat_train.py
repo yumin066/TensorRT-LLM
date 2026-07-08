@@ -354,6 +354,7 @@ class QwenImageRolloutQatTrainingConfig:
     expected_num_layers: int | None = FORMAL_QWEN_IMAGE_BLOCK_LAYER_COUNT
     expected_target_count: int | None = FORMAL_QWEN_IMAGE_BLOCK_LINEAR_TARGET_COUNT
     diagnostic_only: bool = False
+    teacher_target_mode: str = "on_policy"
     loss: QwenImageRolloutLossConfig = field(default_factory=QwenImageRolloutLossConfig)
     log_interval_steps: int = 1
     checkpoint_name: str = "qwen_image_closed_set_rollout_qat_lora_last.pt"
@@ -1600,6 +1601,7 @@ def load_qwen_image_rollout_qat_config(
             )
         ),
         diagnostic_only=bool(data.get("diagnostic_only", False)),
+        teacher_target_mode=str(data.get("teacher_target_mode", "on_policy")),
         loss=loss,
         log_interval_steps=int(data.get("log_interval_steps", 1)),
         checkpoint_name=str(
@@ -1694,23 +1696,35 @@ def run_qwen_image_rollout_qat(
         visual_gen_args=Path(visual_gen_args),
         device=config.device,
     )
-    teacher_pipeline = load_single_worker_pipeline(
-        model=teacher_model or model,
-        visual_gen_args=Path(teacher_visual_gen_args or visual_gen_args),
-        device=config.device,
-    )
+    teacher_pipeline = None
     try:
         student_transformer = getattr(student_pipeline, "transformer", None)
-        teacher_transformer = getattr(teacher_pipeline, "transformer", None)
-        if student_transformer is None or teacher_transformer is None:
-            raise ValueError("Loaded Qwen-Image pipelines must expose transformer components")
+        if student_transformer is None:
+            raise ValueError("Loaded Qwen-Image student pipeline must expose a transformer")
+        teacher_transformer = None
+        teacher_forward_fn = None
+        if config.teacher_target_mode == "on_policy":
+            teacher_pipeline = load_single_worker_pipeline(
+                model=teacher_model or model,
+                visual_gen_args=Path(teacher_visual_gen_args or visual_gen_args),
+                device=config.device,
+            )
+            teacher_transformer = getattr(teacher_pipeline, "transformer", None)
+            if teacher_transformer is None:
+                raise ValueError("Loaded Qwen-Image teacher pipeline must expose a transformer")
+        elif config.teacher_target_mode == "captured_tuple":
+            teacher_forward_fn = _captured_rollout_teacher_target
+        else:
+            raise ValueError(f"unsupported teacher_target_mode: {config.teacher_target_mode}")
         result = train_qwen_image_rollout_qat(
             student_transformer,
             config,
             teacher_transformer=teacher_transformer,
+            teacher_forward_fn=teacher_forward_fn,
         )
     finally:
-        cleanup_pipeline(teacher_pipeline)
+        if teacher_pipeline is not None:
+            cleanup_pipeline(teacher_pipeline)
         cleanup_pipeline(student_pipeline)
 
     summary_path = (
@@ -3349,6 +3363,13 @@ def _forward_rollout_teacher_branch(
     )
 
 
+def _captured_rollout_teacher_target(
+    teacher_input: torch.Tensor,
+    sample: QwenImageTupleSample,
+) -> torch.Tensor:
+    return sample.target_output.to(device=teacher_input.device, dtype=teacher_input.dtype)
+
+
 def _validate_output_shape_pair(
     student_output: torch.Tensor,
     teacher_output: torch.Tensor,
@@ -3683,6 +3704,8 @@ def _validate_rollout_training_config(config: QwenImageRolloutQatTrainingConfig)
         raise ValueError("lora_rank must be positive")
     if config.lora_alpha <= 0.0:
         raise ValueError("lora_alpha must be positive")
+    if config.teacher_target_mode not in ("on_policy", "captured_tuple"):
+        raise ValueError("teacher_target_mode must be 'on_policy' or 'captured_tuple'")
     expected_num_layers = _optional_int(config.expected_num_layers)
     expected_target_count = _optional_int(config.expected_target_count)
     if (
@@ -3904,6 +3927,7 @@ def _rollout_training_config_to_dict(
         "expected_num_layers": config.expected_num_layers,
         "expected_target_count": config.expected_target_count,
         "diagnostic_only": config.diagnostic_only,
+        "teacher_target_mode": config.teacher_target_mode,
         "loss": _rollout_loss_config_to_dict(config.loss),
         "log_interval_steps": config.log_interval_steps,
         "checkpoint_name": config.checkpoint_name,

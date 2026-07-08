@@ -1108,6 +1108,7 @@ def test_load_rollout_qat_config_defaults_closed_set_recipe(tmp_path: Path) -> N
     assert config.expected_num_layers == 60
     assert config.expected_target_count == 840
     assert config.diagnostic_only is False
+    assert config.teacher_target_mode == "on_policy"
     assert config.loss.rollout_k == 4
     assert config.loss.timestep_weights["late"] == pytest.approx(8.0)
     assert config.checkpoint_interval_steps == 250
@@ -1539,6 +1540,7 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
             expected_num_layers=1,
             expected_target_count=14,
             diagnostic_only=True,
+            teacher_target_mode="captured_tuple",
             loss=QwenImageRolloutLossConfig(
                 rollout_k=1,
                 cfg_normalize=False,
@@ -1566,6 +1568,7 @@ def test_train_qwen_image_rollout_qat_updates_lora_from_rollout_loss(tmp_path: P
     assert checkpoint["config"]["recipe"] == "closed_set_rollout_qat_v1"
     assert checkpoint["config"]["lora_rank"] == 4
     assert checkpoint["config"]["diagnostic_only"] is True
+    assert checkpoint["config"]["teacher_target_mode"] == "captured_tuple"
     assert checkpoint["config"]["checkpoint_interval_steps"] == 1
     assert checkpoint["config"]["loss"]["timestep_weights"]["late"] == pytest.approx(8.0)
     step_checkpoint = result.output_dir / "rollout_last_step0001.pt"
