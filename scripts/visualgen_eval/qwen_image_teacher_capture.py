@@ -1243,7 +1243,7 @@ def _validate_captured_command(args: argparse.Namespace) -> None:
 
 
 def _generate_rollout_metadata_command(args: argparse.Namespace) -> None:
-    records = read_prompt_jsonl(Path(args.prompt_manifest_jsonl))
+    records = read_rollout_metadata_prompt_jsonl(Path(args.prompt_manifest_jsonl))
     capture_summary = read_json(Path(args.capture_summary_json))
     tuple_entries = read_tuple_index_jsonl(Path(args.tuple_index_jsonl))
     provenance = build_rollout_metadata_runtime_provenance(
@@ -1259,6 +1259,40 @@ def _generate_rollout_metadata_command(args: argparse.Namespace) -> None:
         summary_json=Path(args.summary_json),
         provenance=provenance,
     )
+
+
+def read_rollout_metadata_prompt_jsonl(path: Path) -> list[dict[str, object]]:
+    """Read closed-set prompt records without requiring calibration split names."""
+    records: list[dict[str, object]] = []
+    prompt_ids: set[str] = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise ValueError(f"prompt manifest line {line_number} must be a mapping")
+        prompt_id = _expect_string(record, "prompt_id")
+        if prompt_id in prompt_ids:
+            raise ValueError(
+                f"duplicate prompt_id in rollout metadata prompt manifest: {prompt_id}"
+            )
+        prompt_ids.add(prompt_id)
+        for field_name in (
+            "seed",
+            "height",
+            "width",
+            "num_inference_steps",
+            "guidance_scale",
+        ):
+            if record.get(field_name) is None:
+                raise ValueError(
+                    "rollout metadata prompt manifest missing required field "
+                    f"{field_name} for prompt_id {prompt_id}"
+                )
+        records.append(record)
+    if not records:
+        raise ValueError(f"rollout metadata prompt manifest is empty: {path}")
+    return records
 
 
 def build_parser() -> argparse.ArgumentParser:
