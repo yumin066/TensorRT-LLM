@@ -584,6 +584,69 @@ def _load_component_weights(
 # ---------------------------------------------------------------------------
 
 
+def build_ltx2_transformer(pipeline_config) -> LTXModel:
+    """Construct the native LTX-2 transformer (``LTXModel``) from checkpoint config.
+
+    Shared by ``LTX2Pipeline`` (generation) and ``LTX2RetakePipeline`` (retake)
+    so both build the same native transformer from the checkpoint's own
+    architecture parameters, matching the reference
+    ``LTXModelConfigurator.from_config()``.  Missing keys fall back to the same
+    defaults the reference uses.
+
+    Reading ``rope_type`` / positional-embedding / timestep-multiplier values
+    from the checkpoint config (rather than relying on constructor defaults) is
+    required for parity with the upstream reference model.
+    """
+    attn_cfg = getattr(pipeline_config, "attention", None)
+    if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+        raise NotImplementedError(
+            "Quantized attention is not yet supported for the LTX-2 pipeline."
+        )
+
+    model_config = pipeline_config.model_configs["transformer"]
+    cfg = model_config.pretrained_config
+
+    rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
+    freq_prec = getattr(cfg, "frequencies_precision", False)
+    double_precision_rope = freq_prec == "float64"
+    apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
+
+    logger.info(
+        f"LTX2 transformer config: rope_type={rope_type.value}, "
+        f"double_precision_rope={double_precision_rope}, "
+        f"apply_gated_attention={apply_gated_attention}"
+    )
+
+    transformer = LTXModel(
+        model_type=LTXModelType.AudioVideo,
+        num_attention_heads=getattr(cfg, "num_attention_heads", 32),
+        attention_head_dim=getattr(cfg, "attention_head_dim", 128),
+        in_channels=getattr(cfg, "in_channels", 128),
+        out_channels=getattr(cfg, "out_channels", 128),
+        num_layers=getattr(cfg, "num_layers", 48),
+        cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
+        norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
+        caption_channels=getattr(cfg, "caption_channels", 3840),
+        positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
+        positional_embedding_max_pos=getattr(cfg, "positional_embedding_max_pos", [20, 2048, 2048]),
+        timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
+        use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
+        audio_num_attention_heads=getattr(cfg, "audio_num_attention_heads", 32),
+        audio_attention_head_dim=getattr(cfg, "audio_attention_head_dim", 64),
+        audio_in_channels=getattr(cfg, "audio_in_channels", 128),
+        audio_out_channels=getattr(cfg, "audio_out_channels", 128),
+        audio_cross_attention_dim=getattr(cfg, "audio_cross_attention_dim", 2048),
+        audio_positional_embedding_max_pos=getattr(cfg, "audio_positional_embedding_max_pos", [20]),
+        av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
+        rope_type=rope_type,
+        double_precision_rope=double_precision_rope,
+        apply_gated_attention=apply_gated_attention,
+        model_config=model_config,
+    )
+    transformer._transformer_config = vars(cfg)
+    return transformer
+
+
 # ``LTX2Pipeline`` owns the canonical ``Lightricks/LTX-2`` discovery
 # surface. ``_detect_from_checkpoint()`` returns ``"LTX2Pipeline"`` from
 # ``model_index.json`` / safetensors metadata, and the pipeline_config
@@ -743,63 +806,8 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def _init_transformer(self) -> None:
-        """Create LTXModel from pretrained_config.
-
-        Reads all architecture parameters from the checkpoint config to match
-        the reference ``LTXModelConfigurator.from_config()``.  Missing keys
-        fall back to the same defaults the reference uses.
-        """
-        attn_cfg = getattr(self.pipeline_config, "attention", None)
-        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
-            raise NotImplementedError(
-                "Quantized attention is not yet supported for the LTX-2 pipeline."
-            )
-
-        model_config = self.pipeline_config.model_configs["transformer"]
-        cfg = model_config.pretrained_config
-
-        rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
-        freq_prec = getattr(cfg, "frequencies_precision", False)
-        double_precision_rope = freq_prec == "float64"
-        apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
-
-        logger.info(
-            f"LTX2 transformer config: rope_type={rope_type.value}, "
-            f"double_precision_rope={double_precision_rope}, "
-            f"apply_gated_attention={apply_gated_attention}"
-        )
-
-        self.transformer = LTXModel(
-            model_type=LTXModelType.AudioVideo,
-            num_attention_heads=getattr(cfg, "num_attention_heads", 32),
-            attention_head_dim=getattr(cfg, "attention_head_dim", 128),
-            in_channels=getattr(cfg, "in_channels", 128),
-            out_channels=getattr(cfg, "out_channels", 128),
-            num_layers=getattr(cfg, "num_layers", 48),
-            cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
-            norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
-            caption_channels=getattr(cfg, "caption_channels", 3840),
-            positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
-            positional_embedding_max_pos=getattr(
-                cfg, "positional_embedding_max_pos", [20, 2048, 2048]
-            ),
-            timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
-            use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
-            audio_num_attention_heads=getattr(cfg, "audio_num_attention_heads", 32),
-            audio_attention_head_dim=getattr(cfg, "audio_attention_head_dim", 64),
-            audio_in_channels=getattr(cfg, "audio_in_channels", 128),
-            audio_out_channels=getattr(cfg, "audio_out_channels", 128),
-            audio_cross_attention_dim=getattr(cfg, "audio_cross_attention_dim", 2048),
-            audio_positional_embedding_max_pos=getattr(
-                cfg, "audio_positional_embedding_max_pos", [20]
-            ),
-            av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
-            rope_type=rope_type,
-            double_precision_rope=double_precision_rope,
-            apply_gated_attention=apply_gated_attention,
-            model_config=model_config,
-        )
-        self.transformer._transformer_config = vars(cfg)
+        """Create LTXModel from pretrained_config via :func:`build_ltx2_transformer`."""
+        self.transformer = build_ltx2_transformer(self.pipeline_config)
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)

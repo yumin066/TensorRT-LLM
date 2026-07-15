@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional LTX-2 retake workflow for VisualGen.
 
-This pipeline is intentionally a thin persistent-worker adapter around the
-official Lightricks ``ltx_pipelines.retake.RetakePipeline``. It lets
-``trtllm-serve`` keep the retake model resident and accept retake requests
-through VisualGen while the native TensorRT-LLM LTX-2 pipeline grows first-class
-temporal-mask support.
+This pipeline keeps a resident retake model for ``trtllm-serve``. It is being
+migrated onto the native TensorRT-LLM LTX-2 transformer (``LTXModel``): the
+native transformer is now built and weight-loaded here (via
+``build_ltx2_transformer`` and the native transformer loader) so retake can
+inherit the config-driven acceleration stack. The upstream Lightricks
+``ltx_pipelines.retake.RetakePipeline`` is still used for retake pre/post
+(source decode, temporal-region mask, composite) until that logic is ported
+natively.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ import torch
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm.logger import logger
+
+from .pipeline_ltx2 import LTX2Pipeline, _load_ltx2_transformer_weights, build_ltx2_transformer
 
 
 class LTX2RetakePipeline(BasePipeline):
@@ -87,16 +92,30 @@ class LTX2RetakePipeline(BasePipeline):
         }
 
     def _init_transformer(self) -> None:
-        self.transformer = None
+        # Build the native LTX-2 transformer so retake runs on the native model
+        # (and can inherit the config-driven acceleration stack) instead of the
+        # no-op ``None`` that forced the eager upstream-wrapper path.
+        self.transformer = build_ltx2_transformer(self.pipeline_config)
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
-        return {}
+        # Read native transformer weights from the LTX-2 checkpoint (same format
+        # and prefixes as the generation pipeline) instead of the previous no-op.
+        return _load_ltx2_transformer_weights(
+            checkpoint_dir,
+            LTX2Pipeline._TRANSFORMER_PREFIX,
+            exclude_prefixes=LTX2Pipeline._TRANSFORMER_EXCLUDE_PREFIXES,
+        )
 
     def load_weights(self, weights: dict) -> None:
-        return None
+        if self.transformer is not None and hasattr(self.transformer, "load_weights"):
+            transformer_weights = weights.get("transformer", weights)
+            self.transformer.load_weights(transformer_weights)
 
     def post_load_weights(self) -> None:
-        return None
+        # Finalize the native transformer (e.g. dynamic-quant weight loading)
+        # when it exposes a post-load hook.
+        if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
+            self.transformer.post_load_weights()
 
     def load_standard_components(
         self,
