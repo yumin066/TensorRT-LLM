@@ -117,6 +117,15 @@ class LTX2RetakePipeline(BasePipeline):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
+    def _setup_cuda_graphs(self) -> None:
+        # Retake now builds the native LTXModel, whose ``forward`` takes
+        # ``Modality`` dataclasses (not flat tensors). Delegate to the
+        # generation pipeline's Modality-aware setup so cuda graph uses
+        # ``_LTX2CUDAGraphRunner`` rather than the base ``CUDAGraphRunner`` and
+        # is allowed to compose with torch.compile (the base implementation
+        # disables cuda graph whenever torch_compile is enabled).
+        LTX2Pipeline._setup_cuda_graphs(self)
+
     def load_standard_components(
         self,
         checkpoint_dir: str,

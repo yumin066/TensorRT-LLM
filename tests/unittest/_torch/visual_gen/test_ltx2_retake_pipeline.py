@@ -21,6 +21,61 @@ def _minimal_retake_config():
     )
 
 
+class _StubNativeTransformer:
+    """Lightweight stand-in for the native ``LTXModel`` in host-side tests.
+
+    ``LTX2RetakePipeline._init_transformer`` now builds a real native
+    transformer; stubbing it keeps construction cheap while still exposing the
+    hooks the Modality-aware CUDA graph setup touches.
+    """
+
+    def register_cuda_graph_extra_key_fns(self, runner):
+        pass
+
+    def forward(self, *args, **kwargs):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _stub_native_transformer(monkeypatch):
+    # Keep host-side construction lightweight: retake builds a native LTXModel
+    # in _init_transformer, which would otherwise require a full checkpoint
+    # config and materialize the transformer.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake.build_ltx2_transformer",
+        lambda pipeline_config: _StubNativeTransformer(),
+    )
+
+
+def test_ltx2_retake_uses_modality_aware_cuda_graph_runner():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+
+    pipeline = LTX2RetakePipeline(_minimal_retake_config())
+    pipeline.pipeline_config.cuda_graph.enable = True
+    pipeline.pipeline_config.torch_compile.enable = False
+    pipeline._cuda_graph_runners = {}
+
+    pipeline._setup_cuda_graphs()
+
+    # Must use the LTX-2 Modality-aware runner, not the base flat-tensor one.
+    assert isinstance(pipeline._cuda_graph_runners.get("transformer"), _LTX2CUDAGraphRunner)
+
+
+def test_ltx2_retake_cuda_graph_composes_with_torch_compile():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+
+    pipeline = LTX2RetakePipeline(_minimal_retake_config())
+    pipeline.pipeline_config.cuda_graph.enable = True
+    pipeline.pipeline_config.torch_compile.enable = True
+    pipeline._cuda_graph_runners = {}
+
+    pipeline._setup_cuda_graphs()
+
+    # The base _setup_cuda_graphs disables cuda graph when torch_compile is on;
+    # the LTX-2 path must still register a runner (the two compose).
+    assert isinstance(pipeline._cuda_graph_runners.get("transformer"), _LTX2CUDAGraphRunner)
+
+
 def test_ltx2_workflow_retake_resolves_retake_variant():
     cfg = SimpleNamespace(extra_attrs={"workflow": "retake"}, cache_backend=None)
 
