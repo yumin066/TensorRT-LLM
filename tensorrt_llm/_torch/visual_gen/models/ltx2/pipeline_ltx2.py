@@ -1240,22 +1240,40 @@ class LTX2Pipeline(BasePipeline):
         )
 
     @torch.inference_mode()
-    def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
-        """Encode a preprocessed image tensor through the VAE encoder.
+    def _encode_video_window(self, video_5d: torch.Tensor) -> torch.Tensor:
+        """Encode an arbitrary source-video window through the VAE encoder.
+
+        Generalizes :meth:`_encode_image` (single frame) to a multi-frame window
+        so retake can VAE-encode the full source window for two-sided
+        conditioning, not just a leading image. The video VAE is temporally
+        causal, so ``T`` pixel frames map to
+        ``(T - 1) // vae_temporal_compression_ratio + 1`` latent frames.
 
         Args:
-            image_5d: ``(B, 3, 1, H, W)`` tensor in ``[-1, 1]``.
+            video_5d: ``(B, 3, T, H, W)`` tensor in ``[-1, 1]``.
 
         Returns:
-            Latent tensor ``(B, C, 1, H_lat, W_lat)``.
+            Latent tensor ``(B, C, T_lat, H_lat, W_lat)``.
         """
         if self.video_encoder is None:
             raise RuntimeError(
-                "Image-to-video requires a VAE encoder but video_encoder was "
-                "not loaded. Ensure the checkpoint contains encoder weights "
+                "Retake / image-to-video requires a VAE encoder but video_encoder "
+                "was not loaded. Ensure the checkpoint contains encoder weights "
                 "(vae.encoder.*) and encoder_blocks config."
             )
-        return self.video_encoder(image_5d)
+        if video_5d.dim() != 5 or video_5d.shape[1] != 3:
+            raise ValueError(
+                f"expected a (B, 3, T, H, W) video window; got {tuple(video_5d.shape)}"
+            )
+        return self.video_encoder(video_5d)
+
+    def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
+        """Encode a single preprocessed image (``(B, 3, 1, H, W)`` in ``[-1, 1]``).
+
+        Single-frame special case of :meth:`_encode_video_window`; returns
+        ``(B, C, 1, H_lat, W_lat)``.
+        """
+        return self._encode_video_window(image_5d)
 
     def _build_denoise_mask(
         self,
