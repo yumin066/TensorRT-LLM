@@ -29,7 +29,7 @@ from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, 
 from .ltx2_core.connector import (
     AudioEmbeddings1DConnectorConfigurator,
     Embeddings1DConnectorConfigurator,
-    GemmaFeaturesExtractorProjLinear,
+    GemmaFeaturesExtractorConfigurator,
 )
 from .ltx2_core.guiders import MultiModalGuider, MultiModalGuiderParams
 from .ltx2_core.modality import Modality
@@ -990,7 +990,7 @@ class LTX2Pipeline(BasePipeline):
         # connectors inside the diffusion model prefix.
         if "connectors" not in skip_components:
             logger.info("Loading native text connectors...")
-            self.feature_extractor = GemmaFeaturesExtractorProjLinear.from_config(config)
+            self.feature_extractor = GemmaFeaturesExtractorConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.feature_extractor,
@@ -1085,55 +1085,20 @@ class LTX2Pipeline(BasePipeline):
     # Text encoding
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _pack_text_embeds(
-        text_hidden_states: torch.Tensor,
-        sequence_lengths: torch.Tensor,
-        device: Union[str, torch.device],
-        padding_side: str = "left",
-        scale_factor: int = 8,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """Pack and normalize text encoder hidden states."""
-        batch_size, seq_len, hidden_dim, num_layers = text_hidden_states.shape
-        original_dtype = text_hidden_states.dtype
-
-        token_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-        if padding_side == "right":
-            mask = token_indices < sequence_lengths[:, None]
-        elif padding_side == "left":
-            start_indices = seq_len - sequence_lengths[:, None]
-            mask = token_indices >= start_indices
-        else:
-            raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
-        mask = mask[:, :, None, None]
-
-        masked_text_hidden_states = text_hidden_states.masked_fill(~mask, 0.0)
-        num_valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
-        masked_mean = masked_text_hidden_states.sum(dim=(1, 2), keepdim=True) / (
-            num_valid_positions + eps
-        )
-
-        x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(dim=(1, 2), keepdim=True)
-        x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(dim=(1, 2), keepdim=True)
-
-        normalized_hidden_states = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
-        normalized_hidden_states = normalized_hidden_states * scale_factor
-
-        normalized_hidden_states = normalized_hidden_states.flatten(2)
-        mask_flat = mask.squeeze(-1).expand(-1, -1, hidden_dim * num_layers)
-        normalized_hidden_states = normalized_hidden_states.masked_fill(~mask_flat, 0.0)
-        normalized_hidden_states = normalized_hidden_states.to(dtype=original_dtype)
-        return normalized_hidden_states
-
     def _encode_prompt(
         self,
         prompt: Union[str, List[str]],
         num_videos_per_prompt: int = 1,
         max_sequence_length: int = 1024,
-        scale_factor: int = 8,
     ):
-        """Encode prompt into text embeddings via Gemma3."""
+        """Encode prompt into raw stacked Gemma3 hidden states.
+
+        Returns the stacked per-layer hidden states ``[B, T, D, L]`` (in the
+        pipeline dtype) together with the binary attention mask ``[B, T]``.
+        Normalization and projection are deferred to the feature extractor so
+        that the V1 (mean/range) and V2 (per-token RMS) paths can each apply
+        their own normalization to the raw hidden states.
+        """
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -1154,27 +1119,22 @@ class LTX2Pipeline(BasePipeline):
             attention_mask=prompt_attention_mask,
             output_hidden_states=True,
         )
-        text_encoder_hidden_states = text_encoder_outputs.hidden_states
-        text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
-        sequence_lengths = prompt_attention_mask.sum(dim=-1)
+        # Stack per-layer hidden states -> [B, T, D, L] (L = num_layers + 1).
+        text_encoder_hidden_states = torch.stack(text_encoder_outputs.hidden_states, dim=-1)
+        text_encoder_hidden_states = text_encoder_hidden_states.to(dtype=self.dtype)
 
-        prompt_embeds = self._pack_text_embeds(
-            text_encoder_hidden_states,
-            sequence_lengths,
-            device=self.device,
-            padding_side=self.tokenizer.padding_side,
-            scale_factor=scale_factor,
+        _, seq_len, hidden_dim, num_layers = text_encoder_hidden_states.shape
+        text_encoder_hidden_states = text_encoder_hidden_states.repeat(
+            1, num_videos_per_prompt, 1, 1
         )
-        prompt_embeds = prompt_embeds.to(dtype=self.dtype)
-
-        _, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+        text_encoder_hidden_states = text_encoder_hidden_states.view(
+            batch_size * num_videos_per_prompt, seq_len, hidden_dim, num_layers
+        )
 
         prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
         prompt_attention_mask = prompt_attention_mask.repeat(num_videos_per_prompt, 1)
 
-        return prompt_embeds, prompt_attention_mask
+        return text_encoder_hidden_states, prompt_attention_mask
 
     # ------------------------------------------------------------------
     # Connector processing
@@ -1182,19 +1142,25 @@ class LTX2Pipeline(BasePipeline):
 
     def _process_connectors(
         self,
-        prompt_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple:
         """Run feature extraction and video/audio connectors.
 
+        ``hidden_states`` are the raw stacked Gemma hidden states ``[B, T, D, L]``
+        and ``attention_mask`` is the binary mask ``[B, T]``. The feature
+        extractor normalizes and projects the hidden states, returning separate
+        video and audio features (V1 returns the same tensor for both, so its
+        behavior is unchanged).
+
         Returns (video_embeds, audio_embeds, connector_mask).
         """
-        additive_mask = (1 - attention_mask.to(prompt_embeds.dtype)) * -1000000.0
+        additive_mask = (1 - attention_mask.to(hidden_states.dtype)) * -1000000.0
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
 
-        projected = self.feature_extractor(prompt_embeds)
-        video_embeds, video_mask = self.video_connector(projected, additive_mask)
-        audio_embeds, _ = self.audio_connector(projected, additive_mask)
+        video_features, audio_features = self.feature_extractor(hidden_states, attention_mask)
+        video_embeds, video_mask = self.video_connector(video_features, additive_mask)
+        audio_embeds, _ = self.audio_connector(audio_features, additive_mask)
 
         return video_embeds, audio_embeds, video_mask
 
@@ -1389,6 +1355,10 @@ class LTX2Pipeline(BasePipeline):
                 positions=video_positions,
                 context=v_context,
                 context_mask=mask,
+                # Per-batch noise level; the prompt AdaLN (cross_attention_adaln,
+                # e.g. the 22b) derives its text-context timestep from this. It is
+                # the unmasked scalar sigma, not the per-token ``v_timestep``.
+                sigma=timestep_val,
             )
             if v_latents_bf is not None
             else None
@@ -1401,6 +1371,7 @@ class LTX2Pipeline(BasePipeline):
                 positions=audio_positions,
                 context=a_context,
                 context_mask=mask,
+                sigma=timestep_val,
             )
             if a_latents_bf is not None
             else None

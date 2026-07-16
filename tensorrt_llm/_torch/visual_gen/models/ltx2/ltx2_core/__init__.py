@@ -15,7 +15,9 @@ from .attention import Attention, FeedForward, GELUApprox
 from .connector import (
     Embeddings1DConnector,
     Embeddings1DConnectorConfigurator,
-    GemmaFeaturesExtractorProjLinear,
+    FeatureExtractorV1,
+    FeatureExtractorV2,
+    GemmaFeaturesExtractorConfigurator,
 )
 from .diffusion_steps import EulerDiffusionStep
 from .modality import Modality
@@ -54,9 +56,11 @@ __all__ = [
     "Embeddings1DConnector",
     "Embeddings1DConnectorConfigurator",
     "EulerDiffusionStep",
+    "FeatureExtractorV1",
+    "FeatureExtractorV2",
     "FeedForward",
     "GELUApprox",
-    "GemmaFeaturesExtractorProjLinear",
+    "GemmaFeaturesExtractorConfigurator",
     "LTX2Scheduler",
     "LTXRopeType",
     "Modality",
