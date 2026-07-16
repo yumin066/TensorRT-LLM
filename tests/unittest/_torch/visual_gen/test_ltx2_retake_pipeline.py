@@ -15,6 +15,7 @@ from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
     LTX2RetakePipeline,
     _composite_retake_window,
     _fuse_lora_into_transformer_weights,
+    _init_retake_latents,
     _retake_conditioned_latent_ranges,
     _retake_pixel_window,
 )
@@ -652,6 +653,55 @@ def test_conditioned_latent_ranges_ratio_one_is_frame_identity():
     lw, cond = _retake_conditioned_latent_ranges(2, 5, 10, 1)
     assert lw == (2, 5)
     assert cond == [(0, 2), (5, 10)]
+
+
+def test_conditioned_latent_ranges_rejects_bad_ratio_or_frames():
+    with pytest.raises(ValueError, match="temporal_ratio"):
+        _retake_conditioned_latent_ranges(0, 8, 97, 0)
+    with pytest.raises(ValueError, match="num_frames"):
+        _retake_conditioned_latent_ranges(0, 8, -1, 8)
+
+
+def test_init_retake_latents_context_from_source_window_from_noise():
+    noise = torch.ones(1, 2, 5, 2, 2)
+    source = torch.full((1, 2, 5, 2, 2), 2.0)
+
+    out = _init_retake_latents(noise, source, [(0, 1), (4, 5)])
+
+    assert torch.equal(out[:, :, 0], source[:, :, 0])  # leading context from source
+    assert torch.equal(out[:, :, 4], source[:, :, 4])  # trailing context from source
+    assert torch.equal(out[:, :, 1:4], noise[:, :, 1:4])  # regenerated window stays noise
+    assert torch.equal(noise, torch.ones(1, 2, 5, 2, 2))  # input unmodified
+
+
+def test_init_retake_latents_full_window_keeps_all_noise():
+    noise = torch.randn(1, 2, 5, 2, 2)
+    source = torch.zeros(1, 2, 5, 2, 2)
+
+    out = _init_retake_latents(noise, source, [])
+
+    assert torch.equal(out, noise)
+
+
+def test_init_retake_latents_clamps_out_of_range():
+    noise = torch.ones(1, 2, 5, 2, 2)
+    source = torch.full((1, 2, 5, 2, 2), 2.0)
+
+    out = _init_retake_latents(noise, source, [(-2, 1), (4, 99)])
+
+    assert torch.equal(out[:, :, 0], source[:, :, 0])
+    assert torch.equal(out[:, :, 4], source[:, :, 4])
+    assert torch.equal(out[:, :, 1:4], noise[:, :, 1:4])
+
+
+def test_init_retake_latents_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="shape mismatch"):
+        _init_retake_latents(torch.ones(1, 2, 5, 2, 2), torch.ones(1, 2, 4, 2, 2), [(0, 1)])
+
+
+def test_init_retake_latents_rejects_non_5d():
+    with pytest.raises(ValueError, match=r"B, C, T, H, W"):
+        _init_retake_latents(torch.ones(2, 5, 2, 2), torch.ones(2, 5, 2, 2), [(0, 1)])
 
 
 def test_fuse_lora_accepts_directory_of_shards(tmp_path):

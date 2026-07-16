@@ -120,6 +120,10 @@ def _retake_conditioned_latent_ranges(
     A full-frame window yields ``cond_ranges == []`` (everything regenerated); an
     empty/inverted window yields ``[(0, L)]`` (everything conditioned).
     """
+    if temporal_ratio <= 0:
+        raise ValueError(f"temporal_ratio must be positive, got {temporal_ratio}")
+    if num_frames < 0:
+        raise ValueError(f"num_frames must be non-negative, got {num_frames}")
     total_latent = _latent_frame_count(num_frames, temporal_ratio)
     if pixel_end <= pixel_start:
         return (0, 0), [(0, total_latent)]
@@ -132,6 +136,37 @@ def _retake_conditioned_latent_ranges(
     if lat_end < total_latent:
         cond_ranges.append((lat_end, total_latent))
     return (lat_start, lat_end), cond_ranges
+
+
+def _init_retake_latents(
+    noise_latents: torch.Tensor,
+    source_latents: torch.Tensor,
+    cond_latent_ranges: list,
+) -> torch.Tensor:
+    """Initialize native retake video latents for the two-sided window.
+
+    Both tensors are ``(B, C, T_lat, H, W)`` and must share shape. The conditioned
+    context latent frames (``cond_latent_ranges`` from
+    :func:`_retake_conditioned_latent_ranges`) are taken from ``source_latents``
+    (the ``_encode_video_window`` output); every other latent frame — the
+    regenerated middle window — keeps the seeded ``noise_latents``. Returns a new
+    tensor; inputs are unmodified. Ranges are clamped to ``[0, T_lat]``.
+    """
+    if noise_latents.dim() != 5:
+        raise ValueError(f"expected (B, C, T, H, W) latents; got {tuple(noise_latents.shape)}")
+    if noise_latents.shape != source_latents.shape:
+        raise ValueError(
+            f"noise/source latent shape mismatch: {tuple(noise_latents.shape)} vs "
+            f"{tuple(source_latents.shape)}"
+        )
+    out = noise_latents.clone()
+    total_latent = noise_latents.shape[2]
+    for start_frame, end_frame in cond_latent_ranges:
+        start_frame = max(0, start_frame)
+        end_frame = min(total_latent, end_frame)
+        if end_frame > start_frame:
+            out[:, :, start_frame:end_frame] = source_latents[:, :, start_frame:end_frame]
+    return out
 
 
 # Comfy-format LoRA key conventions. The two exporters use different factor
