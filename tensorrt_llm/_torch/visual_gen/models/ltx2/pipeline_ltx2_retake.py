@@ -63,7 +63,7 @@ def _composite_retake_window(
     ``[start_frame, end_frame)`` are copied byte-for-byte from ``source``; frames
     inside are replaced by ``window``, which must have exactly
     ``end_frame - start_frame`` frames. This is the native composite-back that
-    guarantees the AC-3.2 "non-retake frames byte-identical to source" invariant.
+    keeps non-retake frames byte-identical to the source.
     """
     if source.dim() < 4:
         raise ValueError(f"source must be (...,T,H,W,C); got {tuple(source.shape)}")
@@ -84,6 +84,54 @@ def _composite_retake_window(
             dtype=source.dtype, device=source.device
         )
     return out
+
+
+def _pixel_frame_to_latent_index(pixel_frame: int, temporal_ratio: int) -> int:
+    """Latent-frame index of a source pixel frame under the causal LTX-2 VAE.
+
+    Pixel frame 0 maps to latent frame 0; pixel frames ``[1+(i-1)*r, 1+i*r)`` map
+    to latent frame ``i`` (``r = temporal_ratio``), i.e. ``(f - 1)//r + 1``.
+    """
+    if pixel_frame <= 0:
+        return 0
+    return (pixel_frame - 1) // temporal_ratio + 1
+
+
+def _latent_frame_count(num_frames: int, temporal_ratio: int) -> int:
+    """Latent frame count for ``num_frames`` pixel frames: ``(T-1)//r + 1``."""
+    return (num_frames - 1) // temporal_ratio + 1
+
+
+def _retake_conditioned_latent_ranges(
+    pixel_start: int, pixel_end: int, num_frames: int, temporal_ratio: int
+) -> tuple:
+    """Two-sided conditioned latent-frame ranges for a pixel retake window.
+
+    Given a half-open source pixel window ``[pixel_start, pixel_end)`` (from
+    :func:`_retake_pixel_window`), returns ``(latent_window, cond_ranges)``:
+
+    - ``latent_window`` = ``(lat_start, lat_end)``: the latent frames the pixel
+      window touches (regenerated). Any latent frame overlapped even partially by
+      the pixel window is regenerated (conservative for a seamless retake).
+    - ``cond_ranges``: the conditioned (context) latent-frame ranges outside the
+      window — leading ``(0, lat_start)`` and trailing ``(lat_end, L)`` — ready to
+      pass to ``_build_denoise_mask(cond_latent_frame_ranges=...)``.
+
+    A full-frame window yields ``cond_ranges == []`` (everything regenerated); an
+    empty/inverted window yields ``[(0, L)]`` (everything conditioned).
+    """
+    total_latent = _latent_frame_count(num_frames, temporal_ratio)
+    if pixel_end <= pixel_start:
+        return (0, 0), [(0, total_latent)]
+    lat_start = max(0, min(_pixel_frame_to_latent_index(pixel_start, temporal_ratio), total_latent))
+    lat_end = _pixel_frame_to_latent_index(pixel_end - 1, temporal_ratio) + 1
+    lat_end = max(lat_start, min(lat_end, total_latent))
+    cond_ranges = []
+    if lat_start > 0:
+        cond_ranges.append((0, lat_start))
+    if lat_end < total_latent:
+        cond_ranges.append((lat_end, total_latent))
+    return (lat_start, lat_end), cond_ranges
 
 
 # Comfy-format LoRA key conventions. The two exporters use different factor

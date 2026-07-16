@@ -15,6 +15,7 @@ from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
     LTX2RetakePipeline,
     _composite_retake_window,
     _fuse_lora_into_transformer_weights,
+    _retake_conditioned_latent_ranges,
     _retake_pixel_window,
 )
 from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeNativeAdapter
@@ -606,6 +607,51 @@ def test_composite_rejects_shape_mismatch():
     window = torch.zeros(1, 2, 4, 2, 3, dtype=torch.uint8)  # H differs
     with pytest.raises(ValueError, match="shape mismatch"):
         _composite_retake_window(source, window, 1, 3)
+
+
+def test_conditioned_latent_ranges_internal_window():
+    # ratio=8, 97 pixel frames -> L = (97-1)//8+1 = 13 latent frames.
+    # pixel [16,40): lat_start=(16-1)//8+1=2; lat_end=((39-1)//8+1)+1=6.
+    latent_window, cond = _retake_conditioned_latent_ranges(16, 40, 97, 8)
+    assert latent_window == (2, 6)
+    assert cond == [(0, 2), (6, 13)]
+
+
+def test_conditioned_latent_ranges_full_window_has_no_context():
+    latent_window, cond = _retake_conditioned_latent_ranges(0, 97, 97, 8)
+    assert latent_window == (0, 13)
+    assert cond == []  # everything regenerated
+
+
+def test_conditioned_latent_ranges_empty_window_is_all_context():
+    latent_window, cond = _retake_conditioned_latent_ranges(40, 40, 97, 8)
+    assert latent_window == (0, 0)
+    assert cond == [(0, 13)]  # everything conditioned
+
+
+def test_conditioned_latent_ranges_leading_and_trailing_only():
+    # From frame 0: no leading context range.
+    lw, cond = _retake_conditioned_latent_ranges(0, 24, 97, 8)
+    assert lw == (0, 4)
+    assert cond == [(4, 13)]
+    # To the last frame: no trailing context range.
+    lw, cond = _retake_conditioned_latent_ranges(73, 97, 97, 8)
+    assert lw == (10, 13)
+    assert cond == [(0, 10)]
+
+
+def test_conditioned_latent_ranges_quantizes_subframe_windows():
+    # Two pixel windows inside the same latent-frame boundaries collapse to the
+    # same latent window (VAE temporal granularity).
+    a, _ = _retake_conditioned_latent_ranges(17, 33, 97, 8)
+    b, _ = _retake_conditioned_latent_ranges(19, 33, 97, 8)
+    assert a == b == (3, 5)
+
+
+def test_conditioned_latent_ranges_ratio_one_is_frame_identity():
+    lw, cond = _retake_conditioned_latent_ranges(2, 5, 10, 1)
+    assert lw == (2, 5)
+    assert cond == [(0, 2), (5, 10)]
 
 
 def test_fuse_lora_accepts_directory_of_shards(tmp_path):
