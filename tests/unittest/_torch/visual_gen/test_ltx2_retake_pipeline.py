@@ -481,6 +481,63 @@ def test_load_weights_fuses_configured_lora(tmp_path):
     assert torch.allclose(captured["weights"][wkey], torch.full((2, 3), 2.0))
 
 
+def test_fuse_lora_supports_lora_down_up_suffix(tmp_path):
+    wkey = "transformer_blocks.0.attn1.to_q.weight"
+    weights = {wkey: torch.zeros(2, 3)}
+    lora_path = str(tmp_path / "lora.safetensors")
+    _write_lora(
+        lora_path,
+        {
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_down.weight": torch.tensor(
+                [[1.0, 2.0, 3.0]]
+            ),
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_up.weight": torch.tensor(
+                [[1.0], [2.0]]
+            ),
+        },
+    )
+
+    _fuse_lora_into_transformer_weights(weights, lora_path, strength=1.0)
+
+    assert torch.allclose(weights[wkey], torch.tensor([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0]]))
+
+
+def test_fuse_lora_applies_alpha_scaling(tmp_path):
+    wkey = "transformer_blocks.0.attn1.to_q.weight"
+    weights = {wkey: torch.zeros(2, 2)}
+    lora_path = str(tmp_path / "lora.safetensors")
+    _write_lora(
+        lora_path,
+        {
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight": torch.eye(2),
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight": torch.eye(2),
+            "diffusion_model.transformer_blocks.0.attn1.to_q.alpha": torch.tensor([1.0]),
+        },
+    )
+
+    # rank=2, alpha=1 -> scale = strength * alpha/rank = 1 * 1/2 = 0.5; B@A = I.
+    _fuse_lora_into_transformer_weights(weights, lora_path, strength=1.0)
+
+    assert torch.allclose(weights[wkey], 0.5 * torch.eye(2))
+
+
+def test_fuse_lora_strips_model_diffusion_model_prefix(tmp_path):
+    wkey = "transformer_blocks.0.attn1.to_q.weight"
+    weights = {wkey: torch.zeros(2, 3)}
+    lora_path = str(tmp_path / "lora.safetensors")
+    _write_lora(
+        lora_path,
+        {
+            "model.diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight": torch.ones(1, 3),
+            "model.diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight": torch.ones(2, 1),
+        },
+    )
+
+    _fuse_lora_into_transformer_weights(weights, lora_path, strength=1.0)
+
+    assert torch.allclose(weights[wkey], torch.ones(2, 3))
+
+
 def test_load_weights_without_lora_is_unchanged(tmp_path):
     wkey = "transformer_blocks.0.attn.to_q.weight"
     pipeline = LTX2RetakePipeline(_minimal_retake_config())

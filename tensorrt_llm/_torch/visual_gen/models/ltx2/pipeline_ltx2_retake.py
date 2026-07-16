@@ -31,12 +31,29 @@ from tensorrt_llm.logger import logger
 from .pipeline_ltx2 import LTX2Pipeline, _load_ltx2_transformer_weights, build_ltx2_transformer
 from .retake_adapter import LTX2RetakeNativeAdapter
 
-# Comfy-format LoRA keys carry this prefix; stripping it aligns them with the
-# ``model.diffusion_model.``-stripped base transformer keys (mirrors upstream
-# ``LTXV_LORA_COMFY_RENAMING_MAP``, which is a single ``diffusion_model.`` -> "" rule).
-_LORA_COMFY_PREFIX = "diffusion_model."
-_LORA_A_SUFFIX = ".lora_A.weight"
-_LORA_B_SUFFIX = ".lora_B.weight"
+# Comfy-format LoRA key conventions. The two exporters use different factor
+# suffixes (PEFT ``lora_A``/``lora_B`` vs comfy ``lora_down``/``lora_up``) and
+# different module prefixes; both are supported so the retake fusion matches
+# whatever the real checkpoint uses (mirrors ``_load_lora_deltas`` in
+# ``pipeline_ltx2_two_stages.py``).
+_LORA_DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight")  # A: (rank, in)
+_LORA_UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight")  # B: (out, rank)
+# Longest-first so the most specific prefix is stripped when both would match.
+_LORA_MODULE_PREFIXES = ("model.diffusion_model.", "diffusion_model.")
+
+
+def _strip_lora_suffix(key: str, suffixes: tuple) -> Optional[str]:
+    for suffix in suffixes:
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return None
+
+
+def _strip_lora_prefix(module: str) -> str:
+    for prefix in _LORA_MODULE_PREFIXES:
+        if module.startswith(prefix):
+            return module[len(prefix) :]
+    return module
 
 
 def _fuse_lora_into_transformer_weights(weights: dict, lora_path: str, strength: float) -> dict:
@@ -44,41 +61,58 @@ def _fuse_lora_into_transformer_weights(weights: dict, lora_path: str, strength:
 
     ``weights`` are the base transformer state dict in the
     ``model.diffusion_model.``-stripped key space (e.g.
-    ``transformer_blocks.0.attn.to_q.weight``). The comfy LoRA stores per-module
-    low-rank factors ``<prefix><module>.lora_A.weight`` (shape ``(r, in)``) and
-    ``.lora_B.weight`` (shape ``(out, r)``); stripping ``diffusion_model.`` aligns
-    ``<module>`` with the base keys. For each matched module this applies
-    ``W += strength * (B @ A)`` (aggregated in the base weight dtype), matching the
-    upstream bf16 fuse rule, so the native transformer inherits the same fused
-    weights the upstream retake build produces. Fusing happens before the native
-    key remap (``LTXModel.load_weights``), so it needs no knowledge of native names.
+    ``transformer_blocks.0.attn1.to_q.weight``). The LoRA stores per-module
+    low-rank factors: a down factor ``<prefix><module>.lora_A.weight`` /
+    ``.lora_down.weight`` (shape ``(rank, in)``) and an up factor
+    ``.lora_B.weight`` / ``.lora_up.weight`` (shape ``(out, rank)``), optionally
+    with an ``<prefix><module>.alpha`` scalar. Stripping the module prefix
+    (``model.diffusion_model.`` or ``diffusion_model.``) aligns ``<module>`` with
+    the base keys. For each matched module this applies
+    ``W += (alpha / rank) * strength * (B @ A)`` (aggregated in the base weight
+    dtype). ``alpha`` defaults to ``rank`` (so the scale is just ``strength``),
+    matching ``_load_lora_deltas``. Fusing happens in checkpoint-key space, before
+    the native key remap (``LTXModel.load_weights`` handles ff/q_norm/QKV), so it
+    needs no knowledge of native parameter names.
     """
     import safetensors.torch
 
-    lora_sd: dict = {}
+    down: dict = {}
+    up: dict = {}
+    alphas: dict = {}
     with safetensors.torch.safe_open(lora_path, framework="pt") as f:
         for key in f.keys():
-            renamed = key[len(_LORA_COMFY_PREFIX) :] if key.startswith(_LORA_COMFY_PREFIX) else key
-            lora_sd[renamed] = f.get_tensor(key)
+            base = _strip_lora_suffix(key, _LORA_DOWN_SUFFIXES)
+            if base is not None:
+                down[base] = f.get_tensor(key)
+                continue
+            base = _strip_lora_suffix(key, _LORA_UP_SUFFIXES)
+            if base is not None:
+                up[base] = f.get_tensor(key)
+                continue
+            if key.endswith(".alpha"):
+                alphas[key[: -len(".alpha")]] = float(f.get_tensor(key).item())
 
-    modules = sorted({k[: -len(_LORA_A_SUFFIX)] for k in lora_sd if k.endswith(_LORA_A_SUFFIX)})
     fused = 0
     missing = []
-    for module in modules:
-        weight_key = module + ".weight"
-        a = lora_sd.get(module + _LORA_A_SUFFIX)
-        b = lora_sd.get(module + _LORA_B_SUFFIX)
+    for module in sorted(down):
+        if module not in up:
+            continue
+        weight_key = _strip_lora_prefix(module) + ".weight"
         base = weights.get(weight_key)
-        if base is None or a is None or b is None:
+        if base is None:
             missing.append(module)
             continue
+        a = down[module]  # (rank, in)
+        b = up[module]  # (out, rank)
+        rank = a.shape[0]
+        scale = strength * alphas.get(module, float(rank)) / rank
         dtype = base.dtype
-        delta = torch.matmul(b.to(dtype) * strength, a.to(dtype))
+        delta = torch.matmul(b.to(dtype), a.to(dtype)) * scale
         weights[weight_key] = (delta + base.to(delta.dtype)).to(dtype)
         fused += 1
 
     logger.info(
-        f"LTX-2 retake LoRA fusion: fused {fused}/{len(modules)} modules "
+        f"LTX-2 retake LoRA fusion: fused {fused}/{len(down)} modules "
         f"from {lora_path} (strength={strength})"
     )
     if missing:
@@ -89,7 +123,9 @@ def _fuse_lora_into_transformer_weights(weights: dict, lora_path: str, strength:
     if fused == 0:
         raise ValueError(
             f"LTX-2 retake LoRA at {lora_path} fused 0 modules; the key convention "
-            f"does not match (expected 'diffusion_model.<module>.lora_A/lora_B.weight')."
+            f"does not match (expected '<prefix><module>.lora_A/lora_B.weight' or "
+            f"'.lora_down/lora_up.weight', prefix 'model.diffusion_model.' or "
+            f"'diffusion_model.'). Sampled base keys: {sorted(down)[:3]}"
         )
     return weights
 
