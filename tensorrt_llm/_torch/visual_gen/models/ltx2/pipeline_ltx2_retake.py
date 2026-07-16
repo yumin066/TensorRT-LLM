@@ -373,6 +373,11 @@ class LTX2RetakePipeline(BasePipeline):
         # when it exposes a post-load hook.
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+        # The native transformer is constructed on CPU (build_ltx2_transformer)
+        # and its weights are loaded in-place; move it onto the pipeline device
+        # so the denoise forward matches the CUDA latents/context tensors.
+        if self.transformer is not None:
+            self.transformer.to(self._device)
 
     def _setup_cuda_graphs(self) -> None:
         # Retake now builds the native LTXModel, whose ``forward`` takes

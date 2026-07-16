@@ -316,5 +316,58 @@ class TestCrossAttentionAdalnForward(unittest.TestCase):
             model(video=video_modality, audio=None, text_cache=text_cache)
 
 
+class TestCaptionProjBeforeConnector(unittest.TestCase):
+    """CPU-only checks for ``caption_proj_before_connector`` (LTX-2.3 22b).
+
+    When True the text projection lives in the text encoder / embeddings
+    connector, the context arrives already at ``cross_attention_dim``, and the
+    transformer's caption projection is a passthrough (``nn.Identity``) — the
+    22b checkpoint carries no ``caption_*`` weights. When False (19b) the
+    in-transformer ``PixArtAlphaTextProjection`` (``caption_channels`` ->
+    ``inner_dim``) is retained.
+    """
+
+    def test_false_keeps_pixart_projection(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.text_projection import (
+            PixArtAlphaTextProjection,
+        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModelType
+
+        model = _build_model(LTXModelType.VideoOnly, False, VIDEO_ONLY_CONFIG)
+        self.assertIsInstance(model.caption_projection, PixArtAlphaTextProjection)
+
+    def test_true_video_is_identity_passthrough(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModelType
+
+        config = {**VIDEO_ONLY_CONFIG, "caption_proj_before_connector": True}
+        model = _build_model(LTXModelType.VideoOnly, True, config)
+
+        self.assertIsInstance(model.caption_projection, torch.nn.Identity)
+        # Passthrough leaves an already-projected (model-dim) context unchanged.
+        ctx = torch.randn(1, 8, VIDEO_ONLY_CONFIG["cross_attention_dim"])
+        out = model.caption_projection(ctx)
+        self.assertEqual(out.shape, ctx.shape)
+        self.assertTrue(torch.equal(out, ctx))
+
+    def test_true_audio_video_both_identity(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModelType
+
+        config = {**AUDIO_VIDEO_CONFIG, "caption_proj_before_connector": True}
+        model = _build_model(LTXModelType.AudioVideo, True, config)
+
+        self.assertIsInstance(model.caption_projection, torch.nn.Identity)
+        self.assertIsInstance(model.audio_caption_projection, torch.nn.Identity)
+
+    def test_true_has_no_caption_weights(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModelType
+
+        # Mirrors the real 22b checkpoint, which carries zero ``caption_*``
+        # tensors: the passthrough must expose no caption-projection params.
+        config = {**VIDEO_ONLY_CONFIG, "caption_proj_before_connector": True}
+        model = _build_model(LTXModelType.VideoOnly, True, config)
+        caption_params = [n for n, _ in model.named_parameters() if "caption_projection" in n]
+        self.assertEqual(caption_params, [])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

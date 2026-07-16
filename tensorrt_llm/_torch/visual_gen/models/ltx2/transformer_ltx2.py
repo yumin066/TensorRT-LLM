@@ -1173,6 +1173,7 @@ class LTXModel(BaseDiffusionModel):
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
         cross_attention_adaln: bool = False,
+        caption_proj_before_connector: bool = False,
         model_config: Optional["DiffusionModelConfig"] = None,
     ):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -1190,6 +1191,14 @@ class LTXModel(BaseDiffusionModel):
         # the LTX-2.3 22b distilled checkpoint (cross_attention_adaln=True);
         # False reproduces the 19b behavior exactly.
         self.cross_attention_adaln = cross_attention_adaln
+        # When True (LTX-2.3 22b), the text projection lives in the text
+        # encoder / embeddings connector, so the context arrives already at the
+        # model dim (cross_attention_dim) and the transformer's caption
+        # projection is a passthrough. This mirrors upstream, where
+        # ``_build_caption_projections`` returns ``None`` for the 22b
+        # (``caption_proj_before_connector=True``); the 22b checkpoint carries no
+        # ``caption_*`` weights. False keeps the 19b in-transformer projection.
+        self.caption_proj_before_connector = caption_proj_before_connector
 
         cross_pe_max_pos = None
 
@@ -1380,10 +1389,14 @@ class LTXModel(BaseDiffusionModel):
             if self.cross_attention_adaln
             else None
         )
-        self.caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.inner_dim,
-            make_linear=self._make_linear,
+        self.caption_projection = (
+            nn.Identity()
+            if self.caption_proj_before_connector
+            else PixArtAlphaTextProjection(
+                in_features=caption_channels,
+                hidden_size=self.inner_dim,
+                make_linear=self._make_linear,
+            )
         )
         self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
@@ -1405,10 +1418,14 @@ class LTXModel(BaseDiffusionModel):
             if self.cross_attention_adaln
             else None
         )
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.audio_inner_dim,
-            make_linear=self._make_linear,
+        self.audio_caption_projection = (
+            nn.Identity()
+            if self.caption_proj_before_connector
+            else PixArtAlphaTextProjection(
+                in_features=caption_channels,
+                hidden_size=self.audio_inner_dim,
+                make_linear=self._make_linear,
+            )
         )
         self.audio_scale_shift_table = nn.Parameter(torch.empty(2, self.audio_inner_dim))
         self.audio_norm_out = nn.LayerNorm(
