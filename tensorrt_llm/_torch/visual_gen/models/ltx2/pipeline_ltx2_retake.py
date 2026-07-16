@@ -422,7 +422,7 @@ class LTX2RetakePipeline(BasePipeline):
 
         prompt = self._single_prompt(req.prompt)
         retake_start = time.perf_counter()
-        video_iter, audio, output_shape = self._run_stage1_native(
+        video_iter, audio, output_shape = self._run_native_retake(
             req, extra, video_path, start_time, end_time, prompt
         )
         video = self._materialize_video(video_iter)
@@ -466,7 +466,7 @@ class LTX2RetakePipeline(BasePipeline):
             ModalitySpec=ModalitySpec,
         )
 
-    def _run_stage1_native(self, req, extra, video_path, start_time, end_time, prompt):
+    def _run_native_retake(self, req, extra, video_path, start_time, end_time, prompt):
         """Run retake denoising on the native transformer via the upstream loop.
 
         Reuses the resident upstream pre/post components (image/audio

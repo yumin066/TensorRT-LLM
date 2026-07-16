@@ -1262,16 +1262,28 @@ class LTX2Pipeline(BasePipeline):
         video_shape: "VideoLatentShape",
         num_cond_latent_frames: int = 1,
         strength: float = 1.0,
+        *,
+        cond_latent_frame_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
-        """Create a per-token denoise mask for image conditioning.
+        """Create a per-token denoise mask for conditioning.
 
         Convention follows LTX-2: ``0.0`` = conditioned (don't denoise),
         ``1.0`` = unconditioned (fully denoise).
 
         Args:
             video_shape: Latent shape for the video.
-            num_cond_latent_frames: Number of latent frames to condition on.
+            num_cond_latent_frames: Number of leading latent frames to condition
+                on (image-conditioning / i2v default).
             strength: Conditioning strength (1.0 = fully conditioned).
+            cond_latent_frame_ranges: Optional explicit half-open latent-frame
+                ranges ``[(start, end), ...]`` to condition. When given, these
+                ranges are conditioned and everything else is left unconditioned
+                — this generalizes the leading-frame mask to a two-sided internal
+                retake window (pass the leading and trailing context ranges,
+                leaving the middle regenerated window unconditioned). Ranges are
+                clamped to ``[0, grid_f]`` and empty/inverted ranges are skipped.
+                When ``None``, the leading ``num_cond_latent_frames`` frames are
+                conditioned (backward-compatible i2v behavior).
 
         Returns:
             ``(1, T)`` mask in patchified token space.
@@ -1282,10 +1294,18 @@ class LTX2Pipeline(BasePipeline):
         grid_w = video_shape.width // patch_w
         tokens_per_frame = grid_h * grid_w
         total_tokens = grid_f * tokens_per_frame
-        cond_tokens = num_cond_latent_frames * tokens_per_frame
+
+        if cond_latent_frame_ranges is None:
+            cond_latent_frame_ranges = [(0, num_cond_latent_frames)]
 
         mask = torch.ones(1, total_tokens, device=self.device, dtype=torch.float32)
-        mask[:, :cond_tokens] = 1.0 - strength
+        cond_value = 1.0 - strength
+        for start_frame, end_frame in cond_latent_frame_ranges:
+            start_frame = max(0, start_frame)
+            end_frame = min(grid_f, end_frame)
+            if end_frame <= start_frame:
+                continue
+            mask[:, start_frame * tokens_per_frame : end_frame * tokens_per_frame] = cond_value
         return mask
 
     # ------------------------------------------------------------------
