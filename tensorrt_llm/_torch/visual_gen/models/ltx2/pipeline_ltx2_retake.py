@@ -31,6 +31,68 @@ from tensorrt_llm.logger import logger
 from .pipeline_ltx2 import LTX2Pipeline, _load_ltx2_transformer_weights, build_ltx2_transformer
 from .retake_adapter import LTX2RetakeNativeAdapter
 
+# Comfy-format LoRA keys carry this prefix; stripping it aligns them with the
+# ``model.diffusion_model.``-stripped base transformer keys (mirrors upstream
+# ``LTXV_LORA_COMFY_RENAMING_MAP``, which is a single ``diffusion_model.`` -> "" rule).
+_LORA_COMFY_PREFIX = "diffusion_model."
+_LORA_A_SUFFIX = ".lora_A.weight"
+_LORA_B_SUFFIX = ".lora_B.weight"
+
+
+def _fuse_lora_into_transformer_weights(weights: dict, lora_path: str, strength: float) -> dict:
+    """Fuse a comfy-format LoRA into base transformer weights, in place.
+
+    ``weights`` are the base transformer state dict in the
+    ``model.diffusion_model.``-stripped key space (e.g.
+    ``transformer_blocks.0.attn.to_q.weight``). The comfy LoRA stores per-module
+    low-rank factors ``<prefix><module>.lora_A.weight`` (shape ``(r, in)``) and
+    ``.lora_B.weight`` (shape ``(out, r)``); stripping ``diffusion_model.`` aligns
+    ``<module>`` with the base keys. For each matched module this applies
+    ``W += strength * (B @ A)`` (aggregated in the base weight dtype), matching the
+    upstream bf16 fuse rule, so the native transformer inherits the same fused
+    weights the upstream retake build produces. Fusing happens before the native
+    key remap (``LTXModel.load_weights``), so it needs no knowledge of native names.
+    """
+    import safetensors.torch
+
+    lora_sd: dict = {}
+    with safetensors.torch.safe_open(lora_path, framework="pt") as f:
+        for key in f.keys():
+            renamed = key[len(_LORA_COMFY_PREFIX) :] if key.startswith(_LORA_COMFY_PREFIX) else key
+            lora_sd[renamed] = f.get_tensor(key)
+
+    modules = sorted({k[: -len(_LORA_A_SUFFIX)] for k in lora_sd if k.endswith(_LORA_A_SUFFIX)})
+    fused = 0
+    missing = []
+    for module in modules:
+        weight_key = module + ".weight"
+        a = lora_sd.get(module + _LORA_A_SUFFIX)
+        b = lora_sd.get(module + _LORA_B_SUFFIX)
+        base = weights.get(weight_key)
+        if base is None or a is None or b is None:
+            missing.append(module)
+            continue
+        dtype = base.dtype
+        delta = torch.matmul(b.to(dtype) * strength, a.to(dtype))
+        weights[weight_key] = (delta + base.to(delta.dtype)).to(dtype)
+        fused += 1
+
+    logger.info(
+        f"LTX-2 retake LoRA fusion: fused {fused}/{len(modules)} modules "
+        f"from {lora_path} (strength={strength})"
+    )
+    if missing:
+        logger.warning(
+            f"LTX-2 retake LoRA: {len(missing)} LoRA modules had no matching base "
+            f"weight and were skipped (e.g. {missing[:3]})"
+        )
+    if fused == 0:
+        raise ValueError(
+            f"LTX-2 retake LoRA at {lora_path} fused 0 modules; the key convention "
+            f"does not match (expected 'diffusion_model.<module>.lora_A/lora_B.weight')."
+        )
+    return weights
+
 
 class LTX2RetakePipeline(BasePipeline):
     """Persistent VisualGen adapter for LTX-2 retake requests."""
@@ -117,6 +179,16 @@ class LTX2RetakePipeline(BasePipeline):
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
             transformer_weights = weights.get("transformer", weights)
+            # Optionally fuse an identity/style LoRA into the base transformer
+            # weights so the native path matches an upstream retake build that
+            # used the same LoRA (e.g. the TalkVid identity LoRA). Fusing here,
+            # before the native key remap, keeps it independent of native names.
+            lora_path = self.pipeline_config.extra_attrs.get("retake_lora_path")
+            if lora_path:
+                strength = float(self.pipeline_config.extra_attrs.get("retake_lora_strength", 1.0))
+                transformer_weights = _fuse_lora_into_transformer_weights(
+                    transformer_weights, lora_path, strength
+                )
             self.transformer.load_weights(transformer_weights)
 
     def post_load_weights(self) -> None:

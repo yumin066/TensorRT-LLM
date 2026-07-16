@@ -11,7 +11,10 @@ import torch
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
-from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import LTX2RetakePipeline
+from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
+    LTX2RetakePipeline,
+    _fuse_lora_into_transformer_weights,
+)
 from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeNativeAdapter
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 
@@ -400,6 +403,98 @@ def test_ltx2_retake_infer_requires_distilled_schedule(monkeypatch):
         pipeline.infer(_native_retake_req())
 
     assert fake.stage.run_calls == []
+
+
+def _write_lora(path, entries):
+    import safetensors.torch
+
+    safetensors.torch.save_file(entries, path)
+
+
+def test_fuse_lora_applies_scaled_ba_and_strips_comfy_prefix(tmp_path):
+    wkey = "transformer_blocks.0.attn.to_q.weight"
+    weights = {wkey: torch.zeros(2, 3)}
+    lora_path = str(tmp_path / "lora.safetensors")
+    _write_lora(
+        lora_path,
+        {
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_A.weight": torch.tensor(
+                [[1.0, 2.0, 3.0]]
+            ),  # (r=1, in=3)
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_B.weight": torch.tensor(
+                [[1.0], [2.0]]
+            ),  # (out=2, r=1)
+        },
+    )
+
+    _fuse_lora_into_transformer_weights(weights, lora_path, strength=0.5)
+
+    # W += 0.5 * (B @ A); B@A = [[1,2,3],[2,4,6]] -> scaled [[.5,1,1.5],[1,2,3]].
+    assert torch.allclose(weights[wkey], torch.tensor([[0.5, 1.0, 1.5], [1.0, 2.0, 3.0]]))
+
+
+def test_fuse_lora_raises_when_no_module_matches(tmp_path):
+    weights = {"transformer_blocks.0.attn.to_q.weight": torch.zeros(2, 3)}
+    lora_path = str(tmp_path / "lora.safetensors")
+    _write_lora(
+        lora_path,
+        {
+            "diffusion_model.nonexistent.module.lora_A.weight": torch.zeros(1, 3),
+            "diffusion_model.nonexistent.module.lora_B.weight": torch.zeros(2, 1),
+        },
+    )
+
+    with pytest.raises(ValueError, match="fused 0 modules"):
+        _fuse_lora_into_transformer_weights(weights, lora_path, strength=1.0)
+
+
+def test_load_weights_fuses_configured_lora(tmp_path):
+    wkey = "transformer_blocks.0.attn.to_q.weight"
+    lora_path = str(tmp_path / "lora.safetensors")
+    _write_lora(
+        lora_path,
+        {
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_A.weight": torch.tensor(
+                [[1.0, 1.0, 1.0]]
+            ),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_B.weight": torch.tensor(
+                [[1.0], [1.0]]
+            ),
+        },
+    )
+    cfg = _minimal_retake_config()
+    cfg.extra_attrs["retake_lora_path"] = lora_path
+    cfg.extra_attrs["retake_lora_strength"] = 2.0
+    pipeline = LTX2RetakePipeline(cfg)
+
+    captured = {}
+
+    class _CapturingTransformer:
+        def load_weights(self, weights):
+            captured["weights"] = weights
+
+    pipeline.transformer = _CapturingTransformer()
+    pipeline.load_weights({wkey: torch.zeros(2, 3)})
+
+    # B @ A contracts over rank r=1, so all-ones (2,1)@(1,3) -> ones(2,3);
+    # strength 2.0 over a zero base -> every entry 2.0.
+    assert torch.allclose(captured["weights"][wkey], torch.full((2, 3), 2.0))
+
+
+def test_load_weights_without_lora_is_unchanged(tmp_path):
+    wkey = "transformer_blocks.0.attn.to_q.weight"
+    pipeline = LTX2RetakePipeline(_minimal_retake_config())
+    captured = {}
+
+    class _CapturingTransformer:
+        def load_weights(self, weights):
+            captured["weights"] = weights
+
+    pipeline.transformer = _CapturingTransformer()
+    base = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    pipeline.load_weights({wkey: base})
+
+    assert torch.equal(captured["weights"][wkey], base)
 
 
 def test_ltx2_retake_prompt_encoder_cache_reuses_matching_prompts():
