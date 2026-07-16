@@ -2,16 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional LTX-2 retake workflow for VisualGen.
 
-This pipeline keeps a resident retake model for ``trtllm-serve``. Denoising now
-runs on the native TensorRT-LLM LTX-2 transformer (``LTXModel``): the native
-transformer is built and weight-loaded here (via ``build_ltx2_transformer`` and
-the native transformer loader) so retake inherits the config-driven acceleration
-stack, and ``infer()`` drives it through the upstream denoise loop by injecting
-``LTX2RetakeNativeAdapter`` into ``DiffusionStage.run`` (the pre-built-transformer
-seam) instead of letting the upstream stage build/free its own transformer. The
-upstream Lightricks ``ltx_pipelines.retake.RetakePipeline`` is still used for
-retake pre/post (source decode, temporal-region mask, prompt encode, VAE decode)
-until that logic is ported natively.
+This pipeline keeps a resident retake model for ``trtllm-serve``. By default it
+runs a fully native retake pre/post runtime path: it composes a native
+``LTX2Pipeline`` (video VAE encoder/decoder, video patchifier, scheduler, Gemma
+text encoder + connectors) that shares the retake pipeline's already-built
+native transformer (``LTXModel``), then drives native source-encode -> native
+masked denoise -> native decode and composites the regenerated pixel window back
+into the source so non-window frames stay byte-identical. The masked-denoise
+mechanism is the native ``LTX2Pipeline`` i2v machinery generalized to a
+two-sided retake window (leading + trailing context conditioned, middle window
+regenerated).
+
+The earlier upstream-stage path — which injects ``LTX2RetakeNativeAdapter`` into
+the upstream Lightricks ``DiffusionStage.run`` loop — is preserved behind the
+``pipeline_config.extra_attrs['retake_use_upstream_stage']`` switch (default
+``False`` / native) as a named oracle for comparison and GPU verification.
+
+Only the deterministic source pixel/audio decode and stream metadata are read
+from the upstream ``ltx_pipelines.utils.media_io`` readers; no upstream retake
+orchestration is used on the native path.
 """
 
 from __future__ import annotations
@@ -26,8 +35,13 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
+from .ltx2_core.patchifier import get_pixel_coords
+from .ltx2_core.scheduler_adapter import NativeSchedulerAdapter
+from .ltx2_core.types import VIDEO_SCALE_FACTORS, VideoLatentShape, VideoPixelShape
+from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import (
     LTX2Pipeline,
     _find_safetensors_files,
@@ -35,6 +49,22 @@ from .pipeline_ltx2 import (
     build_ltx2_transformer,
 )
 from .retake_adapter import LTX2RetakeNativeAdapter
+
+# Distilled retake noise schedule (8 Euler steps). Domain constant mirroring the
+# LTX-2 distillation sigma values; kept local so the native retake path does not
+# depend on upstream orchestration for its schedule (the upstream-stage oracle
+# still sources its own schedule from ``ltx_pipelines``).
+_RETAKE_DISTILLED_SIGMA_VALUES = [
+    1.0,
+    0.99375,
+    0.9875,
+    0.98125,
+    0.975,
+    0.909375,
+    0.725,
+    0.421875,
+    0.0,
+]
 
 
 def _retake_pixel_window(start_time: float, end_time: float, fps: float, num_frames: int) -> tuple:
@@ -271,6 +301,35 @@ def _fuse_lora_into_transformer_weights(weights: dict, lora_path: str, strength:
     return weights
 
 
+class _NativeLTX2Companion(LTX2Pipeline):
+    """Native ``LTX2Pipeline`` that shares an externally-built transformer.
+
+    Constructed by :class:`LTX2RetakePipeline` so the native retake pre/post
+    path reuses the native video VAE encoder/decoder, video patchifier,
+    scheduler, Gemma text encoder, and connectors while the masked denoise runs
+    on the retake pipeline's already-built native transformer. The transformer
+    instance is shared (no second transformer is constructed and no transformer
+    weights are loaded twice), and its CUDA-graph wrapping is owned by the retake
+    pipeline, so this companion neither builds nor re-wraps it.
+    """
+
+    def __init__(self, pipeline_config, shared_transformer):
+        # Stash the shared transformer directly in ``__dict__`` before
+        # ``nn.Module.__init__`` runs: assigning a Module attribute pre-init
+        # raises, and ``_init_transformer`` (called inside the base __init__)
+        # reads it to share instead of building a fresh transformer.
+        self.__dict__["_shared_transformer_box"] = (shared_transformer,)
+        super().__init__(pipeline_config)
+
+    def _init_transformer(self) -> None:
+        self.transformer = self._shared_transformer_box[0]
+
+    def _setup_cuda_graphs(self) -> None:
+        # The shared transformer's CUDA-graph wrapping is owned by the retake
+        # pipeline; do not wrap the same forward a second time here.
+        return
+
+
 class LTX2RetakePipeline(BasePipeline):
     """Persistent VisualGen adapter for LTX-2 retake requests."""
 
@@ -280,6 +339,10 @@ class LTX2RetakePipeline(BasePipeline):
         self._retake_params = None
         self._tiling_config = None
         self._get_videostream_metadata = None
+        # Native pre/post companion (default path) and its source-media readers.
+        self._native = None
+        self._decode_video_by_frame = None
+        self._decode_audio_from_file = None
         super().__init__(pipeline_config)
 
     @property
@@ -388,6 +451,15 @@ class LTX2RetakePipeline(BasePipeline):
         # disables cuda graph whenever torch_compile is enabled).
         LTX2Pipeline._setup_cuda_graphs(self)
 
+    def _use_upstream_stage(self) -> bool:
+        """Whether the upstream ``DiffusionStage.run`` oracle path is selected.
+
+        Native retake pre/post is the default; setting
+        ``pipeline_config.extra_attrs['retake_use_upstream_stage'] = True``
+        selects the preserved upstream-stage path for comparison / verification.
+        """
+        return bool(self.pipeline_config.extra_attrs.get("retake_use_upstream_stage", False))
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -403,7 +475,59 @@ class LTX2RetakePipeline(BasePipeline):
                 "LTX-2 retake workflow requires pipeline_config.text_encoder_path "
                 "to point at the Gemma text encoder directory."
             )
+        if self._use_upstream_stage():
+            self._load_upstream_stage_components(checkpoint_dir, device, text_encoder_path)
+        else:
+            self._load_native_retake_components(checkpoint_dir, device, text_encoder_path)
 
+    def _load_native_retake_components(
+        self, checkpoint_dir: str, device: torch.device, text_encoder_path: str
+    ) -> None:
+        """Load the native pre/post companion and source-media readers.
+
+        Builds a native ``LTX2Pipeline`` that shares this pipeline's native
+        transformer (so no second transformer is constructed and no transformer
+        weights are loaded twice) and loads its native video VAE encoder/decoder,
+        patchifier, scheduler, Gemma text encoder, and connectors. Only the
+        deterministic source pixel/audio decode and stream metadata come from the
+        upstream ``media_io`` readers.
+        """
+        try:
+            from ltx_pipelines.utils.media_io import (
+                decode_audio_from_file,
+                decode_video_by_frame,
+                get_videostream_metadata,
+            )
+        except (ImportError, OSError) as exc:
+            raise ImportError(
+                "LTX-2 retake workflow requires the optional Lightricks "
+                "`ltx-pipelines` package for deterministic source video/audio "
+                "decode. Install it in the VisualGen runtime environment before "
+                "starting trtllm-serve with pipeline_config.workflow=retake."
+            ) from exc
+
+        self._get_videostream_metadata = get_videostream_metadata
+        self._decode_video_by_frame = decode_video_by_frame
+        self._decode_audio_from_file = decode_audio_from_file
+
+        logger.info(
+            "Loading LTX-2 native retake pre/post components "
+            f"(checkpoint={checkpoint_dir}, text_encoder={text_encoder_path})"
+        )
+        native = _NativeLTX2Companion(self.pipeline_config, self.transformer)
+        native.load_standard_components(checkpoint_dir, device, text_encoder_path=text_encoder_path)
+        # Derived attribute used to build the video latent shape; normally set by
+        # LTX2Pipeline.post_load_weights, which we skip to avoid re-running the
+        # shared transformer's post-load hook.
+        native.transformer_in_channels = native.transformer._transformer_config.get(
+            "in_channels", 128
+        )
+        self._native = native
+
+    def _load_upstream_stage_components(
+        self, checkpoint_dir: str, device: torch.device, text_encoder_path: str
+    ) -> None:
+        """Load the preserved upstream ``DiffusionStage.run`` oracle components."""
         try:
             from ltx_core.model.video_vae import TilingConfig
             from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
@@ -599,15 +723,21 @@ class LTX2RetakePipeline(BasePipeline):
                 f"retake_start_time ({start_time}) must be less than retake_end_time ({end_time})"
             )
 
-        if self._retake_pipeline is None:
-            raise RuntimeError("LTX-2 retake pipeline has not been loaded.")
-
         prompt = self._single_prompt(req.prompt)
         retake_start = time.perf_counter()
-        video_iter, audio, output_shape = self._run_native_retake(
-            req, extra, video_path, start_time, end_time, prompt
-        )
-        video = self._materialize_video(video_iter)
+        if self._use_upstream_stage():
+            if self._retake_pipeline is None:
+                raise RuntimeError("LTX-2 retake upstream-stage pipeline has not been loaded.")
+            video_iter, audio, output_shape = self._run_native_retake(
+                req, extra, video_path, start_time, end_time, prompt
+            )
+            video = self._materialize_video(video_iter)
+        else:
+            if self._native is None:
+                raise RuntimeError("LTX-2 native retake pipeline has not been loaded.")
+            video, audio, output_shape = self._run_native_pre_post_retake(
+                req, extra, video_path, start_time, end_time, prompt
+            )
         audio_tensor, sample_rate = self._normalize_audio(audio)
         elapsed = time.perf_counter() - retake_start
         return PipelineOutput(
@@ -767,6 +897,270 @@ class LTX2RetakePipeline(BasePipeline):
             retake.audio_decoder(audio_state.latent) if audio_state is not None else None
         )
         return decoded_video, decoded_audio, output_shape
+
+    # ------------------------------------------------------------------
+    # Native retake pre/post runtime path (default)
+    # ------------------------------------------------------------------
+
+    def _run_native_pre_post_retake(self, req, extra, video_path, start_time, end_time, prompt):
+        """Native source-encode -> masked denoise -> decode -> composite-back.
+
+        Reuses the native ``LTX2Pipeline`` machinery (video VAE encoder/decoder,
+        video patchifier, scheduler, Gemma text encoder + connectors, and the
+        masked-denoise entry :meth:`LTX2Pipeline._masked_transformer_step`) with
+        retake-specific inputs: initial latents seeded from the encoded source,
+        a two-sided ``denoise_mask`` conditioning the leading + trailing context
+        while regenerating the middle window, and a two-sided ``clean_latent``
+        from the source. The regenerated pixel window is spliced back into the
+        original source frames so non-window frames are byte-identical, and the
+        source audio is passed through unchanged (video-only regeneration).
+
+        Returns ``(composited_video_uint8, source_audio, output_shape)`` where
+        ``composited_video_uint8`` is ``(1, T, H, W, C)`` uint8.
+        """
+        native = self._native
+        if native is None:
+            raise RuntimeError(
+                "LTX-2 native retake path requires the native companion pipeline, "
+                "but self._native is None."
+            )
+
+        regenerate_video = bool(extra["retake_regenerate_video"])
+        regenerate_audio = bool(extra["retake_regenerate_audio"])
+        if not regenerate_video:
+            raise NotImplementedError(
+                "LTX-2 native retake regenerates the video window; set "
+                "retake_regenerate_video=True."
+            )
+        if regenerate_audio:
+            raise NotImplementedError(
+                "LTX-2 native retake is video-only and preserves the source audio; "
+                "retake_regenerate_audio=True is not supported."
+            )
+
+        device = self._device
+        dtype = self.dtype
+        seed = req.params.seed
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+        # ---- 1. Source read + validation --------------------------------
+        output_shape = self._get_videostream_metadata(video_path)
+        num_frames = int(output_shape.frames)
+        height = int(output_shape.height)
+        width = int(output_shape.width)
+        fps = float(output_shape.fps)
+        self._validate_retake_source(num_frames, height, width)
+
+        source_uint8, source_norm_5d = self._read_source_video(
+            video_path, num_frames, height, width, device, dtype
+        )
+
+        # ---- 2. Retake windows ------------------------------------------
+        temporal_ratio = VIDEO_SCALE_FACTORS.time
+        pixel_start, pixel_end = _retake_pixel_window(start_time, end_time, fps, num_frames)
+        _latent_window, conditioned_latent_ranges = _retake_conditioned_latent_ranges(
+            pixel_start, pixel_end, num_frames, temporal_ratio
+        )
+
+        # ---- 3. Native VAE encode + seed initial latents ----------------
+        pixel_shape = VideoPixelShape(
+            batch=1, frames=num_frames, height=height, width=width, fps=fps
+        )
+        video_shape = VideoLatentShape.from_pixel_shape(
+            pixel_shape, latent_channels=native.transformer_in_channels
+        )
+        source_window_latents = native._encode_video_window(source_norm_5d).float()
+        expected_latent_shape = tuple(video_shape.to_torch_shape())
+        if tuple(source_window_latents.shape) != expected_latent_shape:
+            raise ValueError(
+                "LTX-2 native retake: encoded source latent shape "
+                f"{tuple(source_window_latents.shape)} != expected "
+                f"{expected_latent_shape}; check source resolution/frame count."
+            )
+
+        noise_latents = torch.randn(
+            video_shape.to_torch_shape(),
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        initial_latents = _init_retake_latents(
+            noise_latents, source_window_latents, conditioned_latent_ranges
+        )
+        latents = native.video_patchifier.patchify(initial_latents)
+
+        clean_5d = torch.zeros_like(noise_latents)
+        total_latent = video_shape.frames
+        for start_frame, end_frame in conditioned_latent_ranges:
+            start_frame = max(0, start_frame)
+            end_frame = min(total_latent, end_frame)
+            if end_frame > start_frame:
+                clean_5d[:, :, start_frame:end_frame] = source_window_latents[
+                    :, :, start_frame:end_frame
+                ]
+        clean_latent = native.video_patchifier.patchify(clean_5d)
+
+        denoise_mask = native._build_denoise_mask(
+            video_shape, cond_latent_frame_ranges=conditioned_latent_ranges
+        )
+
+        # ---- 4. Native prompt encode + connectors + text cache ----------
+        max_sequence_length = getattr(req.params, "max_sequence_length", None) or 1024
+        prompt_embeds, prompt_attention_mask = native._encode_prompt(
+            prompt,
+            num_videos_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+        )
+        video_embeds, _audio_embeds, connector_mask = native._process_connectors(
+            prompt_embeds, prompt_attention_mask
+        )
+
+        video_positions = native.video_patchifier.get_patch_grid_bounds(video_shape, device=device)
+        video_positions = get_pixel_coords(
+            video_positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True
+        )
+        video_positions[:, 0, ...] = video_positions[:, 0, ...] / fps
+        video_positions = video_positions.to(dtype)
+
+        text_cache = native.transformer.prepare_text_cache(
+            video_context=video_embeds,
+            video_context_mask=connector_mask,
+            video_positions=video_positions,
+            audio_context=None,
+            audio_context_mask=None,
+            audio_positions=None,
+            dtype=dtype,
+        )
+
+        # ---- 5. Native masked denoise (distilled, video-only, non-guided) --
+        scheduler = NativeSchedulerAdapter()
+        scheduler.sigmas = self._retake_distilled_sigmas(device)
+        scheduler._step_index = 0
+        timesteps = scheduler.timesteps
+        num_steps = len(timesteps)
+
+        def retake_forward_fn(
+            video_latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
+        ):
+            denoised_video, _ = native._masked_transformer_step(
+                video_latents,
+                None,
+                step_index,
+                timestep,
+                video_embeds,
+                None,
+                connector_mask,
+                video_positions=video_positions,
+                audio_positions=None,
+                denoise_mask=denoise_mask,
+                clean_latent=clean_latent,
+                num_steps=num_steps,
+                text_cache=text_cache,
+            )
+            return denoised_video, {}
+
+        denoised_latents = native.denoise(
+            latents=latents,
+            scheduler=scheduler,
+            prompt_embeds=video_embeds,
+            guidance_scale=1.0,
+            forward_fn=retake_forward_fn,
+            timesteps=timesteps,
+        )
+
+        # ---- 6. Native decode -------------------------------------------
+        video_latents_5d = native.video_patchifier.unpatchify(denoised_latents, video_shape).to(
+            dtype
+        )
+        chunks = list(
+            native.video_decoder.tiled_decode(
+                video_latents_5d, TilingConfig.default(), generator=generator
+            )
+        )
+        decoded = torch.cat(chunks, dim=2)  # (B, C, T, H, W)
+        decoded = postprocess_video_tensor(decoded)  # (B, T, H, W, C) uint8
+
+        # ---- 7. Composite regenerated window back into the source -------
+        regenerated_pixel_window = decoded[:, pixel_start:pixel_end]
+        composited_video = _composite_retake_window(
+            source_uint8, regenerated_pixel_window, pixel_start, pixel_end
+        ).contiguous()
+
+        # ---- 8. Source audio passthrough --------------------------------
+        source_audio = self._read_source_audio(video_path, device)
+
+        return composited_video, source_audio, output_shape
+
+    @staticmethod
+    def _validate_retake_source(num_frames: int, height: int, width: int) -> None:
+        """Fail fast on source video shapes the native VAE cannot round-trip.
+
+        The LTX-2 causal video VAE requires ``8k + 1`` pixel frames and spatial
+        dimensions that are multiples of 32, so encode -> decode reconstructs the
+        exact source frame count / resolution (required for a byte-identical
+        composite of the non-window frames).
+        """
+        ratio = VIDEO_SCALE_FACTORS.time
+        if num_frames <= 0:
+            raise ValueError(f"retake source must have frames; got {num_frames}")
+        if (num_frames - 1) % ratio != 0:
+            snapped = ((num_frames - 1) // ratio) * ratio + 1
+            raise ValueError(
+                f"retake source frame count must satisfy {ratio}k+1 (e.g. 97, 193); "
+                f"got {num_frames}. Use a source with {snapped} frames."
+            )
+        if height % 32 != 0 or width % 32 != 0:
+            raise ValueError(
+                f"retake source resolution must be a multiple of 32; got {height}x{width}."
+            )
+
+    def _read_source_video(self, video_path, num_frames, height, width, device, dtype):
+        """Read the source video as raw uint8 frames and a normalized VAE input.
+
+        Returns ``(source_uint8, source_norm_5d)`` where ``source_uint8`` is
+        ``(1, T, H, W, C)`` uint8 (the original pixels, kept for a byte-identical
+        composite) and ``source_norm_5d`` is ``(1, 3, T, H, W)`` in ``[-1, 1]``
+        (the VAE encoder input). Pixel decode is deterministic (sequential frame
+        index via the upstream ``media_io`` reader).
+        """
+        frames = list(
+            self._decode_video_by_frame(path=video_path, device=device, frame_cap=num_frames)
+        )
+        if not frames:
+            raise ValueError(f"retake source video decoded no frames: {video_path}")
+        source_uint8 = torch.cat(frames, dim=0).unsqueeze(0)  # (1, T, H, W, C)
+        decoded_frames = source_uint8.shape[1]
+        if decoded_frames != num_frames:
+            raise ValueError(
+                f"retake source decoded {decoded_frames} frames but metadata "
+                f"reported {num_frames}; cannot composite a byte-identical result."
+            )
+        if source_uint8.shape[2] != height or source_uint8.shape[3] != width:
+            raise ValueError(
+                f"retake source frame size {tuple(source_uint8.shape[2:4])} does not "
+                f"match metadata {(height, width)}."
+            )
+        # uint8 [0, 255] -> [-1, 1], laid out (1, C, T, H, W) for the VAE encoder.
+        normalized = source_uint8[0].to(torch.float32) / 127.5 - 1.0  # (T, H, W, C)
+        source_norm_5d = normalized.permute(3, 0, 1, 2).unsqueeze(0).to(device=device, dtype=dtype)
+        return source_uint8, source_norm_5d
+
+    def _read_source_audio(self, video_path, device):
+        """Read the source audio unchanged (video-only retake preserves audio).
+
+        Returns the upstream ``Audio`` object (``.waveform`` / ``.sampling_rate``)
+        or ``None`` when the source has no audio stream.
+        """
+        return self._decode_audio_from_file(video_path, device)
+
+    @staticmethod
+    def _retake_distilled_sigmas(device) -> torch.Tensor:
+        return torch.tensor(_RETAKE_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device)
 
     @staticmethod
     def _single_prompt(prompt: str | list[str]) -> str:

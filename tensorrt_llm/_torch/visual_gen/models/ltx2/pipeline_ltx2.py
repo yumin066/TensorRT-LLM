@@ -674,6 +674,7 @@ def build_ltx2_transformer(pipeline_config) -> LTXModel:
         "retake_distilled": True,
         "retake_offload_mode": "none",
         "retake_prompt_cache_size": 16,
+        "retake_use_upstream_stage": False,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
@@ -1332,6 +1333,104 @@ class LTX2Pipeline(BasePipeline):
             mask[:, start_frame * tokens_per_frame : end_frame * tokens_per_frame] = cond_value
         return mask
 
+    def _masked_transformer_step(
+        self,
+        v_latents,
+        a_latents,
+        step_index,
+        timestep_val,
+        v_context,
+        a_context,
+        mask,
+        *,
+        video_positions,
+        audio_positions,
+        denoise_mask,
+        clean_latent,
+        num_steps,
+        text_cache,
+        perturbations=None,
+    ):
+        """Single masked transformer pass -> (denoised_video, denoised_audio).
+
+        Reusable masked-denoise entry shared by the generation ``forward``
+        (image-to-video / text-to-video) and the retake pre/post runtime path.
+        The masking mechanism is identical to i2v: when *denoise_mask* is active
+        the video timesteps become per-token values (conditioned tokens -> 0) and
+        the denoised prediction is blended with *clean_latent* at the conditioned
+        positions. Retake reuses this with a two-sided *denoise_mask* /
+        *clean_latent* (leading + trailing context conditioned, the middle window
+        regenerated) instead of the single leading frame.
+
+        Either *v_latents* or *a_latents* (but not both) may be ``None`` for
+        modality-isolated passes. The masking / positions / step schedule state
+        that the generation loop closes over is passed explicitly here so the
+        method has no hidden dependency on any particular ``forward`` call.
+        """
+        v_latents_f32 = v_latents.float() if v_latents is not None else None
+        v_latents_bf = v_latents.to(self.dtype) if v_latents is not None else None
+        a_latents_f32 = a_latents.float() if a_latents is not None else None
+        a_latents_bf = a_latents.to(self.dtype) if a_latents is not None else None
+
+        # Per-token timesteps for masked conditioning
+        if denoise_mask is not None and v_latents_bf is not None:
+            v_timestep = denoise_mask * timestep_val.unsqueeze(-1)  # (B, T)
+        else:
+            v_timestep = timestep_val
+
+        video_mod = (
+            Modality(
+                latent=v_latents_bf,
+                timesteps=v_timestep,
+                positions=video_positions,
+                context=v_context,
+                context_mask=mask,
+            )
+            if v_latents_bf is not None
+            else None
+        )
+
+        audio_mod = (
+            Modality(
+                latent=a_latents_bf,
+                timesteps=timestep_val,
+                positions=audio_positions,
+                context=a_context,
+                context_mask=mask,
+            )
+            if a_latents_bf is not None
+            else None
+        )
+
+        vel_v, vel_a = self.transformer(
+            video=video_mod,
+            audio=audio_mod,
+            perturbations=perturbations,
+            text_cache=text_cache,
+            timestep=timestep_val.new_tensor(float(step_index) / num_steps),
+            step_index=step_index,
+        )
+
+        dn_v = None
+        if vel_v is not None and v_latents_f32 is not None:
+            sigma = timestep_val.float()
+            while sigma.dim() < vel_v.dim():
+                sigma = sigma.unsqueeze(-1)
+            dn_v = v_latents_f32 - vel_v.float() * sigma
+
+            if denoise_mask is not None and clean_latent is not None:
+                dm = denoise_mask.unsqueeze(-1)  # (B, T, 1)
+                dn_v = dn_v * dm + clean_latent.float() * (1.0 - dm)
+
+        dn_a = None
+        if vel_a is not None and a_latents_f32 is not None:
+            sigma = timestep_val.float()
+            while sigma.dim() < vel_a.dim():
+                sigma = sigma.unsqueeze(-1)
+            dn_a = a_latents_f32 - vel_a.float() * sigma
+
+        return dn_v, dn_a
+
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
@@ -1799,76 +1898,26 @@ class LTX2Pipeline(BasePipeline):
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
-            Either *v_latents* or *a_latents* (but not both) may be ``None``
-            for modality-isolated passes.
-
-            When *denoise_mask* is active (i2v mode), video timesteps are
-            converted to per-token values (conditioned tokens → 0) and the
-            denoised prediction is blended with the clean conditioning latent.
+            Thin closure over this ``forward``'s masking / positions / step
+            schedule that delegates to :meth:`_masked_transformer_step` (the
+            reusable masked-denoise entry, also used by the retake path).
             """
-            v_latents_f32 = v_latents.float() if v_latents is not None else None
-            v_latents_bf = v_latents.to(self.dtype) if v_latents is not None else None
-            a_latents_f32 = a_latents.float() if a_latents is not None else None
-            a_latents_bf = a_latents.to(self.dtype) if a_latents is not None else None
-
-            # Per-token timesteps for image conditioning
-            if denoise_mask is not None and v_latents_bf is not None:
-                v_timestep = denoise_mask * timestep_val.unsqueeze(-1)  # (B, T)
-            else:
-                v_timestep = timestep_val
-
-            video_mod = (
-                Modality(
-                    latent=v_latents_bf,
-                    timesteps=v_timestep,
-                    positions=video_positions,
-                    context=v_context,
-                    context_mask=mask,
-                )
-                if v_latents_bf is not None
-                else None
-            )
-
-            audio_mod = (
-                Modality(
-                    latent=a_latents_bf,
-                    timesteps=timestep_val,
-                    positions=audio_positions,
-                    context=a_context,
-                    context_mask=mask,
-                )
-                if a_latents_bf is not None
-                else None
-            )
-
-            vel_v, vel_a = self.transformer(
-                video=video_mod,
-                audio=audio_mod,
-                perturbations=perturbations,
+            return self._masked_transformer_step(
+                v_latents,
+                a_latents,
+                step_index,
+                timestep_val,
+                v_context,
+                a_context,
+                mask,
+                video_positions=video_positions,
+                audio_positions=audio_positions,
+                denoise_mask=denoise_mask,
+                clean_latent=clean_latent,
+                num_steps=num_steps,
                 text_cache=text_cache,
-                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
-                step_index=step_index,
+                perturbations=perturbations,
             )
-
-            dn_v = None
-            if vel_v is not None and v_latents_f32 is not None:
-                sigma = timestep_val.float()
-                while sigma.dim() < vel_v.dim():
-                    sigma = sigma.unsqueeze(-1)
-                dn_v = v_latents_f32 - vel_v.float() * sigma
-
-                if denoise_mask is not None and clean_latent is not None:
-                    dm = denoise_mask.unsqueeze(-1)  # (B, T, 1)
-                    dn_v = dn_v * dm + clean_latent.float() * (1.0 - dm)
-
-            dn_a = None
-            if vel_a is not None and a_latents_f32 is not None:
-                sigma = timestep_val.float()
-                while sigma.dim() < vel_a.dim():
-                    sigma = sigma.unsqueeze(-1)
-                dn_a = a_latents_f32 - vel_a.float() * sigma
-
-            return dn_v, dn_a
 
         def forward_fn(
             video_latents,

@@ -315,7 +315,12 @@ def _native_retake_req(*, regenerate_video=True, regenerate_audio=False):
 
 
 def _prepare_native_pipeline(monkeypatch, *, distilled=True, has_audio=True):
-    pipeline = LTX2RetakePipeline(_minimal_retake_config())
+    # These tests exercise the preserved upstream ``DiffusionStage.run`` oracle
+    # path, which is now behind the retake_use_upstream_stage switch (the native
+    # pre/post path is the default). Opt into the oracle explicitly.
+    config = _minimal_retake_config()
+    config.extra_attrs["retake_use_upstream_stage"] = True
+    pipeline = LTX2RetakePipeline(config)
     fake = _FakeResidentRetakePipeline(distilled=distilled, has_audio=has_audio)
     pipeline._retake_pipeline = fake
     pipeline._tiling_config = object()
@@ -749,3 +754,305 @@ def test_ltx2_retake_prompt_encoder_cache_reuses_matching_prompts():
     assert encoder(["other"]) == [(("other",), 2)]
     assert encoder(["third"]) == [(("third",), 3)]
     assert encoder(["hello"]) == [(("hello",), 4)]
+
+
+# ---------------------------------------------------------------------------
+# Native retake pre/post runtime path (default)
+# ---------------------------------------------------------------------------
+
+
+class _FakePatchifier:
+    """Minimal (T,H,W)-token patchifier for host tests (H=W=1 latent grid)."""
+
+    def patchify(self, x5d):
+        b, c, t, h, w = x5d.shape
+        return x5d.reshape(b, c, t * h * w).permute(0, 2, 1).contiguous()  # (B, tokens, C)
+
+    def unpatchify(self, tokens, video_shape):
+        b, c, t, h, w = video_shape.to_torch_shape()
+        return tokens.permute(0, 2, 1).reshape(b, c, t, h, w).contiguous()
+
+    def get_patch_grid_bounds(self, video_shape, device):
+        return torch.zeros(1, 3, video_shape.frames, device=device)
+
+
+class _FakeNativeTransformer:
+    def prepare_text_cache(self, **kwargs):
+        return "native_text_cache"
+
+
+class _FakeVideoDecoder:
+    def __init__(self, num_frames, height, width):
+        self._nf, self._h, self._w = num_frames, height, width
+
+    def tiled_decode(self, latents_5d, tiling, generator=None):
+        # Constant [-1, 1] -> 0.0 midpoint -> postprocess -> uint8 128.
+        yield torch.zeros(1, 3, self._nf, self._h, self._w)
+
+
+class _FakeNativeCompanion:
+    """Records the native-companion seam calls the retake driver drives.
+
+    Tensor ops (patchify, mask, init/clean latents, composite, scheduler) run
+    for real on small tensors; only the heavy native modules (VAE encode, the
+    transformer/denoise, decode) are stubbed -- mirroring how the existing
+    retake tests stub the native transformer.
+    """
+
+    def __init__(self, num_frames, height, width, channels, latent_frames):
+        self._channels = channels
+        self._latent_frames = latent_frames
+        self.transformer_in_channels = channels
+        self.video_patchifier = _FakePatchifier()
+        self.transformer = _FakeNativeTransformer()
+        self.video_decoder = _FakeVideoDecoder(num_frames, height, width)
+        self.built_mask_ranges = None
+        self.masked_step_calls = 0
+        self.denoise_calls = 0
+        self.clean_latent_seen = None
+        self.encode_shape_override = None
+
+    def _encode_video_window(self, video_5d):
+        if self.encode_shape_override is not None:
+            return torch.zeros(self.encode_shape_override)
+        # Non-zero source so conditioned frames are distinguishable from zeros.
+        return torch.ones(1, self._channels, self._latent_frames, 1, 1)
+
+    def _build_denoise_mask(self, video_shape, cond_latent_frame_ranges=None):
+        self.built_mask_ranges = cond_latent_frame_ranges
+        tokens = video_shape.frames * video_shape.height * video_shape.width
+        return torch.ones(1, tokens)
+
+    def _encode_prompt(self, prompt, num_videos_per_prompt=1, max_sequence_length=1024):
+        return torch.zeros(1, 3, 8), torch.ones(1, 3)
+
+    def _process_connectors(self, prompt_embeds, attention_mask):
+        return torch.zeros(1, 3, 8), torch.zeros(1, 3, 8), torch.ones(1, 1, 1, 3)
+
+    def _masked_transformer_step(  # noqa: PLR0913
+        self,
+        v_latents,
+        a_latents,
+        step_index,
+        timestep_val,
+        v_context,
+        a_context,
+        mask,
+        *,
+        video_positions,
+        audio_positions,
+        denoise_mask,
+        clean_latent,
+        num_steps,
+        text_cache,
+        perturbations=None,
+    ):
+        self.masked_step_calls += 1
+        self.clean_latent_seen = clean_latent
+        assert a_latents is None  # video-only retake
+        assert text_cache == "native_text_cache"
+        return v_latents, None
+
+    def denoise(self, latents, scheduler, prompt_embeds, guidance_scale, forward_fn, timesteps):
+        self.denoise_calls += 1
+        assert guidance_scale == 1.0
+        out, extra = forward_fn(latents, {}, 0, timesteps[0], prompt_embeds, {})
+        assert extra == {}
+        return out
+
+
+def _prepare_native_pre_post_pipeline(monkeypatch, *, num_frames=25, fps=8.0):
+    import tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake as retake_mod
+
+    pipeline = LTX2RetakePipeline(_minimal_retake_config())  # native path by default
+    fake = _FakeNativeCompanion(
+        num_frames=num_frames, height=32, width=32, channels=4, latent_frames=4
+    )
+    pipeline._native = fake
+    pipeline._device = torch.device("cpu")
+    pipeline._get_videostream_metadata = lambda path: SimpleNamespace(
+        fps=fps, width=32, height=32, frames=num_frames
+    )
+    pipeline._decode_video_by_frame = lambda path, device, frame_cap: [
+        torch.full((1, 32, 32, 3), i % 256, dtype=torch.uint8) for i in range(frame_cap)
+    ]
+    pipeline._decode_audio_from_file = lambda path, device: SimpleNamespace(
+        waveform=torch.ones(2, 4), sampling_rate=48000
+    )
+    monkeypatch.setattr(
+        retake_mod,
+        "get_pixel_coords",
+        lambda pos, sf, causal_fix=True: torch.zeros(1, 3, pos.shape[-1]),
+    )
+    return pipeline, fake
+
+
+def _native_pre_post_req(
+    *, start_time=1.0, end_time=2.0, regenerate_video=True, regenerate_audio=False
+):
+    return SimpleNamespace(
+        prompt="regenerated window content",
+        params=SimpleNamespace(
+            extra_params={
+                "retake_video_path": "/tmp/src.mp4",
+                "retake_start_time": start_time,
+                "retake_end_time": end_time,
+                "retake_regenerate_video": regenerate_video,
+                "retake_regenerate_audio": regenerate_audio,
+                "retake_enhance_prompt": False,
+                "retake_max_batch_size": 1,
+            },
+            seed=7,
+            negative_prompt="",
+            num_inference_steps=8,
+        ),
+    )
+
+
+def test_ltx2_retake_routes_to_native_pre_post_by_default(monkeypatch):
+    # Default (no upstream switch) drives the native VAE-encode -> masked denoise
+    # -> decode -> composite path, not the upstream DiffusionStage.run oracle.
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    out = pipeline.infer(_native_pre_post_req())
+
+    assert fake.denoise_calls == 1
+    assert fake.masked_step_calls == 1  # native masked-denoise seam invoked
+    assert out.video.dtype == torch.uint8
+    assert out.video.shape == (1, 25, 32, 32, 3)
+    assert out.frame_rate == 8.0
+    assert out.audio_sample_rate == 48000
+
+
+def test_ltx2_retake_native_builds_two_sided_denoise_mask(monkeypatch):
+    # fps=8, [1s, 2s) -> pixel window [8, 16); 25 frames -> 4 latent frames.
+    # Latent window (1, 3) => leading (0,1) and trailing (3,4) context ranges.
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    pipeline.infer(_native_pre_post_req())
+
+    assert fake.built_mask_ranges == [(0, 1), (3, 4)]
+
+
+def test_ltx2_retake_native_clean_latent_holds_source_at_context(monkeypatch):
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    pipeline.infer(_native_pre_post_req())
+
+    # clean_latent is patchified (1, tokens=4, C=4); conditioned latent frames
+    # 0 and 3 carry the source (ones), regenerated frames 1 and 2 are zero.
+    clean = fake.clean_latent_seen
+    assert clean.shape == (1, 4, 4)
+    assert torch.equal(clean[0, 0], torch.ones(4))
+    assert torch.equal(clean[0, 3], torch.ones(4))
+    assert torch.equal(clean[0, 1], torch.zeros(4))
+    assert torch.equal(clean[0, 2], torch.zeros(4))
+
+
+def test_ltx2_retake_native_composite_keeps_nonwindow_frames_byte_identical(monkeypatch):
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    out = pipeline.infer(_native_pre_post_req())
+    video = out.video[0]  # (25, 32, 32, 3)
+
+    # Outside the pixel window [8, 16): byte-identical to the source frame value.
+    for frame in (0, 1, 7, 16, 24):
+        assert torch.equal(video[frame], torch.full((32, 32, 3), frame % 256, dtype=torch.uint8))
+    # Inside the window: replaced by the regenerated (decoded) pixels (128).
+    for frame in (8, 12, 15):
+        assert torch.equal(video[frame], torch.full((32, 32, 3), 128, dtype=torch.uint8))
+
+
+def test_ltx2_retake_native_source_read_shapes(monkeypatch):
+    pipeline, _ = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    source_uint8, source_norm_5d = pipeline._read_source_video(
+        "/tmp/src.mp4", 25, 32, 32, torch.device("cpu"), torch.bfloat16
+    )
+
+    assert source_uint8.shape == (1, 25, 32, 32, 3)
+    assert source_uint8.dtype == torch.uint8
+    assert source_norm_5d.shape == (1, 3, 25, 32, 32)  # (B, C, T, H, W)
+    assert source_norm_5d.dtype == torch.bfloat16
+    # Frame 0 has pixel value 0 -> normalized to -1.0.
+    assert torch.allclose(source_norm_5d[0, :, 0].float(), torch.full((3, 32, 32), -1.0))
+
+
+def test_ltx2_retake_native_rejects_bad_encoded_shape(monkeypatch):
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+    fake.encode_shape_override = (1, 4, 3, 1, 1)  # wrong latent frame count
+
+    with pytest.raises(ValueError, match="encoded source latent shape"):
+        pipeline.infer(_native_pre_post_req())
+    assert fake.denoise_calls == 0
+
+
+def test_ltx2_retake_native_passes_source_audio_through(monkeypatch):
+    pipeline, _ = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    out = pipeline.infer(_native_pre_post_req())
+
+    # Source audio is returned unchanged (video-only regeneration).
+    assert out.audio.shape == (1, 2, 4)
+    assert torch.equal(out.audio, torch.ones(1, 2, 4))
+    assert out.audio_sample_rate == 48000
+
+
+def test_ltx2_retake_native_handles_missing_source_audio(monkeypatch):
+    pipeline, _ = _prepare_native_pre_post_pipeline(monkeypatch)
+    pipeline._decode_audio_from_file = lambda path, device: None
+
+    out = pipeline.infer(_native_pre_post_req())
+
+    assert out.audio is None
+    assert out.audio_sample_rate is None
+
+
+def test_ltx2_retake_native_rejects_audio_regeneration(monkeypatch):
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    with pytest.raises(NotImplementedError, match="regenerate_audio"):
+        pipeline.infer(_native_pre_post_req(regenerate_audio=True))
+    assert fake.denoise_calls == 0
+
+
+def test_ltx2_retake_native_rejects_video_preservation(monkeypatch):
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    with pytest.raises(NotImplementedError, match="regenerate_video"):
+        pipeline.infer(_native_pre_post_req(regenerate_video=False))
+    assert fake.denoise_calls == 0
+
+
+def test_ltx2_retake_native_requires_native_pipeline_loaded():
+    pipeline = LTX2RetakePipeline(_minimal_retake_config())
+    pipeline._native = None
+
+    with pytest.raises(RuntimeError, match="native retake pipeline has not been loaded"):
+        pipeline.infer(_native_pre_post_req())
+
+
+def test_ltx2_retake_native_validates_source_frame_count(monkeypatch):
+    pipeline, _ = _prepare_native_pre_post_pipeline(monkeypatch, num_frames=24)
+
+    with pytest.raises(ValueError, match=r"8k\+1"):
+        pipeline.infer(_native_pre_post_req())
+
+
+def test_ltx2_retake_native_validates_source_resolution():
+    with pytest.raises(ValueError, match="multiple of 32"):
+        LTX2RetakePipeline._validate_retake_source(25, 32, 30)
+
+
+def test_ltx2_retake_upstream_stage_switch_defaults_false():
+    defaults = PIPELINE_REGISTRY["LTX2Pipeline"].defaults
+
+    assert defaults["retake_use_upstream_stage"] is False
+
+
+def test_ltx2_retake_distilled_sigmas_are_eight_steps():
+    sigmas = LTX2RetakePipeline._retake_distilled_sigmas(torch.device("cpu"))
+
+    assert sigmas.shape == (9,)  # 8 Euler steps + terminal
+    assert sigmas[0].item() == 1.0
+    assert sigmas[-1].item() == 0.0
