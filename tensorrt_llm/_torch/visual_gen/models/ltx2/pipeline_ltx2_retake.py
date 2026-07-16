@@ -28,8 +28,63 @@ from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm.logger import logger
 
-from .pipeline_ltx2 import LTX2Pipeline, _load_ltx2_transformer_weights, build_ltx2_transformer
+from .pipeline_ltx2 import (
+    LTX2Pipeline,
+    _find_safetensors_files,
+    _load_ltx2_transformer_weights,
+    build_ltx2_transformer,
+)
 from .retake_adapter import LTX2RetakeNativeAdapter
+
+
+def _retake_pixel_window(start_time: float, end_time: float, fps: float, num_frames: int) -> tuple:
+    """Half-open source pixel-frame window ``[start, end)`` for a retake window.
+
+    Frames are indexed by ``round(time * fps)`` and clamped to ``[0, num_frames]``
+    with ``start <= end`` so out-of-range or inverted times are safe (an inverted
+    or degenerate window yields an empty ``[start, start)`` span).
+    """
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
+    if num_frames < 0:
+        raise ValueError(f"num_frames must be non-negative, got {num_frames}")
+    start = max(0, min(int(round(start_time * fps)), num_frames))
+    end = max(start, min(int(round(end_time * fps)), num_frames))
+    return start, end
+
+
+def _composite_retake_window(
+    source: torch.Tensor, window: torch.Tensor, start_frame: int, end_frame: int
+) -> torch.Tensor:
+    """Splice regenerated ``window`` frames into ``source`` over ``[start, end)``.
+
+    ``source`` and ``window`` are ``(..., T, H, W, C)`` video tensors that share
+    every dimension except the frame count (dim ``-4``). Frames outside
+    ``[start_frame, end_frame)`` are copied byte-for-byte from ``source``; frames
+    inside are replaced by ``window``, which must have exactly
+    ``end_frame - start_frame`` frames. This is the native composite-back that
+    guarantees the AC-3.2 "non-retake frames byte-identical to source" invariant.
+    """
+    if source.dim() < 4:
+        raise ValueError(f"source must be (...,T,H,W,C); got {tuple(source.shape)}")
+    expected = end_frame - start_frame
+    if window.shape[-4] != expected:
+        raise ValueError(
+            f"composite window frame count {window.shape[-4]} != window span "
+            f"{expected} (for [{start_frame}, {end_frame}))"
+        )
+    if source.shape[:-4] != window.shape[:-4] or source.shape[-3:] != window.shape[-3:]:
+        raise ValueError(
+            f"composite source/window shape mismatch: source {tuple(source.shape)} "
+            f"window {tuple(window.shape)} (must match except the frame dim -4)"
+        )
+    out = source.clone()
+    if expected > 0:
+        out[..., start_frame:end_frame, :, :, :] = window.to(
+            dtype=source.dtype, device=source.device
+        )
+    return out
+
 
 # Comfy-format LoRA key conventions. The two exporters use different factor
 # suffixes (PEFT ``lora_A``/``lora_B`` vs comfy ``lora_down``/``lora_up``) and
@@ -79,18 +134,21 @@ def _fuse_lora_into_transformer_weights(weights: dict, lora_path: str, strength:
     down: dict = {}
     up: dict = {}
     alphas: dict = {}
-    with safetensors.torch.safe_open(lora_path, framework="pt") as f:
-        for key in f.keys():
-            base = _strip_lora_suffix(key, _LORA_DOWN_SUFFIXES)
-            if base is not None:
-                down[base] = f.get_tensor(key)
-                continue
-            base = _strip_lora_suffix(key, _LORA_UP_SUFFIXES)
-            if base is not None:
-                up[base] = f.get_tensor(key)
-                continue
-            if key.endswith(".alpha"):
-                alphas[key[: -len(".alpha")]] = float(f.get_tensor(key).item())
+    # Accept a single .safetensors file, a directory, or split shards (like the
+    # generation-side ``_load_lora_deltas``).
+    for path in _find_safetensors_files(lora_path):
+        with safetensors.torch.safe_open(path, framework="pt") as f:
+            for key in f.keys():
+                base = _strip_lora_suffix(key, _LORA_DOWN_SUFFIXES)
+                if base is not None:
+                    down[base] = f.get_tensor(key)
+                    continue
+                base = _strip_lora_suffix(key, _LORA_UP_SUFFIXES)
+                if base is not None:
+                    up[base] = f.get_tensor(key)
+                    continue
+                if key.endswith(".alpha"):
+                    alphas[key[: -len(".alpha")]] = float(f.get_tensor(key).item())
 
     fused = 0
     missing = []

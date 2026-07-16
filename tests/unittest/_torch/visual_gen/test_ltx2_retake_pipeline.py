@@ -13,7 +13,9 @@ from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
     LTX2RetakePipeline,
+    _composite_retake_window,
     _fuse_lora_into_transformer_weights,
+    _retake_pixel_window,
 )
 from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeNativeAdapter
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
@@ -552,6 +554,76 @@ def test_load_weights_without_lora_is_unchanged(tmp_path):
     pipeline.load_weights({wkey: base})
 
     assert torch.equal(captured["weights"][wkey], base)
+
+
+def test_retake_pixel_window_rounds_and_returns_half_open_span():
+    assert _retake_pixel_window(1.0, 2.0, 24.0, 100) == (24, 48)
+    # round(1.48*24)=round(35.52)=36, round(2.02*24)=round(48.48)=48
+    assert _retake_pixel_window(1.48, 2.02, 24.0, 100) == (36, 48)
+
+
+def test_retake_pixel_window_clamps_out_of_range_times():
+    assert _retake_pixel_window(-1.0, 10.0, 24.0, 100) == (0, 100)
+    assert _retake_pixel_window(0.0, 100.0, 24.0, 50) == (0, 50)
+
+
+def test_retake_pixel_window_inverted_times_yield_empty_span():
+    start, end = _retake_pixel_window(2.0, 1.0, 24.0, 100)
+    assert start == end == 48  # end clamped up to start -> empty
+
+
+def test_composite_replaces_window_and_keeps_outside_byte_identical():
+    source = torch.arange(5 * 2 * 2 * 3, dtype=torch.uint8).reshape(1, 5, 2, 2, 3)
+    window = torch.full((1, 2, 2, 2, 3), 200, dtype=torch.uint8)
+
+    out = _composite_retake_window(source, window, 1, 3)
+
+    assert torch.equal(out[:, 0], source[:, 0])  # before window: byte-identical
+    assert torch.equal(out[:, 3:5], source[:, 3:5])  # after window: byte-identical
+    assert torch.equal(out[:, 1:3], window)  # window replaced
+    assert torch.equal(source, torch.arange(60, dtype=torch.uint8).reshape(1, 5, 2, 2, 3))
+
+
+def test_composite_empty_window_returns_unmodified_copy():
+    source = torch.arange(3 * 2 * 2 * 3, dtype=torch.uint8).reshape(1, 3, 2, 2, 3)
+    window = torch.zeros(1, 0, 2, 2, 3, dtype=torch.uint8)
+
+    out = _composite_retake_window(source, window, 2, 2)
+
+    assert torch.equal(out, source)
+    assert out.data_ptr() != source.data_ptr()  # a copy, not the same storage
+
+
+def test_composite_rejects_wrong_window_length():
+    source = torch.zeros(1, 5, 2, 2, 3, dtype=torch.uint8)
+    window = torch.zeros(1, 3, 2, 2, 3, dtype=torch.uint8)  # span is 2, not 3
+    with pytest.raises(ValueError, match="window frame count"):
+        _composite_retake_window(source, window, 1, 3)
+
+
+def test_composite_rejects_shape_mismatch():
+    source = torch.zeros(1, 5, 2, 2, 3, dtype=torch.uint8)
+    window = torch.zeros(1, 2, 4, 2, 3, dtype=torch.uint8)  # H differs
+    with pytest.raises(ValueError, match="shape mismatch"):
+        _composite_retake_window(source, window, 1, 3)
+
+
+def test_fuse_lora_accepts_directory_of_shards(tmp_path):
+    wkey = "transformer_blocks.0.attn1.to_q.weight"
+    weights = {wkey: torch.zeros(2, 3)}
+    lora_dir = tmp_path / "lora"
+    lora_dir.mkdir()
+    _write_lora(
+        str(lora_dir / "lora.safetensors"),
+        {
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight": torch.ones(1, 3),
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight": torch.ones(2, 1),
+        },
+    )
+
+    _fuse_lora_into_transformer_weights(weights, str(lora_dir), strength=1.0)
+
+    assert torch.allclose(weights[wkey], torch.ones(2, 3))
 
 
 def test_ltx2_retake_prompt_encoder_cache_reuses_matching_prompts():
