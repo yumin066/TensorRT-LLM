@@ -947,6 +947,15 @@ class LTX2RetakePipeline(BasePipeline):
                 "LTX-2 native retake is video-only and preserves the source audio; "
                 "retake_regenerate_audio=True is not supported."
             )
+        # The native denoise path runs the distilled (non-guided) 8-step schedule.
+        # Reject a non-distilled request rather than silently running distilled
+        # sigmas, mirroring the upstream-stage path's guard.
+        if not bool(self.pipeline_config.extra_attrs.get("retake_distilled", True)):
+            raise NotImplementedError(
+                "LTX-2 native retake currently supports only the distilled "
+                "(non-guided) schedule; non-distilled guided denoise is not "
+                "implemented. Set retake_distilled=True."
+            )
 
         device = self._device
         dtype = self.dtype
@@ -1163,8 +1172,11 @@ class LTX2RetakePipeline(BasePipeline):
     def _read_source_audio(self, video_path, device):
         """Read the source audio unchanged (video-only retake preserves audio).
 
-        Returns the upstream ``Audio`` object (``.waveform`` / ``.sampling_rate``)
-        or ``None`` when the source has no audio stream.
+        Uses the upstream ``media_io.decode_audio_from_file`` reader, which
+        decodes via PyAV (no torchaudio dependency — torchaudio is only needed by
+        the audio VAE / vocoder, which the video-only retake path never loads or
+        calls). Returns the upstream ``Audio`` object (``.waveform`` /
+        ``.sampling_rate``) or ``None`` when the source has no audio stream.
         """
         return self._decode_audio_from_file(video_path, device)
 

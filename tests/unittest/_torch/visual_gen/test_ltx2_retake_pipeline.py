@@ -1024,6 +1024,15 @@ def test_ltx2_retake_native_rejects_video_preservation(monkeypatch):
     assert fake.denoise_calls == 0
 
 
+def test_ltx2_retake_native_rejects_non_distilled(monkeypatch):
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+    pipeline.pipeline_config.extra_attrs["retake_distilled"] = False
+
+    with pytest.raises(NotImplementedError, match="distilled"):
+        pipeline.infer(_native_pre_post_req())
+    assert fake.denoise_calls == 0
+
+
 def test_ltx2_retake_native_requires_native_pipeline_loaded():
     pipeline = LTX2RetakePipeline(_minimal_retake_config())
     pipeline._native = None
