@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Stage 1 native-transformer adapter for the LTX-2 retake workflow.
+"""Native-transformer adapter for the LTX-2 retake workflow.
 
 The upstream Lightricks ``ltx_pipelines`` retake orchestration
 (``DiffusionStage.run``) owns the source decode, temporal-region mask,
@@ -12,12 +12,13 @@ in ``BatchSplitAdapter``, not in the upstream ``X0Model`` velocity->x0 shim.
 
 The native TensorRT-LLM ``LTXModel`` instead returns **velocity** and requires a
 pre-built ``TextCache``. This adapter bridges the two so the native transformer
-(and its config-driven acceleration stack) can be injected into the upstream
-loop without modifying ``../LTX2.3-eval/packages/``. It:
+(and its config-driven acceleration stack) can be driven by the upstream loop
+without modifying ``../LTX2.3-eval/packages/``. It:
 
 - converts each upstream ``Modality`` into a native ``Modality`` (positions kept
   in fp32 for RoPE parity; latent/context cast to the model dtype),
-- builds the step-invariant native ``TextCache`` once and reuses it,
+- builds the native ``TextCache`` (step-invariant within a denoise loop) and
+  reuses it while the same text context and positions are passed in,
 - calls the native forward, and
 - converts the returned velocity to x0 with per-token timesteps:
   ``x0 = latent - velocity * timesteps[..., None]``.
@@ -34,7 +35,7 @@ import torch
 from .ltx2_core.modality import Modality as NativeModality
 
 
-class LTX2RetakeStage1Adapter(torch.nn.Module):
+class LTX2RetakeNativeAdapter(torch.nn.Module):
     """Impersonate the upstream ``X0Model`` around a native ``LTXModel``.
 
     Args:
@@ -52,7 +53,7 @@ class LTX2RetakeStage1Adapter(torch.nn.Module):
     def forward(self, video=None, audio=None, perturbations=None):
         if perturbations is not None:
             raise NotImplementedError(
-                "LTX-2 Stage 1 retake adapter does not translate STG perturbations; "
+                "The LTX-2 retake native adapter does not translate STG perturbations; "
                 "the distilled retake path uses a non-guided denoiser (perturbations=None)."
             )
 
@@ -89,20 +90,38 @@ class LTX2RetakeStage1Adapter(torch.nn.Module):
             latent=upstream.latent.to(dtype=self._dtype),
             timesteps=upstream.timesteps,
             # Keep positions in fp32: casting fractional time positions to bf16
-            # perturbs RoPE and breaks oracle parity (task3 D2).
+            # perturbs RoPE and breaks parity with the checkpoint-derived RoPE.
             positions=upstream.positions.to(dtype=torch.float32),
             context=upstream.context.to(dtype=self._dtype),
             enabled=getattr(upstream, "enabled", True),
             context_mask=getattr(upstream, "context_mask", None),
         )
 
+    @staticmethod
+    def _tensor_key(tensor):
+        return None if tensor is None else (id(tensor), tuple(tensor.shape))
+
+    @classmethod
+    def _modality_cache_key(cls, upstream):
+        # The text cache depends on text context, its mask, AND positions (which
+        # drive RoPE/PE). Keying only on context would replay stale positional
+        # embeddings when the same prompt context object is reused with different
+        # positions (e.g. a different retake window/shape). Include all three.
+        if upstream is None:
+            return None
+        return (
+            cls._tensor_key(getattr(upstream, "context", None)),
+            cls._tensor_key(getattr(upstream, "positions", None)),
+            cls._tensor_key(getattr(upstream, "context_mask", None)),
+        )
+
     def _get_text_cache(self, native_video, native_audio, upstream_video, upstream_audio):
-        # Text context/positions are step-invariant within a denoise loop, so the
+        # Context/positions are step-invariant within a denoise loop, so the
         # (expensive) KV-projection text cache is built once and reused while the
-        # same upstream context tensors are passed in.
+        # same context/positions/masks are passed in.
         key = (
-            id(getattr(upstream_video, "context", None)),
-            id(getattr(upstream_audio, "context", None)),
+            self._modality_cache_key(upstream_video),
+            self._modality_cache_key(upstream_audio),
         )
         if self._text_cache is None or self._text_cache_key != key:
             self._text_cache = self._model.prepare_text_cache(

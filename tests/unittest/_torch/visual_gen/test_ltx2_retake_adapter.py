@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality as NativeModality
-from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeStage1Adapter
+from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeNativeAdapter
 
 
 class _StubNativeModel(torch.nn.Module):
@@ -41,11 +41,7 @@ class _StubNativeModel(torch.nn.Module):
         return vv, va
 
 
-def _up_modality(
-    latent, timesteps, context, positions=None, context_mask=None, attention_mask=None
-):
-    if positions is None:
-        positions = torch.zeros(latent.shape[0], 3, latent.shape[1], 2)
+def _up_modality(latent, timesteps, context, positions, context_mask=None, attention_mask=None):
     return SimpleNamespace(
         latent=latent,
         timesteps=timesteps,
@@ -55,6 +51,10 @@ def _up_modality(
         enabled=True,
         attention_mask=attention_mask,
     )
+
+
+def _default_positions(latent):
+    return torch.zeros(latent.shape[0], 3, latent.shape[1], 2)
 
 
 def test_velocity_to_x0_uses_per_token_timesteps():
@@ -68,7 +68,7 @@ def test_velocity_to_x0_uses_per_token_timesteps():
         context=torch.zeros(1, 1, 4),
     )
 
-    x0 = LTX2RetakeStage1Adapter._velocity_to_x0(velocity, mod)
+    x0 = LTX2RetakeNativeAdapter._velocity_to_x0(velocity, mod)
 
     # token0: x0 = 1 - 0.5*0 = 1 (clean); token1: x0 = 2 - 1.0*0.5 = 1.5
     assert torch.allclose(x0[0, 0], torch.tensor([1.0, 1.0]))
@@ -77,34 +77,53 @@ def test_velocity_to_x0_uses_per_token_timesteps():
 
 def test_forward_returns_x0_and_reuses_text_cache():
     model = _StubNativeModel(velocity_scale=0.25)
-    adapter = LTX2RetakeStage1Adapter(model, model_dtype=torch.float32)
+    adapter = LTX2RetakeNativeAdapter(model, model_dtype=torch.float32)
     ctx = torch.zeros(1, 4, 8)
     latent = torch.ones(1, 3, 2)
     ts = torch.full((1, 3), 2.0)
+    pos = _default_positions(latent)
 
-    x0v, x0a = adapter(video=_up_modality(latent, ts, ctx), audio=None)
+    x0v, x0a = adapter(video=_up_modality(latent, ts, ctx, pos), audio=None)
 
     assert torch.allclose(x0v, torch.full_like(latent, 0.5))  # 1 - 0.25*2
     assert x0a is None
     assert model.prepare_calls == 1
 
-    # Same context tensor -> text cache reused (no rebuild).
-    adapter(video=_up_modality(latent, ts, ctx), audio=None)
+    # Same context AND positions objects -> text cache reused (no rebuild).
+    adapter(video=_up_modality(latent, ts, ctx, pos), audio=None)
     assert model.prepare_calls == 1
 
     # Different context tensor -> rebuild.
-    adapter(video=_up_modality(latent, ts, torch.zeros(1, 4, 8)), audio=None)
+    adapter(video=_up_modality(latent, ts, torch.zeros(1, 4, 8), pos), audio=None)
+    assert model.prepare_calls == 2
+
+
+def test_changed_positions_rebuilds_text_cache():
+    # Regression: same prompt context object but different positions (e.g. a
+    # different retake window/shape) must rebuild the cache, since positions
+    # drive RoPE/PE. Keying only on context would replay stale embeddings.
+    model = _StubNativeModel()
+    adapter = LTX2RetakeNativeAdapter(model, model_dtype=torch.float32)
+    ctx = torch.zeros(1, 4, 8)
+    latent = torch.ones(1, 3, 2)
+    ts = torch.zeros(1, 3)
+
+    adapter(video=_up_modality(latent, ts, ctx, _default_positions(latent)), audio=None)
+    assert model.prepare_calls == 1
+
+    # Same ctx object, brand-new positions tensor -> must rebuild.
+    adapter(video=_up_modality(latent, ts, ctx, torch.ones(1, 3, 3, 2)), audio=None)
     assert model.prepare_calls == 2
 
 
 def test_positions_kept_fp32_latent_cast_to_model_dtype():
     model = _StubNativeModel()
-    adapter = LTX2RetakeStage1Adapter(model, model_dtype=torch.bfloat16)
+    adapter = LTX2RetakeNativeAdapter(model, model_dtype=torch.bfloat16)
     video = _up_modality(
         torch.ones(1, 3, 2, dtype=torch.float32),
         torch.zeros(1, 3),
         torch.zeros(1, 4, 8, dtype=torch.float32),
-        positions=torch.zeros(1, 3, 3, 2, dtype=torch.float32),
+        torch.zeros(1, 3, 3, 2, dtype=torch.float32),
     )
 
     adapter(video=video, audio=None)
@@ -115,11 +134,13 @@ def test_positions_kept_fp32_latent_cast_to_model_dtype():
 
 
 def test_non_none_attention_mask_fails_fast():
-    adapter = LTX2RetakeStage1Adapter(_StubNativeModel())
+    adapter = LTX2RetakeNativeAdapter(_StubNativeModel())
+    latent = torch.ones(1, 3, 2)
     video = _up_modality(
-        torch.ones(1, 3, 2),
+        latent,
         torch.zeros(1, 3),
         torch.zeros(1, 4, 8),
+        _default_positions(latent),
         attention_mask=torch.ones(1, 3, 3),
     )
     with pytest.raises(NotImplementedError, match="attention_mask"):
@@ -127,7 +148,10 @@ def test_non_none_attention_mask_fails_fast():
 
 
 def test_non_none_perturbations_fails_fast():
-    adapter = LTX2RetakeStage1Adapter(_StubNativeModel())
-    video = _up_modality(torch.ones(1, 3, 2), torch.zeros(1, 3), torch.zeros(1, 4, 8))
+    adapter = LTX2RetakeNativeAdapter(_StubNativeModel())
+    latent = torch.ones(1, 3, 2)
+    video = _up_modality(
+        latent, torch.zeros(1, 3), torch.zeros(1, 4, 8), _default_positions(latent)
+    )
     with pytest.raises(NotImplementedError, match="perturbations"):
         adapter(video=video, audio=None, perturbations=object())
