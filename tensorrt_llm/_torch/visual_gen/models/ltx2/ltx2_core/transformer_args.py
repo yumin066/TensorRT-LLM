@@ -32,6 +32,10 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    # Per-batch (B, 1, 2*dim) prompt-AdaLN timestep embedding used to modulate
+    # the text cross-attention context when ``cross_attention_adaln=True``.
+    # None for models without prompt AdaLN.
+    prompt_timestep: torch.Tensor | None = None
     # Optional [B, S_full_padded] bool mask (True=valid, False=pad) for the
     # audio modality when Ulysses padding is engaged (T_a padded to be
     # divisible by ulysses_size). Identical across Ulysses ranks (full-seq).
@@ -59,6 +63,7 @@ class TransformerArgsPreprocessor:
         double_precision_rope: bool,
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -71,6 +76,9 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        # Present only for cross_attention_adaln=True checkpoints; derives the
+        # per-batch prompt timestep that modulates the text CA context.
+        self.prompt_adaln = prompt_adaln
         self._freq_grid_cache: dict = {}
 
     def _prepare_timestep(
@@ -78,9 +86,11 @@ class TransformerArgsPreprocessor:
         timestep: torch.Tensor,
         batch_size: int,
         hidden_dtype: torch.dtype,
+        adaln: AdaLayerNormSingle | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        adaln = adaln if adaln is not None else self.adaln
         timestep = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = self.adaln(timestep.flatten(), hidden_dtype=hidden_dtype)
+        timestep, embedded_timestep = adaln(timestep.flatten(), hidden_dtype=hidden_dtype)
         timestep = timestep.view(batch_size, -1, timestep.shape[-1])
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
         return timestep, embedded_timestep
@@ -170,6 +180,16 @@ class TransformerArgsPreprocessor:
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            if modality.sigma is None:
+                raise ValueError(
+                    "cross_attention_adaln=True requires Modality.sigma to derive "
+                    "the prompt AdaLN timestep, but it was None."
+                )
+            prompt_timestep, _ = self._prepare_timestep(
+                modality.sigma, x.shape[0], modality.latent.dtype, adaln=self.prompt_adaln
+            )
         return TransformerArgs(
             x=x,
             context=static_context,
@@ -181,6 +201,7 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
+            prompt_timestep=prompt_timestep,
         )
 
 
@@ -205,6 +226,7 @@ class MultiModalTransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -218,6 +240,7 @@ class MultiModalTransformerArgsPreprocessor:
             double_precision_rope=double_precision_rope,
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
+            prompt_adaln=prompt_adaln,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln

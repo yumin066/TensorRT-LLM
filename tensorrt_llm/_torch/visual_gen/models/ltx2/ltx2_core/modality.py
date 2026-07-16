@@ -21,3 +21,8 @@ class Modality:
     context: torch.Tensor  # Text embeddings
     enabled: bool = True
     context_mask: torch.Tensor | None = None
+    # (B,): current sigma (noise level). Only consumed by prompt AdaLN
+    # (cross_attention_adaln=True checkpoints, e.g. LTX-2.3 22b distilled) to
+    # derive the per-batch prompt timestep. None for models without prompt
+    # AdaLN, where it is unused.
+    sigma: torch.Tensor | None = None

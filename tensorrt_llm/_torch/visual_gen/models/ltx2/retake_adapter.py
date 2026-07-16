@@ -95,6 +95,9 @@ class LTX2RetakeNativeAdapter(torch.nn.Module):
             context=upstream.context.to(dtype=self._dtype),
             enabled=getattr(upstream, "enabled", True),
             context_mask=getattr(upstream, "context_mask", None),
+            # Consumed only by prompt AdaLN (cross_attention_adaln=True, e.g. the
+            # LTX-2.3 22b distilled checkpoint); carries the current noise level.
+            sigma=getattr(upstream, "sigma", None),
         )
 
     @staticmethod

@@ -39,7 +39,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .ltx2_core.adaln import AdaLayerNormSingle
+from .ltx2_core.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from .ltx2_core.modality import Modality
 from .ltx2_core.perturbations import BatchedPerturbationConfig, PerturbationType
 from .ltx2_core.rope import LTXRopeType, apply_rotary_emb
@@ -531,6 +531,10 @@ class TransformerConfig:
     d_head: int
     context_dim: int
     apply_gated_attention: bool = False
+    # When True, the block carries text cross-attention AdaLN modulation:
+    # scale_shift_table gains 3 rows ([6:9] = query shift/scale/gate) and a
+    # prompt_scale_shift_table modulates the text context (LTX-2.3 22b).
+    cross_attention_adaln: bool = False
 
 
 class BasicAVTransformerBlock(nn.Module):
@@ -560,6 +564,13 @@ class BasicAVTransformerBlock(nn.Module):
         self._sharder = SequenceSharder.from_vgm(vgm)
         self._audio_is_sharded = False
 
+        # Text cross-attention AdaLN (LTX-2.3 22b): enlarges the per-block
+        # scale_shift_table to 9 rows and adds a prompt_scale_shift_table that
+        # modulates the text context. Mirrors upstream ``BasicAVTransformerBlock``.
+        self.cross_attention_adaln = (video is not None and video.cross_attention_adaln) or (
+            audio is not None and audio.cross_attention_adaln
+        )
+
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
 
@@ -568,6 +579,11 @@ class BasicAVTransformerBlock(nn.Module):
 
         if audio is not None and video is not None:
             self._init_av_cross_modules(video, audio, rope_type, norm_eps, config, idx)
+
+        if self.cross_attention_adaln and video is not None:
+            self.prompt_scale_shift_table = nn.Parameter(torch.empty(2, video.dim))
+        if self.cross_attention_adaln and audio is not None:
+            self.audio_prompt_scale_shift_table = nn.Parameter(torch.empty(2, audio.dim))
 
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
@@ -613,7 +629,8 @@ class BasicAVTransformerBlock(nn.Module):
             enable_sequence_parallel=False,
         )
         self.ff = self._make_mlp(cfg, model_config, idx)
-        self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
+        sst_size = adaln_embedding_coefficient(cfg.cross_attention_adaln)
+        self.scale_shift_table = nn.Parameter(torch.empty(sst_size, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
         # Audio under Ulysses needs key_padding_mask support on audio_attn1
@@ -659,7 +676,8 @@ class BasicAVTransformerBlock(nn.Module):
             enable_sequence_parallel=False,
         )
         self.audio_ff = self._make_mlp(cfg, model_config, idx)
-        self.audio_scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
+        audio_sst_size = adaln_embedding_coefficient(cfg.cross_attention_adaln)
+        self.audio_scale_shift_table = nn.Parameter(torch.empty(audio_sst_size, cfg.dim))
 
     def _init_av_cross_modules(self, v_cfg, a_cfg, rope_type, eps, model_config, idx):
         self.audio_to_video_attn = LTX2Attention(
@@ -745,6 +763,54 @@ class BasicAVTransformerBlock(nn.Module):
         gate_chunks = [t.squeeze(2) for t in gate_vals]
         return (*ss_chunks, *gate_chunks)
 
+    def _apply_text_cross_attention(
+        self,
+        attn: "LTX2Attention",
+        x_normed: torch.Tensor,
+        context: torch.Tensor,
+        pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None,
+        scale_shift_table: torch.Tensor,
+        prompt_scale_shift_table: torch.Tensor | None,
+        timestep: torch.Tensor,
+        prompt_timestep: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Text cross-attention, with optional AdaLN modulation.
+
+        ``x_normed`` is the RMS-normalized stream (this method does not
+        normalize again). Without ``cross_attention_adaln`` this is today's
+        cached path: Q is projected from ``x_normed`` and cached text K/V
+        (``pre_projected_kv``) are reused.
+
+        With ``cross_attention_adaln`` (LTX-2.3 22b) the query is modulated by
+        ``scale_shift_table[6:9]`` (shift/scale/gate), the text context by
+        ``prompt_scale_shift_table`` + ``prompt_timestep``, K/V are projected
+        per-step from the *modulated* context (the ``prepare_text_cache``
+        pre-projection is intentionally unused here — it would be stale), and
+        the attention output is gated. Mirrors upstream
+        ``apply_cross_attention_adaln``.
+        """
+        if not self.cross_attention_adaln:
+            return attn(
+                x_normed,
+                context=context,
+                pre_projected_kv=pre_projected_kv,
+                timestep=timestep,
+            )
+        shift_q, scale_q, gate = self._get_ada_values(
+            scale_shift_table, x_normed.shape[0], timestep, slice(6, 9)
+        )
+        batch_size = x_normed.shape[0]
+        shift_kv, scale_kv = (
+            prompt_scale_shift_table[None, None].to(device=x_normed.device, dtype=x_normed.dtype)
+            + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+        ).unbind(dim=2)
+        attn_input = x_normed * (1 + scale_q) + shift_q
+        modulated_context = context * (1 + scale_kv) + shift_kv
+        # Text cross-attn has no RoPE, so project_kv is norm-only; project
+        # per-step from the modulated context (pe=None).
+        k, v = attn.project_kv(modulated_context)
+        return attn(attn_input, pre_projected_kv=(k, v), timestep=timestep) * gate
+
     # -- Sequence-parallel helpers for AV cross-attention ----------------------
 
     def _sp_all_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
@@ -813,11 +879,15 @@ class BasicAVTransformerBlock(nn.Module):
                         PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, v_self_out
                     )
                 vx = vx + v_self_out
-            vx = vx + self.attn2(
+            vx = vx + self._apply_text_cross_attention(
+                self.attn2,
                 rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
-                pre_projected_kv=text_kv_video,
-                timestep=video.timesteps,
+                video.context,
+                text_kv_video,
+                self.scale_shift_table,
+                getattr(self, "prompt_scale_shift_table", None),
+                video.timesteps,
+                video.prompt_timestep,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -847,11 +917,15 @@ class BasicAVTransformerBlock(nn.Module):
                         PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, a_self_out
                     )
                 ax = ax + a_self_out
-            ax = ax + self.audio_attn2(
+            ax = ax + self._apply_text_cross_attention(
+                self.audio_attn2,
                 rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
-                pre_projected_kv=text_kv_audio,
-                timestep=audio.timesteps,
+                audio.context,
+                text_kv_audio,
+                self.audio_scale_shift_table,
+                getattr(self, "audio_prompt_scale_shift_table", None),
+                audio.timesteps,
+                audio.prompt_timestep,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -975,7 +1049,7 @@ class BasicAVTransformerBlock(nn.Module):
         # --- Video FFN ---
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = self._get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None)
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
             vx = vx + self.ff(vx_scaled) * vgate_mlp
@@ -983,7 +1057,7 @@ class BasicAVTransformerBlock(nn.Module):
         # --- Audio FFN ---
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self._get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None)
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp
@@ -1098,6 +1172,7 @@ class LTXModel(BaseDiffusionModel):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        cross_attention_adaln: bool = False,
         model_config: Optional["DiffusionModelConfig"] = None,
     ):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -1110,6 +1185,11 @@ class LTXModel(BaseDiffusionModel):
         self.double_precision_rope = double_precision_rope
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
+        # Text cross-attention AdaLN: 9-row per-block tables + root/audio
+        # prompt AdaLN modules + per-step text-context modulation. Enabled by
+        # the LTX-2.3 22b distilled checkpoint (cross_attention_adaln=True);
+        # False reproduces the 19b behavior exactly.
+        self.cross_attention_adaln = cross_attention_adaln
 
         cross_pe_max_pos = None
 
@@ -1286,7 +1366,19 @@ class LTXModel(BaseDiffusionModel):
         self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
         self.adaln_single = AdaLayerNormSingle(
             self.inner_dim,
+            embedding_coefficient=adaln_embedding_coefficient(self.cross_attention_adaln),
             make_linear=self._make_linear,
+        )
+        # Prompt AdaLN (coefficient 2): produces the per-batch text-context
+        # shift/scale for cross-attention AdaLN. Only present when enabled.
+        self.prompt_adaln_single = (
+            AdaLayerNormSingle(
+                self.inner_dim,
+                embedding_coefficient=2,
+                make_linear=self._make_linear,
+            )
+            if self.cross_attention_adaln
+            else None
         )
         self.caption_projection = PixArtAlphaTextProjection(
             in_features=caption_channels,
@@ -1301,7 +1393,17 @@ class LTXModel(BaseDiffusionModel):
         self.audio_patchify_proj = self._make_linear(in_channels, self.audio_inner_dim)
         self.audio_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim,
+            embedding_coefficient=adaln_embedding_coefficient(self.cross_attention_adaln),
             make_linear=self._make_linear,
+        )
+        self.audio_prompt_adaln_single = (
+            AdaLayerNormSingle(
+                self.audio_inner_dim,
+                embedding_coefficient=2,
+                make_linear=self._make_linear,
+            )
+            if self.cross_attention_adaln
+            else None
         )
         self.audio_caption_projection = PixArtAlphaTextProjection(
             in_features=caption_channels,
@@ -1341,6 +1443,7 @@ class LTXModel(BaseDiffusionModel):
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
+                prompt_adaln=self.prompt_adaln_single,
                 caption_projection=self.caption_projection,
                 cross_scale_shift_adaln=self.av_ca_video_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_a2v_gate_adaln_single,
@@ -1359,6 +1462,7 @@ class LTXModel(BaseDiffusionModel):
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
+                prompt_adaln=self.audio_prompt_adaln_single,
                 caption_projection=self.audio_caption_projection,
                 cross_scale_shift_adaln=self.av_ca_audio_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_v2a_gate_adaln_single,
@@ -1378,6 +1482,7 @@ class LTXModel(BaseDiffusionModel):
             self.video_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
+                prompt_adaln=self.prompt_adaln_single,
                 caption_projection=self.caption_projection,
                 inner_dim=self.inner_dim,
                 max_pos=self.positional_embedding_max_pos,
@@ -1392,6 +1497,7 @@ class LTXModel(BaseDiffusionModel):
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
+                prompt_adaln=self.audio_prompt_adaln_single,
                 caption_projection=self.audio_caption_projection,
                 inner_dim=self.audio_inner_dim,
                 max_pos=self.audio_positional_embedding_max_pos,
@@ -1424,6 +1530,7 @@ class LTXModel(BaseDiffusionModel):
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=self.cross_attention_adaln,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -1435,6 +1542,7 @@ class LTXModel(BaseDiffusionModel):
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=self.cross_attention_adaln,
             )
             if self.model_type.is_audio_enabled()
             else None
@@ -1700,17 +1808,25 @@ class LTXModel(BaseDiffusionModel):
         v_ctx = v_mask = v_pe = v_cross_pe = v_kv = None
         a_ctx = a_mask = a_pe = a_cross_pe = a_kv = None
 
+        # When cross_attention_adaln is enabled the text context is modulated
+        # per-step (prompt AdaLN) before the K/V projection, so a step-invariant
+        # pre-projection would be stale. Leave the KV caches as None and let the
+        # block project K/V per-step from the modulated context.
+        cache_text_kv = not self.cross_attention_adaln
+
         if video_context is not None:
             v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
                 video_context, video_context_mask, video_positions, dtype
             )
-            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
+            if cache_text_kv:
+                v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
 
         if audio_context is not None:
             a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
                 audio_context, audio_context_mask, audio_positions, dtype
             )
-            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+            if cache_text_kv:
+                a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
             # cos/sin are token-major: token axis is dim 1 for both SPLIT and
             # INTERLEAVED rope, matching `_make_pe_local`'s `cos[:, s:e]` shard.
             if self._audio_pad > 0:

@@ -610,11 +610,13 @@ def build_ltx2_transformer(pipeline_config) -> LTXModel:
     freq_prec = getattr(cfg, "frequencies_precision", False)
     double_precision_rope = freq_prec == "float64"
     apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
+    cross_attention_adaln = getattr(cfg, "cross_attention_adaln", False)
 
     logger.info(
         f"LTX2 transformer config: rope_type={rope_type.value}, "
         f"double_precision_rope={double_precision_rope}, "
-        f"apply_gated_attention={apply_gated_attention}"
+        f"apply_gated_attention={apply_gated_attention}, "
+        f"cross_attention_adaln={cross_attention_adaln}"
     )
 
     transformer = LTXModel(
@@ -641,6 +643,7 @@ def build_ltx2_transformer(pipeline_config) -> LTXModel:
         rope_type=rope_type,
         double_precision_rope=double_precision_rope,
         apply_gated_attention=apply_gated_attention,
+        cross_attention_adaln=getattr(cfg, "cross_attention_adaln", False),
         model_config=model_config,
     )
     transformer._transformer_config = vars(cfg)
