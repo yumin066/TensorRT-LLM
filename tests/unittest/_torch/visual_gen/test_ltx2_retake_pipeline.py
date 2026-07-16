@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import LTX2RetakePipeline
 from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeNativeAdapter
@@ -99,7 +100,9 @@ def test_ltx2_retake_declares_required_extra_params():
     assert specs["retake_start_time"].type == "float"
     assert specs["retake_end_time"].type == "float"
     assert specs["retake_regenerate_video"].default is True
-    assert specs["retake_regenerate_audio"].default is True
+    # Native retake is video-only and preserves source audio, so the default
+    # request (which omits the flag) must not request audio regeneration.
+    assert specs["retake_regenerate_audio"].default is False
     assert pipeline.default_generation_params == {"num_inference_steps": 40}
 
 
@@ -230,7 +233,7 @@ class _RecordingStage:
 
 class _FakeResidentRetakePipeline:
     """Resident upstream retake pipeline stub exposing only the pre/post seams
-    the native Stage 1 path reuses; ``__call__`` (the eager path) must not run."""
+    the native path reuses; ``__call__`` (the eager path) must not run."""
 
     def __init__(self, distilled=True, has_audio=True):
         self.distilled = distilled
@@ -336,6 +339,39 @@ def test_ltx2_retake_infer_injects_native_adapter_into_stage_run(monkeypatch):
     assert out.video.dtype == torch.uint8
     assert out.frame_rate == 24.0
     assert out.audio_sample_rate == 48000
+
+
+def test_ltx2_retake_default_request_omitting_audio_flag_reaches_stage_run(monkeypatch):
+    # Regression: an ordinary serving request omits retake_regenerate_audio and
+    # relies on DiffusionExecutor._merge_defaults() to fill it from the schema
+    # default. That default must be False so the native (video-only) path is
+    # reached and the source audio is frozen -- not rejected by the fail-fast.
+    pipeline, fake = _prepare_native_pipeline(monkeypatch)
+    req = SimpleNamespace(
+        prompt="regenerated window content",
+        params=SimpleNamespace(
+            extra_params={
+                "retake_video_path": "/tmp/src.mp4",
+                "retake_start_time": 1.0,
+                "retake_end_time": 2.0,
+                "retake_regenerate_video": True,
+                "retake_enhance_prompt": False,
+                "retake_max_batch_size": 1,
+                # retake_regenerate_audio intentionally omitted.
+            },
+            seed=42,
+            negative_prompt="",
+            num_inference_steps=None,
+        ),
+    )
+
+    # Materialize defaults exactly like the serving worker does.
+    DiffusionExecutor._merge_defaults(SimpleNamespace(pipeline=pipeline), req)
+
+    assert req.params.extra_params["retake_regenerate_audio"] is False
+    pipeline.infer(req)
+    assert len(fake.stage.run_calls) == 1
+    assert fake.stage.run_calls[0].audio.frozen is True
 
 
 def test_ltx2_retake_infer_rejects_audio_regeneration(monkeypatch):

@@ -79,8 +79,12 @@ class LTX2RetakePipeline(BasePipeline):
             ),
             "retake_regenerate_audio": ExtraParamSchema(
                 type="bool",
-                default=True,
-                description="Regenerate audio inside the retake window when source audio exists.",
+                default=False,
+                description=(
+                    "Regenerate audio inside the retake window. The native retake path "
+                    "is video-only and preserves the source audio, so this defaults to "
+                    "False; True is rejected."
+                ),
             ),
             "retake_enhance_prompt": ExtraParamSchema(
                 type="bool",
@@ -391,7 +395,7 @@ class LTX2RetakePipeline(BasePipeline):
         )
 
     def _run_stage1_native(self, req, extra, video_path, start_time, end_time, prompt):
-        """Stage 1 hybrid retake: native denoise driven by the upstream loop.
+        """Run retake denoising on the native transformer via the upstream loop.
 
         Reuses the resident upstream pre/post components (image/audio
         conditioners, prompt encoder, diffusion stage, VAE decoders) but injects
@@ -406,7 +410,7 @@ class LTX2RetakePipeline(BasePipeline):
         """
         if self.transformer is None:
             raise RuntimeError(
-                "LTX-2 retake Stage 1 native path requires the native transformer, "
+                "LTX-2 retake native path requires the native transformer, "
                 "but self.transformer is None."
             )
 
@@ -428,7 +432,7 @@ class LTX2RetakePipeline(BasePipeline):
         if regenerate_audio:
             raise NotImplementedError(
                 "LTX-2 retake native path is video-only and preserves the source "
-                "audio; retake_regenerate_audio=True is not supported (AC-3.2)."
+                "audio; retake_regenerate_audio=True is not supported."
             )
 
         up = self._import_upstream_retake_symbols()
