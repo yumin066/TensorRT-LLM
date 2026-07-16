@@ -7,9 +7,10 @@ Runs the native LTX-2 retake video regeneration and the preserved upstream
 ``DiffusionStage.run`` oracle on the same source / prompt / window / seed, then:
 
 - persists both output videos plus a reproducibility protocol,
-- re-checks the retake hard invariants (output length, byte-identical frames
-  outside the retake window, source-audio preservation, determinism, and the
-  audio-regeneration fail-fast) on the native output, and
+- re-checks the retake hard invariants (output length, output shape, output
+  fps, byte-identical frames outside the retake window, source-audio
+  preservation, determinism, and the audio-regeneration fail-fast) on the
+  native output, and
 - computes advisory PSNR / SSIM between the native and upstream outputs (and an
   optional committed reference), split into the retake window and the region
   outside it.
@@ -18,20 +19,26 @@ The PSNR / SSIM columns are informational only: the exit code and the
 ``all_checks_passed`` summary reflect the hard invariants exclusively and never
 depend on any image-similarity metric.
 
-Source-media guidance: the native-vs-upstream PSNR / SSIM comparison must use a
-VIDEO-ONLY source (a source with no audio stream). The upstream oracle path
-resamples source audio through torchaudio, which is stubbed in some runtime
-containers and raises when handed an audio-bearing source; the native path
-reads media through PyAV and is unaffected. Run the audio-preservation
-invariant on an audio-bearing source (native path only) and run the
-native-vs-upstream comparison on a video-only source. When the upstream path
-cannot run, the oracle still completes with the native artifacts, protocol, and
-hard invariants, and records the skip reason instead of the upstream metrics.
+The native-vs-upstream comparison is the point of this oracle, so the upstream
+run is REQUIRED by default: if it is skipped, raises, or produces no output the
+gate fails and the process exits nonzero. Pass ``--native-only`` for a
+diagnostic run that exercises the native hard invariants alone (upstream not
+run); that mode reports ``task6_satisfied = False`` and its gate reflects the
+native invariants only.
+
+Source-media guidance: the native-vs-upstream comparison must use a VIDEO-ONLY
+source (a source with no audio stream). The upstream oracle path resamples
+source audio through torchaudio, which is stubbed in some runtime containers and
+raises when handed an audio-bearing source; the native path reads media through
+PyAV and is unaffected. In the default (native-vs-upstream) mode an audio-
+bearing source fails fast with a message directing the operator to
+``--native-only``. Run the audio-preservation invariant on an audio-bearing
+source via ``--native-only``.
 
 The heavy ``tensorrt_llm`` / Lightricks imports live inside the build and run
 functions so the pure helpers at the top of this module (``psnr``, ``ssim``,
-``split_regions``, ``build_protocol``, ``sha256_file``) import on a plain CPU
-host without a GPU.
+``split_regions``, ``build_protocol``, ``sha256_file``, ``assemble_gate``,
+``build_manifest_entries``) import on a plain CPU host without a GPU.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -209,6 +217,9 @@ def build_protocol(
     pixel_window: list,
     conditioned_latent_ranges: list,
     env: dict,
+    scheduler: str = "",
+    source_fps: Optional[float] = None,
+    code_commit: Optional[str] = None,
 ) -> dict:
     """Assemble the reproducibility protocol from already-computed primitives.
 
@@ -216,6 +227,12 @@ def build_protocol(
     testable without a GPU. ``regenerate_video`` is always True and
     ``regenerate_audio`` always False because the native retake path is a
     video-only window regeneration that preserves the source audio.
+
+    ``code_commit`` is the authoritative source-of-truth for the running code
+    (the operator-supplied reviewed local commit), distinct from the possibly
+    stale git HEAD ``commit`` recorded inside ``native_repo`` / ``eval_repo``.
+    ``scheduler`` is a stable identifier for the native denoise schedule and
+    ``source_fps`` is the source frame rate read via PyAV.
     """
     return {
         "native_repo": native_repo,
@@ -230,9 +247,11 @@ def build_protocol(
         "seed": seed,
         "dtype": dtype,
         "attention_backend": attention_backend,
+        "scheduler": scheduler,
         "num_inference_steps": num_inference_steps,
         "sigmas": list(sigmas),
         "fps": fps,
+        "source_fps": source_fps,
         "num_frames": num_frames,
         "height": height,
         "width": width,
@@ -241,8 +260,108 @@ def build_protocol(
         "conditioned_latent_ranges": conditioned_latent_ranges,
         "regenerate_video": True,
         "regenerate_audio": False,
+        "code_commit": code_commit,
         "env": env,
     }
+
+
+def assemble_gate(
+    invariants: dict,
+    invariant_errors: dict,
+    upstream_available: bool,
+    native_only: bool,
+) -> tuple:
+    """Compute ``(all_checks_passed, task6_satisfied)`` from the invariant state.
+
+    Pure and side-effect free so it is unit testable without a GPU.
+
+    - The native hard invariants pass only when every applicable (non-``None``)
+      invariant is ``True`` AND ``invariant_errors`` is empty. Only
+      ``audio_preserved`` may legitimately be ``None`` (no source audio, N/A);
+      every other invariant is a strict bool, and an invariant that raised is
+      recorded ``False`` with an entry in ``invariant_errors``.
+    - Default (native-vs-upstream) mode: ``all_checks_passed`` requires the
+      upstream oracle to have produced output AND the native invariants to pass.
+      ``task6_satisfied`` is ``True`` only under those same two conditions.
+    - ``--native-only`` diagnostic mode: ``task6_satisfied`` is always ``False``
+      (this is not the native-vs-upstream oracle) and ``all_checks_passed``
+      reflects the native hard invariants alone.
+    """
+    native_ok = (
+        all(v is True for k, v in invariants.items() if v is not None) and not invariant_errors
+    )
+    if native_only:
+        return native_ok, False
+    if not upstream_available:
+        return False, False
+    return native_ok, native_ok
+
+
+# ----------------------------------------------------------------------------
+# Local artifact manifest (filesystem, stdlib only).
+# ----------------------------------------------------------------------------
+
+MANIFEST_ARTIFACTS = (
+    "protocol.json",
+    "metrics.json",
+    "native.mp4",
+    "upstream.mp4",
+    "native.pt",
+    "upstream.pt",
+)
+
+
+def build_manifest_entries(paths_by_name: dict) -> dict:
+    """Map ``name -> {path, exists, size_bytes, sha256}`` for each artifact.
+
+    Pure aside from reading the referenced files: missing files yield
+    ``exists=False`` with ``None`` size / digest, present files carry their byte
+    size and streaming SHA-256 so the copied package is self-describing.
+    """
+    entries = {}
+    for name, path in paths_by_name.items():
+        p = Path(path)
+        if p.exists() and p.is_file():
+            entries[name] = {
+                "path": str(p),
+                "exists": True,
+                "size_bytes": p.stat().st_size,
+                "sha256": sha256_file(str(p)),
+            }
+        else:
+            entries[name] = {
+                "path": str(p),
+                "exists": False,
+                "size_bytes": None,
+                "sha256": None,
+            }
+    return entries
+
+
+def build_manifest(
+    output_dir: str,
+    remote_output_dir: str,
+    code_commit: Optional[str],
+    artifact_names=MANIFEST_ARTIFACTS,
+) -> dict:
+    """Assemble a self-describing manifest for the artifacts in *output_dir*."""
+    out = Path(output_dir)
+    paths_by_name = {name: out / name for name in artifact_names}
+    return {
+        "remote_output_dir": remote_output_dir,
+        "code_commit": code_commit,
+        "artifacts": build_manifest_entries(paths_by_name),
+    }
+
+
+def _json_parses(path: str) -> bool:
+    """Whether the file at *path* exists and parses as JSON."""
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -251,8 +370,12 @@ def build_protocol(
 
 
 def _git_info(repo_dir: str) -> dict:
-    """Best-effort ``{commit, branch}`` for a git repo; nulls on any failure."""
-    info = {"path": repo_dir, "commit": None, "branch": None}
+    """Best-effort ``{commit, branch, dirty}`` for a git repo; nulls on failure.
+
+    ``dirty`` is ``True`` when ``git status --porcelain`` reports any uncommitted
+    change in the working tree, so a synced-but-uncommitted tree is never hidden.
+    """
+    info = {"path": repo_dir, "commit": None, "branch": None, "dirty": None}
     try:
         info["commit"] = subprocess.check_output(
             ["git", "-C", repo_dir, "rev-parse", "HEAD"],
@@ -264,6 +387,12 @@ def _git_info(repo_dir: str) -> dict:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", repo_dir, "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        info["dirty"] = bool(status.strip())
     except (subprocess.CalledProcessError, OSError):
         pass
     return info
@@ -381,6 +510,36 @@ def read_source_frames(path: str) -> np.ndarray:
     return np.stack(frames, axis=0)
 
 
+def read_source_fps(path: str) -> Optional[float]:
+    """Read the source video frame rate via PyAV, or ``None`` if unavailable.
+
+    Uses the stream's ``average_rate`` (a ``Fraction`` such as ``30000/1001``)
+    so fractional rates are preserved before conversion to float.
+    """
+    import av
+
+    container = av.open(path)
+    try:
+        video_stream = next(s for s in container.streams if s.type == "video")
+        rate = video_stream.average_rate
+        if rate is None:
+            rate = video_stream.base_rate
+        return float(rate) if rate is not None else None
+    finally:
+        container.close()
+
+
+def has_audio_stream(path: str) -> bool:
+    """Whether *path* carries at least one audio stream (PyAV probe)."""
+    import av
+
+    container = av.open(path)
+    try:
+        return any(s.type == "audio" for s in container.streams)
+    finally:
+        container.close()
+
+
 def read_source_audio(path: str, device):
     """Return ``(waveform_tensor, sampling_rate)`` for *path* or ``None``."""
     from ltx_pipelines.utils.media_io import decode_audio_from_file
@@ -480,12 +639,39 @@ def _audio_preserved(native_audio, source_audio) -> Optional[bool]:
         return False
 
 
-def check_invariants(native_video, source_frames, native_audio, source_audio, pixel_window):
+def _safe_invariant(name: str, fn, invariant_errors: dict):
+    """Evaluate a hard invariant, recording exceptions as a strict ``False``.
+
+    A broad ``except Exception`` is intended here: any failure to evaluate a
+    hard invariant must fail the gate (never become an ignorable ``None``), and
+    the exception type + message is recorded in ``invariant_errors[name]`` for
+    triage. The callable's own return value (including a legitimate ``None`` for
+    an N/A invariant) is passed through unchanged when no exception is raised.
+    """
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 - any failure fails the gate; see docstring
+        invariant_errors[name] = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+def check_invariants(
+    native_video,
+    source_frames,
+    native_audio,
+    source_audio,
+    pixel_window,
+    source_fps,
+    native_frame_rate,
+    invariant_errors: dict,
+):
     """Re-check the retake hard invariants on the native output.
 
-    Returns a dict of ``bool | None`` invariant results. ``None`` means the
-    invariant does not apply (e.g. no source audio) and is excluded from the
-    hard gate. These invariants are the sole pass/fail gate; the similarity
+    Returns a dict of ``bool | None`` invariant results and mutates
+    ``invariant_errors`` (``name -> "ExceptionType: message"``) for any
+    invariant that raised. Only ``audio_preserved`` may be ``None`` (no source
+    audio, N/A) and is excluded from the hard gate; every other invariant is a
+    strict bool. These invariants are the sole pass/fail gate; the similarity
     metrics computed elsewhere never enter this dict.
     """
     import torch
@@ -495,19 +681,52 @@ def check_invariants(native_video, source_frames, native_audio, source_audio, pi
     start, end = pixel_window
 
     results = {}
-    results["output_len_matches_source"] = bool(nat.shape[0] == src.shape[0])
 
-    outside_identical = None
-    if results["output_len_matches_source"]:
+    def _len():
+        return bool(nat.shape[0] == src.shape[0])
+
+    results["output_len_matches_source"] = _safe_invariant(
+        "output_len_matches_source", _len, invariant_errors
+    )
+
+    def _shape():
+        # Full (T, H, W, C) equality, not just the frame count.
+        return bool(tuple(nat.shape) == tuple(src.shape))
+
+    results["output_shape_matches"] = _safe_invariant(
+        "output_shape_matches", _shape, invariant_errors
+    )
+
+    def _fps():
+        if source_fps is None:
+            raise ValueError("source_fps unavailable")
+        if native_frame_rate is None:
+            raise ValueError("native frame_rate unavailable")
+        # fps can be a fraction (e.g. 30000/1001), so compare with a small
+        # relative tolerance rather than exact equality.
+        return bool(np.allclose(float(source_fps), float(native_frame_rate), rtol=1e-3, atol=0.0))
+
+    results["output_fps_matches"] = _safe_invariant("output_fps_matches", _fps, invariant_errors)
+
+    def _outside():
+        # _tensor_equal returns False on shape mismatch, so a length or spatial
+        # mismatch already fails this without a separate length guard.
         nat_lead, nat_trail = nat[:start], nat[end:]
         src_lead, src_trail = src[:start], src[end:]
-        outside_identical = bool(
+        return bool(
             _tensor_equal(nat_lead.cpu(), src_lead.cpu())
             and _tensor_equal(nat_trail.cpu(), src_trail.cpu())
         )
-    results["composite_outside_byte_identical"] = outside_identical
 
-    results["audio_preserved"] = _audio_preserved(native_audio, source_audio)
+    results["composite_outside_byte_identical"] = _safe_invariant(
+        "composite_outside_byte_identical", _outside, invariant_errors
+    )
+
+    def _audio():
+        # Passes through a legitimate None (no source audio -> N/A).
+        return _audio_preserved(native_audio, source_audio)
+
+    results["audio_preserved"] = _safe_invariant("audio_preserved", _audio, invariant_errors)
     return results
 
 
@@ -575,15 +794,40 @@ def parse_args(argv=None):
     p.add_argument("--start", type=float, required=True, help="Retake window start (seconds).")
     p.add_argument("--end", type=float, required=True, help="Retake window end (seconds).")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--dtype", default="bf16")
+    p.add_argument(
+        "--dtype",
+        default="bf16",
+        help="Native path dtype. Only 'bf16' is supported today; anything else errors.",
+    )
     p.add_argument("--attention-backend", default="VANILLA")
     p.add_argument("--steps", type=int, default=8)
     p.add_argument(
-        "--skip-upstream",
+        "--native-only",
         action="store_true",
-        help="Run only the native path (when the upstream-stage path OOMs or is unavailable).",
+        help=(
+            "Diagnostic run of the native path alone (upstream not run). "
+            "task6_satisfied is reported False and the gate reflects only the "
+            "native hard invariants. Without this flag the upstream oracle is "
+            "REQUIRED and its absence fails the gate."
+        ),
     )
-    return p.parse_args(argv)
+    p.add_argument(
+        "--code-commit",
+        default=None,
+        help=(
+            "Authoritative commit for the running code (the reviewed local "
+            "commit). Set this on clusters whose git HEAD is a stale base "
+            "commit while the working tree is synced from the reviewed commit. "
+            "Falls back to the LTX2_ORACLE_CODE_COMMIT environment variable."
+        ),
+    )
+    args = p.parse_args(argv)
+    if args.dtype != "bf16":
+        p.error(
+            f"--dtype only supports 'bf16' on the native path; got {args.dtype!r}. "
+            "Re-run with --dtype bf16."
+        )
+    return args
 
 
 def main(argv=None) -> int:
@@ -600,6 +844,8 @@ def main(argv=None) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    code_commit = args.code_commit or os.environ.get("LTX2_ORACLE_CODE_COMMIT")
+    invariant_errors: dict = {}
 
     # ---- Source media + window geometry --------------------------------
     source_frames = read_source_frames(args.source)
@@ -607,11 +853,36 @@ def main(argv=None) -> int:
     height = int(source_frames.shape[1])
     width = int(source_frames.shape[2])
     source_audio = read_source_audio(args.source, device)
+    source_fps = None
+    try:
+        source_fps = read_source_fps(args.source)
+    except (OSError, ValueError, StopIteration) as exc:
+        print(f"[oracle] source fps read failed: {exc}", file=sys.stderr)
+
+    # Audio-bearing sources cannot run through the upstream oracle in this
+    # container (upstream resamples audio via the stubbed torchaudio), so the
+    # default native-vs-upstream mode fails fast before building any pipeline.
+    source_has_audio = source_audio is not None
+    if not source_has_audio:
+        try:
+            source_has_audio = has_audio_stream(args.source)
+        except (OSError, ValueError, StopIteration) as exc:
+            print(f"[oracle] audio stream probe failed: {exc}", file=sys.stderr)
+    if source_has_audio and not args.native_only:
+        print(
+            "[oracle] audio-bearing source detected: the upstream oracle path cannot "
+            "decode audio-bearing sources in this container (upstream resamples audio "
+            "via the stubbed torchaudio). Re-run with --native-only for the "
+            "audio-preservation check.",
+            file=sys.stderr,
+        )
+        return 2
 
     # ---- 1. Native retake (build, run, determinism + failfast, free) ---
     native_pipe = build_pipeline(
         args.checkpoint, args.gemma, args.lora, device, args.attention_backend
     )
+    scheduler = f"NativeSchedulerAdapter/distilled-euler-{args.steps}"
     native_request = _make_request(
         args.prompt, args.negative_prompt, args.source, args.start, args.end, args.seed, args.steps
     )
@@ -621,7 +892,8 @@ def main(argv=None) -> int:
     pixel_start, pixel_end = _retake_pixel_window(args.start, args.end, fps, num_frames)
 
     # Cheap determinism re-check: a 2nd native run with the same seeded request
-    # must reproduce the first output bit-for-bit.
+    # must reproduce the first output bit-for-bit. Any failure to evaluate this
+    # hard invariant fails the gate and is recorded in invariant_errors.
     seed_deterministic = None
     try:
         native_video2, _, _ = _run_pipeline(native_pipe, native_request)
@@ -629,11 +901,14 @@ def main(argv=None) -> int:
             _video_to_thwc_uint8(native_video).cpu(), _video_to_thwc_uint8(native_video2).cpu()
         )
         del native_video2
-    except Exception as exc:  # noqa: BLE001 - recorded as advisory null, re-raised only in metrics
-        print(f"[oracle] determinism re-check skipped: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - any failure fails this hard invariant
+        seed_deterministic = False
+        invariant_errors["seed_deterministic"] = repr(exc)
+        print(f"[oracle] determinism re-check failed: {exc}", file=sys.stderr)
 
-    # Fail-fast re-check: requesting audio regeneration must raise, since the
-    # native retake path is video-only and preserves the source audio.
+    # Fail-fast re-check: requesting audio regeneration must raise
+    # NotImplementedError, since the native retake path is video-only and
+    # preserves the source audio. Any other outcome fails the gate.
     audio_regen_failfast = None
     try:
         failfast_request = _make_request(
@@ -650,8 +925,10 @@ def main(argv=None) -> int:
         audio_regen_failfast = False
     except NotImplementedError:
         audio_regen_failfast = True
-    except Exception as exc:  # noqa: BLE001 - unexpected error type; record as advisory null
-        print(f"[oracle] audio-regen failfast re-check inconclusive: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - unexpected error type; fail the hard invariant
+        audio_regen_failfast = False
+        invariant_errors["audio_regen_failfast"] = repr(exc)
+        print(f"[oracle] audio-regen failfast re-check errored: {exc}", file=sys.stderr)
 
     save_video_pt(native_video, str(output_dir / "native.pt"))
     native_mp4 = encode_mp4(native_thwc, fps, str(output_dir / "native.mp4"))
@@ -662,10 +939,12 @@ def main(argv=None) -> int:
         torch.cuda.empty_cache()
 
     # ---- 2. Upstream-stage oracle (build, run, free) -------------------
+    # Required by default: the native-vs-upstream comparison is the point of the
+    # oracle. Only --native-only skips it, as an explicit diagnostic run.
     upstream_thwc = None
     upstream_reason = None
-    if args.skip_upstream:
-        upstream_reason = "skipped_by_flag"
+    if args.native_only:
+        upstream_reason = "native_only_diagnostic_run"
     else:
         try:
             upstream_pipe = build_pipeline(
@@ -704,14 +983,26 @@ def main(argv=None) -> int:
 
     # ---- 3. Hard invariants (native output only) -----------------------
     invariants = check_invariants(
-        native_thwc, source_frames, native_audio, source_audio, (pixel_start, pixel_end)
+        native_thwc,
+        source_frames,
+        native_audio,
+        source_audio,
+        (pixel_start, pixel_end),
+        source_fps,
+        fps,
+        invariant_errors,
     )
     invariants["seed_deterministic"] = seed_deterministic
     invariants["audio_regen_failfast"] = audio_regen_failfast
 
-    # Hard gate: every applicable (non-None) invariant must be True. Similarity
-    # metrics are excluded by construction.
-    all_checks_passed = all(v is True for v in invariants.values() if v is not None)
+    # Hard gate: every applicable (non-None) invariant must be True and there
+    # must be no invariant_errors. In the default mode the upstream oracle must
+    # also have produced output; task6_satisfied additionally requires that.
+    # Similarity metrics are excluded by construction.
+    upstream_available = upstream_thwc is not None
+    all_checks_passed, task6_satisfied = assemble_gate(
+        invariants, invariant_errors, upstream_available, args.native_only
+    )
 
     # ---- 4. Advisory similarity (never gates) --------------------------
     similarity = []
@@ -768,28 +1059,62 @@ def main(argv=None) -> int:
         pixel_window=[pixel_start, pixel_end],
         conditioned_latent_ranges=[list(r) for r in conditioned_latent_ranges],
         env=_env_metadata(),
+        scheduler=scheduler,
+        source_fps=source_fps,
+        code_commit=code_commit,
     )
-    protocol["upstream_available"] = upstream_thwc is not None
+    protocol["upstream_available"] = upstream_available
     protocol["upstream_skipped_reason"] = upstream_reason
 
     metrics = {
         "invariants": invariants,
+        "invariant_errors": invariant_errors,
         "all_checks_passed": all_checks_passed,
+        "task6_satisfied": task6_satisfied,
+        "native_only": args.native_only,
         "similarity_informational": similarity,
         "upstream_reason": upstream_reason,
         "native_mp4_written": native_mp4,
     }
+    if args.native_only:
+        mode_note = (
+            "diagnostic native-only run: this is NOT the native-vs-upstream oracle. "
+            "task6_satisfied is False and the gate reflects the native hard invariants only."
+        )
+    elif not upstream_available:
+        mode_note = (
+            f"native-vs-upstream oracle: upstream run was required but unavailable "
+            f"({upstream_reason}); gate failed."
+        )
+    else:
+        mode_note = "native-vs-upstream oracle: upstream produced output."
+    metrics["mode_note"] = mode_note
 
     with open(output_dir / "protocol.json", "w") as f:
         json.dump(protocol, f, indent=2, sort_keys=True, default=str)
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2, sort_keys=True, default=str)
 
+    # ---- 6. Self-describing local artifact manifest --------------------
+    # Validate that the just-written JSON artifacts parse before advertising
+    # them in the manifest, so the copied package is self-consistent.
+    protocol_valid = _json_parses(str(output_dir / "protocol.json"))
+    metrics_valid = _json_parses(str(output_dir / "metrics.json"))
+    manifest = build_manifest(str(output_dir), str(output_dir.resolve()), code_commit)
+    manifest["protocol_json_valid"] = protocol_valid
+    manifest["metrics_json_valid"] = metrics_valid
+    with open(output_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True, default=str)
+
+    print(f"[oracle] {mode_note}")
     summary = {
         "all_checks_passed": all_checks_passed,
+        "task6_satisfied": task6_satisfied,
+        "native_only": args.native_only,
         "invariants": invariants,
+        "invariant_errors": invariant_errors,
         "output_dir": str(output_dir.resolve()),
-        "upstream_available": upstream_thwc is not None,
+        "upstream_available": upstream_available,
     }
     print(f"ORACLE_DONE {json.dumps(summary, default=str)}")
     print(

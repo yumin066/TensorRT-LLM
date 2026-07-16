@@ -175,3 +175,129 @@ def test_build_protocol_is_pure_copy_of_sigmas():
     proto["sigmas"].append(999.0)
     # Mutating the returned list must not corrupt the caller's input.
     assert kwargs["sigmas"] == [1.0, 0.5, 0.0]
+
+
+def test_build_protocol_records_new_fields():
+    proto = oracle.build_protocol(
+        **_protocol_kwargs(),
+        scheduler="NativeSchedulerAdapter/distilled-euler-8",
+        source_fps=29.97,
+        code_commit="cafef00d",
+    )
+    assert proto["scheduler"] == "NativeSchedulerAdapter/distilled-euler-8"
+    assert proto["source_fps"] == 29.97
+    assert proto["code_commit"] == "cafef00d"
+
+
+# --------------------------------------------------------------------------- #
+# assemble_gate
+# --------------------------------------------------------------------------- #
+
+
+def _passing_invariants():
+    # A no-audio source: audio_preserved is legitimately None (N/A) and excluded.
+    return {
+        "output_len_matches_source": True,
+        "output_shape_matches": True,
+        "output_fps_matches": True,
+        "composite_outside_byte_identical": True,
+        "audio_preserved": None,
+        "seed_deterministic": True,
+        "audio_regen_failfast": True,
+    }
+
+
+def test_gate_upstream_unavailable_not_native_only_fails():
+    all_passed, task6 = oracle.assemble_gate(
+        _passing_invariants(), {}, upstream_available=False, native_only=False
+    )
+    assert all_passed is False
+    assert task6 is False
+
+
+def test_gate_upstream_unavailable_native_only_reflects_native():
+    # Diagnostic mode: task6 always False; gate reflects native invariants only.
+    all_passed, task6 = oracle.assemble_gate(
+        _passing_invariants(), {}, upstream_available=False, native_only=True
+    )
+    assert all_passed is True
+    assert task6 is False
+
+
+def test_gate_upstream_available_and_native_pass_satisfies_task6():
+    all_passed, task6 = oracle.assemble_gate(
+        _passing_invariants(), {}, upstream_available=True, native_only=False
+    )
+    assert all_passed is True
+    assert task6 is True
+
+
+def test_gate_invariant_error_fails_even_with_upstream():
+    all_passed, task6 = oracle.assemble_gate(
+        _passing_invariants(),
+        {"seed_deterministic": "RuntimeError: boom"},
+        upstream_available=True,
+        native_only=False,
+    )
+    assert all_passed is False
+    assert task6 is False
+
+
+def test_gate_false_invariant_fails():
+    invs = _passing_invariants()
+    invs["output_fps_matches"] = False
+    all_passed, task6 = oracle.assemble_gate(invs, {}, upstream_available=True, native_only=False)
+    assert all_passed is False
+    assert task6 is False
+
+
+def test_gate_shape_mismatch_fails():
+    invs = _passing_invariants()
+    invs["output_shape_matches"] = False
+    all_passed, _ = oracle.assemble_gate(invs, {}, upstream_available=True, native_only=False)
+    assert all_passed is False
+
+
+def test_gate_none_audio_excluded_when_others_pass():
+    # audio_preserved=None with a no-audio source does not fail the gate.
+    invs = _passing_invariants()
+    assert invs["audio_preserved"] is None
+    all_passed, task6 = oracle.assemble_gate(invs, {}, upstream_available=True, native_only=False)
+    assert all_passed is True
+    assert task6 is True
+
+
+# --------------------------------------------------------------------------- #
+# manifest assembly
+# --------------------------------------------------------------------------- #
+
+
+def test_build_manifest_entries_size_and_sha256(tmp_path):
+    present = tmp_path / "protocol.json"
+    payload = b'{"ok": true}'
+    present.write_bytes(payload)
+    missing = tmp_path / "upstream.mp4"
+
+    entries = oracle.build_manifest_entries({"protocol.json": present, "upstream.mp4": missing})
+
+    p = entries["protocol.json"]
+    assert p["exists"] is True
+    assert p["size_bytes"] == len(payload)
+    assert p["sha256"] == hashlib.sha256(payload).hexdigest()
+
+    m = entries["upstream.mp4"]
+    assert m["exists"] is False
+    assert m["size_bytes"] is None
+    assert m["sha256"] is None
+
+
+def test_build_manifest_top_level_fields(tmp_path):
+    (tmp_path / "metrics.json").write_bytes(b"{}")
+    manifest = oracle.build_manifest(
+        str(tmp_path), remote_output_dir="/remote/out", code_commit="abc123"
+    )
+    assert manifest["remote_output_dir"] == "/remote/out"
+    assert manifest["code_commit"] == "abc123"
+    # Every known artifact name is represented, present or not.
+    assert set(manifest["artifacts"]) == set(oracle.MANIFEST_ARTIFACTS)
+    assert manifest["artifacts"]["metrics.json"]["exists"] is True
