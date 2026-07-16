@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional LTX-2 retake workflow for VisualGen.
 
-This pipeline keeps a resident retake model for ``trtllm-serve``. It is being
-migrated onto the native TensorRT-LLM LTX-2 transformer (``LTXModel``): the
-native transformer is now built and weight-loaded here (via
-``build_ltx2_transformer`` and the native transformer loader) so retake can
-inherit the config-driven acceleration stack. The upstream Lightricks
-``ltx_pipelines.retake.RetakePipeline`` is still used for retake pre/post
-(source decode, temporal-region mask, composite) until that logic is ported
-natively.
+This pipeline keeps a resident retake model for ``trtllm-serve``. Denoising now
+runs on the native TensorRT-LLM LTX-2 transformer (``LTXModel``): the native
+transformer is built and weight-loaded here (via ``build_ltx2_transformer`` and
+the native transformer loader) so retake inherits the config-driven acceleration
+stack, and ``infer()`` drives it through the upstream denoise loop by injecting
+``LTX2RetakeNativeAdapter`` into ``DiffusionStage.run`` (the pre-built-transformer
+seam) instead of letting the upstream stage build/free its own transformer. The
+upstream Lightricks ``ltx_pipelines.retake.RetakePipeline`` is still used for
+retake pre/post (source decode, temporal-region mask, prompt encode, VAE decode)
+until that logic is ported natively.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
@@ -26,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSche
 from tensorrt_llm.logger import logger
 
 from .pipeline_ltx2 import LTX2Pipeline, _load_ltx2_transformer_weights, build_ltx2_transformer
+from .retake_adapter import LTX2RetakeNativeAdapter
 
 
 class LTX2RetakePipeline(BasePipeline):
@@ -342,22 +346,8 @@ class LTX2RetakePipeline(BasePipeline):
 
         prompt = self._single_prompt(req.prompt)
         retake_start = time.perf_counter()
-        metadata = self._get_videostream_metadata(video_path)
-        video_iter, audio = self._retake_pipeline(
-            video_path=video_path,
-            prompt=prompt,
-            start_time=start_time,
-            end_time=end_time,
-            seed=req.params.seed,
-            negative_prompt=req.params.negative_prompt or "",
-            num_inference_steps=req.params.num_inference_steps,
-            video_guider_params=getattr(self._retake_params, "video_guider_params", None),
-            audio_guider_params=getattr(self._retake_params, "audio_guider_params", None),
-            regenerate_video=extra["retake_regenerate_video"],
-            regenerate_audio=extra["retake_regenerate_audio"],
-            enhance_prompt=extra["retake_enhance_prompt"],
-            tiling_config=self._tiling_config,
-            max_batch_size=extra["retake_max_batch_size"],
+        video_iter, audio, output_shape = self._run_stage1_native(
+            req, extra, video_path, start_time, end_time, prompt
         )
         video = self._materialize_video(video_iter)
         audio_tensor, sample_rate = self._normalize_audio(audio)
@@ -365,10 +355,160 @@ class LTX2RetakePipeline(BasePipeline):
         return PipelineOutput(
             video=video,
             audio=audio_tensor,
-            frame_rate=float(metadata.fps),
+            frame_rate=float(output_shape.fps),
             audio_sample_rate=sample_rate,
             denoise=elapsed,
         )
+
+    @staticmethod
+    def _import_upstream_retake_symbols() -> SimpleNamespace:
+        # Import the upstream retake pre/post building blocks lazily (same
+        # optional Lightricks dependency as ``load_standard_components``), so the
+        # module imports cleanly in environments without ``ltx-pipelines`` and so
+        # host tests can monkeypatch this one seam to inject fakes.
+        try:
+            from ltx_core.components.noisers import GaussianNoiser
+            from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
+            from ltx_pipelines.utils.constants import DISTILLED_SIGMAS
+            from ltx_pipelines.utils.denoisers import SimpleDenoiser
+            from ltx_pipelines.utils.helpers import audio_latent_from_file, video_latent_from_file
+            from ltx_pipelines.utils.types import ModalitySpec
+        except (ImportError, OSError) as exc:
+            raise ImportError(
+                "LTX-2 retake native path requires the optional Lightricks "
+                "`ltx-pipelines`/`ltx-core` packages for source I/O, the "
+                "temporal-region mask, and the distilled denoise schedule. "
+                "Install them in the VisualGen runtime before serving retake."
+            ) from exc
+        return SimpleNamespace(
+            GaussianNoiser=GaussianNoiser,
+            TemporalRegionMask=TemporalRegionMask,
+            DISTILLED_SIGMAS=DISTILLED_SIGMAS,
+            SimpleDenoiser=SimpleDenoiser,
+            audio_latent_from_file=audio_latent_from_file,
+            video_latent_from_file=video_latent_from_file,
+            ModalitySpec=ModalitySpec,
+        )
+
+    def _run_stage1_native(self, req, extra, video_path, start_time, end_time, prompt):
+        """Stage 1 hybrid retake: native denoise driven by the upstream loop.
+
+        Reuses the resident upstream pre/post components (image/audio
+        conditioners, prompt encoder, diffusion stage, VAE decoders) but injects
+        the native ``LTXModel`` into ``DiffusionStage.run`` via
+        ``LTX2RetakeNativeAdapter`` instead of calling the eager
+        ``RetakePipeline.__call__`` (which would build and free an upstream
+        transformer). Mirrors ``RetakePipeline.__call__`` so the schedule,
+        temporal-region mask, and modality specs stay byte-for-byte identical;
+        only the denoiser transformer differs.
+
+        Returns ``(decoded_video, decoded_audio, output_shape)``.
+        """
+        if self.transformer is None:
+            raise RuntimeError(
+                "LTX-2 retake Stage 1 native path requires the native transformer, "
+                "but self.transformer is None."
+            )
+
+        retake = self._retake_pipeline
+        if not getattr(retake, "distilled", False):
+            raise NotImplementedError(
+                "LTX-2 retake native path currently supports only the distilled "
+                "(non-guided) schedule; the native adapter rejects STG "
+                "perturbations required by the guided path."
+            )
+
+        regenerate_video = bool(extra["retake_regenerate_video"])
+        regenerate_audio = bool(extra["retake_regenerate_audio"])
+        if not regenerate_video:
+            raise NotImplementedError(
+                "LTX-2 retake native path regenerates the video window; set "
+                "retake_regenerate_video=True."
+            )
+        if regenerate_audio:
+            raise NotImplementedError(
+                "LTX-2 retake native path is video-only and preserves the source "
+                "audio; retake_regenerate_audio=True is not supported (AC-3.2)."
+            )
+
+        up = self._import_upstream_retake_symbols()
+        dtype = self.dtype
+        device = self._device
+        seed = req.params.seed
+        generator = torch.Generator(device=device).manual_seed(seed)
+        noiser = up.GaussianNoiser(generator=generator)
+
+        output_shape = self._get_videostream_metadata(video_path)
+        initial_video_latent = retake.image_conditioner(
+            lambda enc: up.video_latent_from_file(
+                video_encoder=enc,
+                file_path=video_path,
+                output_shape=output_shape,
+                dtype=dtype,
+                device=device,
+            )
+        )
+        initial_audio_latent = retake.audio_conditioner(
+            lambda enc: up.audio_latent_from_file(
+                audio_encoder=enc,
+                file_path=video_path,
+                output_shape=output_shape,
+                dtype=dtype,
+                device=device,
+            )
+        )
+
+        contexts = retake.prompt_encoder(
+            [prompt],
+            enhance_first_prompt=bool(extra["retake_enhance_prompt"]),
+            enhance_prompt_seed=seed,
+        )
+        v_context_p = contexts[0].video_encoding
+        a_context_p = contexts[0].audio_encoding
+
+        # Regenerate the video window; keep the source audio frozen. Mirrors the
+        # ``regenerate_video=True, regenerate_audio=False`` branch of upstream
+        # ``RetakePipeline.__call__``.
+        video_modality_spec = up.ModalitySpec(
+            context=v_context_p,
+            conditionings=[
+                up.TemporalRegionMask(
+                    start_time=start_time, end_time=end_time, fps=output_shape.fps
+                )
+            ],
+            initial_latent=initial_video_latent,
+            frozen=False,
+        )
+        audio_modality_spec = up.ModalitySpec(
+            context=a_context_p,
+            conditionings=[],
+            initial_latent=initial_audio_latent,
+            frozen=initial_audio_latent is not None,
+        )
+
+        sigmas = up.DISTILLED_SIGMAS.to(dtype=torch.float32, device=device)
+        denoiser = up.SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        adapter = LTX2RetakeNativeAdapter(self.transformer, model_dtype=dtype)
+
+        video_state, audio_state = retake.stage.run(
+            adapter,
+            denoiser,
+            sigmas,
+            noiser,
+            output_shape.width,
+            output_shape.height,
+            output_shape.frames,
+            output_shape.fps,
+            video=video_modality_spec,
+            audio=audio_modality_spec,
+            max_batch_size=int(extra["retake_max_batch_size"]),
+        )
+
+        decoded_video = retake.video_decoder(video_state.latent, self._tiling_config, generator)
+        decoded_audio = (
+            retake.audio_decoder(audio_state.latent) if audio_state is not None else None
+        )
+        return decoded_video, decoded_audio, output_shape
 
     @staticmethod
     def _single_prompt(prompt: str | list[str]) -> str:

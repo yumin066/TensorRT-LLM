@@ -11,6 +11,7 @@ import torch
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import LTX2RetakePipeline
+from tensorrt_llm._torch.visual_gen.models.ltx2.retake_adapter import LTX2RetakeNativeAdapter
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 
 
@@ -195,6 +196,174 @@ def test_ltx2_registry_accepts_retake_offload_mode_config():
 
     assert defaults["retake_offload_mode"] == "none"
     assert defaults["retake_prompt_cache_size"] == 16
+
+
+class _RecordingStage:
+    """Records ``run()`` calls; stands in for upstream ``DiffusionStage``."""
+
+    def __init__(self):
+        self.run_calls = []
+
+    def run(  # noqa: PLR0913
+        self,
+        transformer,
+        denoiser,
+        sigmas,
+        noiser,
+        width,
+        height,
+        frames,
+        fps,
+        *,
+        video,
+        audio,
+        max_batch_size,
+    ):
+        self.run_calls.append(
+            SimpleNamespace(transformer=transformer, video=video, audio=audio, fps=fps)
+        )
+        return (
+            SimpleNamespace(latent=torch.zeros(1, 2, 8)),
+            SimpleNamespace(latent=torch.zeros(1, 2, 4)),
+        )
+
+
+class _FakeResidentRetakePipeline:
+    """Resident upstream retake pipeline stub exposing only the pre/post seams
+    the native Stage 1 path reuses; ``__call__`` (the eager path) must not run."""
+
+    def __init__(self, distilled=True, has_audio=True):
+        self.distilled = distilled
+        self.stage = _RecordingStage()
+        self.called_directly = False
+        self._has_audio = has_audio
+        self.image_conditioner = lambda fn: fn(object())
+        self.audio_conditioner = lambda fn: fn(object())
+        self.prompt_encoder = (
+            lambda prompts, *, enhance_first_prompt=False, enhance_prompt_seed=42: [
+                SimpleNamespace(
+                    video_encoding=torch.zeros(1, 1, 4), audio_encoding=torch.zeros(1, 1, 4)
+                )
+            ]
+        )
+        self.video_decoder = lambda latent, tiling, generator: iter(
+            [torch.zeros(2, 3, 3, 3, dtype=torch.uint8)]
+        )
+        self.audio_decoder = lambda latent: SimpleNamespace(
+            waveform=torch.ones(2, 4), sampling_rate=48000
+        )
+
+    def __call__(self, *args, **kwargs):
+        self.called_directly = True
+        raise AssertionError("eager RetakePipeline.__call__ must not be used by the native path")
+
+
+def _fake_upstream_symbols():
+    return SimpleNamespace(
+        GaussianNoiser=lambda *, generator: SimpleNamespace(generator=generator),
+        TemporalRegionMask=lambda *, start_time, end_time, fps: SimpleNamespace(
+            start_time=start_time, end_time=end_time, fps=fps
+        ),
+        DISTILLED_SIGMAS=torch.linspace(1.0, 0.0, 9),
+        SimpleDenoiser=lambda *, v_context, a_context: SimpleNamespace(v=v_context, a=a_context),
+        video_latent_from_file=lambda *,
+        video_encoder,
+        file_path,
+        output_shape,
+        dtype,
+        device: torch.zeros(1, 2, 8),
+        audio_latent_from_file=lambda *, audio_encoder, file_path, output_shape, dtype, device: (
+            torch.zeros(1, 2, 4)
+        ),
+        ModalitySpec=lambda *, context, conditionings, initial_latent, frozen: SimpleNamespace(
+            context=context,
+            conditionings=conditionings,
+            initial_latent=initial_latent,
+            frozen=frozen,
+        ),
+    )
+
+
+def _native_retake_req(*, regenerate_video=True, regenerate_audio=False):
+    return SimpleNamespace(
+        prompt="regenerated window content",
+        params=SimpleNamespace(
+            extra_params={
+                "retake_video_path": "/tmp/src.mp4",
+                "retake_start_time": 1.0,
+                "retake_end_time": 2.0,
+                "retake_regenerate_video": regenerate_video,
+                "retake_regenerate_audio": regenerate_audio,
+                "retake_enhance_prompt": False,
+                "retake_max_batch_size": 1,
+            },
+            seed=42,
+            negative_prompt="",
+            num_inference_steps=8,
+        ),
+    )
+
+
+def _prepare_native_pipeline(monkeypatch, *, distilled=True, has_audio=True):
+    pipeline = LTX2RetakePipeline(_minimal_retake_config())
+    fake = _FakeResidentRetakePipeline(distilled=distilled, has_audio=has_audio)
+    pipeline._retake_pipeline = fake
+    pipeline._tiling_config = object()
+    pipeline._get_videostream_metadata = lambda path: SimpleNamespace(
+        fps=24.0, width=64, height=64, frames=9
+    )
+    monkeypatch.setattr(pipeline, "_import_upstream_retake_symbols", _fake_upstream_symbols)
+    return pipeline, fake
+
+
+def test_ltx2_retake_infer_injects_native_adapter_into_stage_run(monkeypatch):
+    pipeline, fake = _prepare_native_pipeline(monkeypatch)
+
+    out = pipeline.infer(_native_retake_req())
+
+    # Denoising goes through DiffusionStage.run with the native adapter, and the
+    # eager RetakePipeline.__call__ (which builds its own transformer) is unused.
+    assert len(fake.stage.run_calls) == 1
+    call = fake.stage.run_calls[0]
+    assert isinstance(call.transformer, LTX2RetakeNativeAdapter)
+    assert fake.called_directly is False
+    # Video window regenerated (one region mask, not frozen); source audio frozen.
+    assert call.video.frozen is False
+    assert len(call.video.conditionings) == 1
+    assert call.audio.frozen is True
+    assert call.audio.conditionings == []
+    # Output shape flows from the source metadata through the resident decoders.
+    assert out.video.dtype == torch.uint8
+    assert out.frame_rate == 24.0
+    assert out.audio_sample_rate == 48000
+
+
+def test_ltx2_retake_infer_rejects_audio_regeneration(monkeypatch):
+    pipeline, fake = _prepare_native_pipeline(monkeypatch)
+
+    with pytest.raises(NotImplementedError, match="regenerate_audio"):
+        pipeline.infer(_native_retake_req(regenerate_audio=True))
+
+    assert fake.stage.run_calls == []
+    assert fake.called_directly is False
+
+
+def test_ltx2_retake_infer_rejects_video_preservation(monkeypatch):
+    pipeline, fake = _prepare_native_pipeline(monkeypatch)
+
+    with pytest.raises(NotImplementedError, match="regenerate_video"):
+        pipeline.infer(_native_retake_req(regenerate_video=False))
+
+    assert fake.stage.run_calls == []
+
+
+def test_ltx2_retake_infer_requires_distilled_schedule(monkeypatch):
+    pipeline, fake = _prepare_native_pipeline(monkeypatch, distilled=False)
+
+    with pytest.raises(NotImplementedError, match="distilled"):
+        pipeline.infer(_native_retake_req())
+
+    assert fake.stage.run_calls == []
 
 
 def test_ltx2_retake_prompt_encoder_cache_reuses_matching_prompts():
