@@ -26,7 +26,11 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
-from .ltx2_core.connector import Embeddings1DConnectorConfigurator, GemmaFeaturesExtractorProjLinear
+from .ltx2_core.connector import (
+    AudioEmbeddings1DConnectorConfigurator,
+    Embeddings1DConnectorConfigurator,
+    GemmaFeaturesExtractorProjLinear,
+)
 from .ltx2_core.guiders import MultiModalGuider, MultiModalGuiderParams
 from .ltx2_core.modality import Modality
 from .ltx2_core.patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
@@ -1002,7 +1006,7 @@ class LTX2Pipeline(BasePipeline):
             )
             self.video_connector = self.video_connector.to(device=device, dtype=dtype)
 
-            self.audio_connector = Embeddings1DConnectorConfigurator.from_config(config)
+            self.audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.audio_connector,

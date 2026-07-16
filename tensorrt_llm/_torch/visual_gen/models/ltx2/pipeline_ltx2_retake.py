@@ -515,7 +515,17 @@ class LTX2RetakePipeline(BasePipeline):
             f"(checkpoint={checkpoint_dir}, text_encoder={text_encoder_path})"
         )
         native = _NativeLTX2Companion(self.pipeline_config, self.transformer)
-        native.load_standard_components(checkpoint_dir, device, text_encoder_path=text_encoder_path)
+        # The native retake path is video-only: it uses the video VAE encoder/
+        # decoder, the text encoder + video/audio embedding connectors, and the
+        # scheduler, but never the audio VAE decoder or the vocoder. Skip loading
+        # those so retake neither wastes memory on them nor depends on their
+        # checkpoint-specific config parity.
+        native.load_standard_components(
+            checkpoint_dir,
+            device,
+            text_encoder_path=text_encoder_path,
+            skip_components=["audio_vae", "vocoder"],
+        )
         # Derived attribute used to build the video latent shape; normally set by
         # LTX2Pipeline.post_load_weights, which we skip to avoid re-running the
         # shared transformer's post-load hook.

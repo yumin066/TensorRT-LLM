@@ -172,7 +172,46 @@ class Embeddings1DConnectorConfigurator:
         rope_type = LTXRopeType(config.get("rope_type", "interleaved"))
         double_precision_rope = config.get("frequencies_precision", False) == "float64"
         pe_max_pos = config.get("connector_positional_embedding_max_pos", [1])
+        # Thread the connector's own attention dimensions from the checkpoint
+        # config. Checkpoints that enable the embeddings connector size it
+        # independently of the text-projection width (e.g. the LTX-2.3 22b uses
+        # 32 heads x 128 = 4096); without these the connector falls back to the
+        # 30-head (3840) default and fails to load the connector weights.
         return Embeddings1DConnector(
+            num_attention_heads=config.get("connector_num_attention_heads", 30),
+            attention_head_dim=config.get("connector_attention_head_dim", 128),
+            num_layers=config.get("connector_num_layers", 2),
+            positional_embedding_max_pos=pe_max_pos,
+            rope_type=rope_type,
+            double_precision_rope=double_precision_rope,
+            apply_gated_attention=config.get("connector_apply_gated_attention", False),
+        )
+
+
+class AudioEmbeddings1DConnectorConfigurator:
+    @classmethod
+    def from_config(cls, config: dict) -> Embeddings1DConnector:
+        config = config.get("transformer", {})
+        rope_type = LTXRopeType(config.get("rope_type", "interleaved"))
+        double_precision_rope = config.get("frequencies_precision", False) == "float64"
+        pe_max_pos = config.get("connector_positional_embedding_max_pos", [1])
+        # The audio embeddings connector is sized independently of the video one
+        # (the LTX-2.3 22b uses 32 heads x 64 = 2048 vs the video connector's
+        # 32 x 128 = 4096); read the ``audio_connector_*`` dimensions and fall
+        # back to the video connector fields for checkpoints that share them.
+        return Embeddings1DConnector(
+            num_attention_heads=config.get(
+                "audio_connector_num_attention_heads",
+                config.get("connector_num_attention_heads", 30),
+            ),
+            attention_head_dim=config.get(
+                "audio_connector_attention_head_dim",
+                config.get("connector_attention_head_dim", 128),
+            ),
+            num_layers=config.get(
+                "audio_connector_num_layers",
+                config.get("connector_num_layers", 2),
+            ),
             positional_embedding_max_pos=pe_max_pos,
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,

@@ -22,8 +22,9 @@ class VideoDecoderConfigurator:
             causal=config.get("causal_decoder", False),
             timestep_conditioning=config.get("timestep_conditioning", True),
             decoder_spatial_padding_mode=PaddingModeType(
-                config.get("decoder_spatial_padding_mode", "reflect")
+                config.get("spatial_padding_mode", "reflect")
             ),
+            base_channels=config.get("decoder_base_channels", 128),
         )
 
 
@@ -43,6 +44,6 @@ class VideoEncoderConfigurator:
             causal=config.get("causal_encoder", True),
             timestep_conditioning=False,
             encoder_spatial_padding_mode=PaddingModeType(
-                config.get("encoder_spatial_padding_mode", "zeros")
+                config.get("spatial_padding_mode", "zeros")
             ),
         )
