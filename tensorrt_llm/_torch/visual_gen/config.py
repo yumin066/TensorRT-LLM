@@ -496,6 +496,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             "retake_distilled",
             "retake_offload_mode",
             "retake_prompt_cache_size",
+            "retake_use_upstream_stage",
+            "retake_lora_path",
+            "retake_lora_strength",
         ):
             value = resolved_pipeline_config.get(key)
             if value is not None:

@@ -1131,3 +1131,29 @@ def test_ltx2_retake_distilled_sigmas_are_eight_steps():
     assert sigmas.shape == (9,)  # 8 Euler steps + terminal
     assert sigmas[0].item() == 1.0
     assert sigmas[-1].item() == 0.0
+
+
+def test_ltx2_registry_accepts_retake_lora_keys():
+    # The serve pipeline_config validator gates on the LTX2Pipeline registry
+    # defaults; retake fuses retake_lora_path/retake_lora_strength from
+    # extra_attrs, so both must be valid pipeline_config keys (else the serve
+    # path silently runs the base retake without the reference LoRA).
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
+
+    entry = PIPELINE_REGISTRY.get("LTX2Pipeline")
+    assert entry is not None
+    assert "retake_lora_path" in entry.defaults
+    assert "retake_lora_strength" in entry.defaults
+
+
+def test_ltx2_config_propagates_retake_lora_to_extra_attrs():
+    # config.py from_pretrained must copy retake_lora_path/retake_lora_strength
+    # from the resolved pipeline_config into extra_attrs (where the retake load
+    # path reads them). Test the propagation key list directly.
+    import inspect
+
+    from tensorrt_llm._torch.visual_gen import config as vg_config
+
+    src = inspect.getsource(vg_config.DiffusionPipelineConfig.from_pretrained)
+    assert "retake_lora_path" in src
+    assert "retake_lora_strength" in src

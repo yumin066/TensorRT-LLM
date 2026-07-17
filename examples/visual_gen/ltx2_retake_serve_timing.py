@@ -12,9 +12,10 @@ seconds); this tool records that plus per-request wall latency and HTTP status,
 reports the **first-served request separately from steady-warm p50/p90/min** (raw
 samples included), and always tears the server down.
 
-This is the AC-2 production serve surface (HTTP, resident worker) as opposed to
-the pipeline-direct probe in ``ltx2_retake_timing.py``. It records the server
-command + captured log path + env + provenance + the Mode A every-rebuild
+This is the production serve surface (HTTP, resident worker) as opposed to the
+pipeline-direct probe in ``ltx2_retake_timing.py``, and it serves the SAME retake
+LoRA (``retake_lora_path``) as the oracle / Mode A reference. It records the
+server command + captured log path + env + provenance + the Mode A every-rebuild
 comparison, as strict JSON.
 
 The percentile / JSON helpers are reused from ``ltx2_retake_timing`` (loaded by
@@ -108,21 +109,55 @@ def parse_server_timing(header_value: Optional[str]) -> dict:
 
 
 def classify_response(status: int, server_timing: dict) -> tuple:
-    """Return ``(ok, reason)``: 200 with a positive ``generation`` metric is ok."""
+    """Return ``(ok, reason)``: 200 with positive ``generation`` AND ``denoise``.
+
+    Both engine metrics must be present and positive — a successful HTTP status
+    with a missing/zero timing metric is a bad benchmark sample, not a zero-cost
+    one.
+    """
     if status != 200:
         return False, f"http_status_{status}"
     gen = server_timing.get("generation")
+    den = server_timing.get("denoise")
     if gen is None or gen <= 0:
         return False, "missing_or_nonpositive_generation_timing"
+    if den is None or den <= 0:
+        return False, "missing_or_nonpositive_denoise_timing"
     return True, None
 
 
 def split_first_steady(records: list) -> tuple:
-    """Split successful measured records into ``(first, steady_list)``."""
-    oks = [r for r in records if r.get("ok")]
-    if not oks:
+    """Split measured records into ``(first_served, steady_list)``, strictly.
+
+    The FIRST measured request is first-served; if it failed there is no valid
+    benchmark, so ``first`` is ``None`` (never promote a later success). Steady =
+    the remaining records; the caller gates on all of them being ok.
+    """
+    if not records:
         return None, []
-    return oks[0], oks[1:]
+    first = records[0]
+    if not first.get("ok"):
+        return None, records[1:]
+    return first, records[1:]
+
+
+def serve_run_ok(records: list, measured: int) -> tuple:
+    """Return ``(ok, reason)`` for the whole measured run (strict).
+
+    Every measured request must have run and be ``ok`` (200 + positive
+    generation AND denoise), the count must match, and there must be at least
+    one steady-warm sample (measured >= 2). A failed first-served or any failed/
+    incomplete measured request fails the whole run.
+    """
+    if len(records) != measured:
+        return False, f"expected {measured} measured records, got {len(records)}"
+    if measured < 2:
+        return False, "need >= 2 measured requests for a steady-warm sample"
+    bad = [r for r in records if not r.get("ok")]
+    if bad:
+        idxs = ", ".join(f"{r.get('index')}:{r.get('reason')}" for r in bad)
+        return False, f"failed/incomplete measured requests: {idxs}"
+    return True, None
 
 
 def summarize_serve(records: list, summarize_fn, keys=_STEADY_KEYS) -> dict:
@@ -157,13 +192,16 @@ def _free_port() -> int:
     return port
 
 
-def _write_retake_serve_yaml(path: Path, gemma: str, lora: Optional[str]) -> None:
+def _write_retake_serve_yaml(
+    path: Path, gemma: str, lora: Optional[str], lora_strength: float
+) -> None:
     """Write a retake serve config with resident-warm (offload none) defaults.
 
-    The serve pipeline_config validator for LTX2Pipeline uses ``distilled_lora_path``
-    for the (distilled) retake LoRA — NOT ``retake_lora_path`` (that key is only
-    accepted on the oracle's direct-``build_pipeline`` path, which bypasses this
-    validator).
+    Uses ``retake_lora_path`` / ``retake_lora_strength`` — the keys the native
+    retake load path actually fuses (``LTX2RetakePipeline.load_weights`` reads
+    ``extra_attrs['retake_lora_path']``) — so the served workload matches the
+    oracle / Mode A reference (the same TalkVid identity LoRA), NOT the base
+    retake. ``distilled_lora_path`` is a distinct generation/two-stage knob.
     """
     lines = [
         "pipeline_config:",
@@ -173,7 +211,7 @@ def _write_retake_serve_yaml(path: Path, gemma: str, lora: Optional[str]) -> Non
         f"  text_encoder_path: {gemma}",
     ]
     if lora:
-        lines += [f"  distilled_lora_path: {lora}"]
+        lines += [f"  retake_lora_path: {lora}", f"  retake_lora_strength: {lora_strength}"]
     lines += ["attention_config:", "  backend: VANILLA", ""]
     path.write_text("\n".join(lines))
 
@@ -251,6 +289,7 @@ def parse_args(argv=None):
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--gemma", required=True)
     p.add_argument("--lora", default=None)
+    p.add_argument("--lora-strength", type=float, default=1.0)
     p.add_argument("--source", required=True, help="video-only source clip")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--start", type=float, required=True)
@@ -286,7 +325,7 @@ def main(argv=None) -> int:
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
     yaml_path = output_dir / "retake_serve.yml"
-    _write_retake_serve_yaml(yaml_path, args.gemma, args.lora)
+    _write_retake_serve_yaml(yaml_path, args.gemma, args.lora, args.lora_strength)
     server_log = output_dir / "server.log"
     import shlex
 
@@ -338,6 +377,7 @@ def main(argv=None) -> int:
 
     first, steady = split_first_steady(records)
     steady_summary = summarize_serve(steady, timing.summarize_samples)
+    run_ok, run_reason = serve_run_ok(records, args.measured) if ready else (False, server_error)
     comparison = {
         "mode_b_serve_first_served_wall": first["wall"] if first else None,
         "mode_b_serve_steady_wall_p50": steady_summary.get("wall", {}).get("p50"),
@@ -350,6 +390,8 @@ def main(argv=None) -> int:
         "mode": "mode_b_trtllm_serve_http_resident_warm",
         "server_ready": ready,
         "server_error": server_error,
+        "run_ok": run_ok,
+        "run_reason": run_reason,
         "server_cmd": server_cmd,
         "server_log": str(server_log),
         "first_served": first,
@@ -365,6 +407,10 @@ def main(argv=None) -> int:
             "retake_offload_mode": "none",
             "format": payload["format"],
             "response_format": payload["response_format"],
+            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "gemma": str(Path(args.gemma).resolve()),
+            "lora": str(Path(args.lora).resolve()) if args.lora else None,
+            "lora_strength": args.lora_strength,
         },
         "env": oracle._env_metadata(),
         "code_commit": code_commit,
@@ -375,11 +421,14 @@ def main(argv=None) -> int:
         "seed": args.seed,
         "steps": args.steps,
         "note": (
-            "AC-2 production serve surface: one trtllm-serve resident worker "
-            "(retake_offload_mode: none) over HTTP. first_served is separated from "
-            "steady-warm p50/p90/min; generation/denoise come from the response "
-            "Server-Timing header. Compare with the pipeline-direct native harness "
-            "and the Mode A every-rebuild reference."
+            "Production serve surface: one trtllm-serve resident worker "
+            "(retake_offload_mode: none) over HTTP, serving the SAME retake LoRA "
+            "(retake_lora_path) as the oracle / Mode A reference. first_served is "
+            "separated from steady-warm p50/p90/min; generation/denoise come from "
+            "the response Server-Timing header. Every measured request must be a "
+            "200 with positive generation AND denoise or the run fails. Compare "
+            "with the pipeline-direct native harness and the Mode A every-rebuild "
+            "reference."
         ),
     }
     (output_dir / "serve_timing.json").write_text(
@@ -390,14 +439,16 @@ def main(argv=None) -> int:
         json.dumps(
             {
                 "ready": ready,
+                "run_ok": run_ok,
+                "run_reason": run_reason,
                 "steady_count": len(steady),
                 "steady_wall_p50": steady_summary.get("wall", {}).get("p50"),
             }
         ),
     )
-    # Success needs a healthy server and at least one steady-warm sample.
-    ok = ready and len(steady) >= 1
-    return 0 if ok else 1
+    # Strict: healthy server AND every measured request ok (200 + positive
+    # generation AND denoise) AND enough measured samples.
+    return 0 if run_ok else 1
 
 
 if __name__ == "__main__":

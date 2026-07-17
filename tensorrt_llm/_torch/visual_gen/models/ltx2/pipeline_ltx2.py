@@ -679,6 +679,12 @@ def build_ltx2_transformer(pipeline_config) -> LTXModel:
         "retake_offload_mode": "none",
         "retake_prompt_cache_size": 16,
         "retake_use_upstream_stage": False,
+        # retake fuses its own identity/style LoRA (e.g. TalkVid) into the base
+        # transformer weights via extra_attrs; distinct from the generation/
+        # two-stage ``distilled_lora_path`` so the serve path can carry the same
+        # LoRA the oracle / Mode A reference uses.
+        "retake_lora_path": None,
+        "retake_lora_strength": 1.0,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
