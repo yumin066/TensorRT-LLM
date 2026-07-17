@@ -301,3 +301,134 @@ def test_build_manifest_top_level_fields(tmp_path):
     # Every known artifact name is represented, present or not.
     assert set(manifest["artifacts"]) == set(oracle.MANIFEST_ARTIFACTS)
     assert manifest["artifacts"]["metrics.json"]["exists"] is True
+
+
+# --------------------------------------------------------------------------- #
+# native_invariants_ok / strict-None gate (Round 23)
+# --------------------------------------------------------------------------- #
+
+
+def test_native_invariants_ok_only_audio_may_be_none():
+    assert oracle.native_invariants_ok(
+        {"output_len_matches_source": True, "audio_preserved": None, "seed_deterministic": True}, {}
+    )
+
+
+def test_native_invariants_ok_non_audio_none_fails():
+    assert not oracle.native_invariants_ok({"seed_deterministic": None}, {})
+    assert not oracle.native_invariants_ok({"output_fps_matches": None}, {})
+
+
+def test_native_invariants_ok_invariant_errors_fail():
+    assert not oracle.native_invariants_ok({"x": True}, {"x": "Boom: kaput"})
+
+
+def test_gate_non_audio_none_fails_default_mode():
+    all_passed, task6 = oracle.assemble_gate(
+        {"seed_deterministic": None},
+        {},
+        upstream_available=True,
+        native_only=False,
+        provenance_ok=True,
+    )
+    assert all_passed is False and task6 is False
+
+
+def test_gate_default_mode_requires_provenance():
+    inv = {"output_len_matches_source": True, "audio_preserved": None}
+    ok_all, ok_t6 = oracle.assemble_gate(inv, {}, True, False, provenance_ok=True)
+    assert ok_all is True and ok_t6 is True
+    bad_all, bad_t6 = oracle.assemble_gate(inv, {}, True, False, provenance_ok=False)
+    assert bad_all is False and bad_t6 is False
+
+
+def test_gate_native_only_ignores_provenance():
+    inv = {"output_len_matches_source": True, "audio_preserved": None}
+    ok_all, ok_t6 = oracle.assemble_gate(inv, {}, False, native_only=True, provenance_ok=False)
+    assert ok_all is True and ok_t6 is False
+
+
+# --------------------------------------------------------------------------- #
+# validate_provenance (Round 23)
+# --------------------------------------------------------------------------- #
+
+
+def test_validate_provenance_full_is_ok():
+    proto = {
+        "code_commit": "abc",
+        "native_repo": {"commit": "x", "dirty": False},
+        "eval_repo": {"commit": "y", "dirty": True},
+    }
+    ok, reasons = oracle.validate_provenance(proto, native_only=False)
+    assert ok and reasons == []
+
+
+def test_validate_provenance_missing_code_commit_fails():
+    proto = {
+        "code_commit": None,
+        "native_repo": {"commit": "x", "dirty": False},
+        "eval_repo": {"commit": "y", "dirty": False},
+    }
+    ok, reasons = oracle.validate_provenance(proto, native_only=False)
+    assert not ok and any("code_commit" in r for r in reasons)
+
+
+def test_validate_provenance_null_repo_metadata_fails():
+    proto = {"code_commit": "abc", "native_repo": {"commit": None, "dirty": None}, "eval_repo": {}}
+    ok, reasons = oracle.validate_provenance(proto, native_only=False)
+    assert not ok and len(reasons) >= 2
+
+
+def test_validate_provenance_native_only_not_required():
+    ok, reasons = oracle.validate_provenance({"code_commit": None}, native_only=True)
+    assert ok and reasons == []
+
+
+# --------------------------------------------------------------------------- #
+# verify_local (Round 23)
+# --------------------------------------------------------------------------- #
+
+
+def _make_local_package(tmp_path):
+    (tmp_path / "native.mp4").write_bytes(b"vid1")
+    (tmp_path / "upstream.mp4").write_bytes(b"vid2")
+    (tmp_path / "protocol.json").write_text('{"a": 1}')
+    (tmp_path / "metrics.json").write_text('{"b": 2}')
+    manifest = oracle.build_manifest(str(tmp_path), "remote:/x", "commitZ")
+    import json
+
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    return tmp_path
+
+
+def test_verify_local_ok_with_trimmed_tensors(tmp_path):
+    _make_local_package(tmp_path)
+    report = oracle.verify_local(str(tmp_path))
+    assert report["ok"] is True, report["problems"]
+    assert report["artifacts"]["native.mp4"]["present_local"] is True
+    # Heavy tensors are absent locally (optional) and must not fail the package.
+    assert report["artifacts"]["native.pt"]["present_local"] is False
+
+
+def test_verify_local_sha256_mismatch_fails(tmp_path):
+    _make_local_package(tmp_path)
+    (tmp_path / "native.mp4").write_bytes(b"TAMPERED")
+    report = oracle.verify_local(str(tmp_path))
+    assert report["ok"] is False
+    assert any("native.mp4 sha256" in p for p in report["problems"])
+
+
+def test_verify_local_missing_required_fails(tmp_path):
+    _make_local_package(tmp_path)
+    (tmp_path / "upstream.mp4").unlink()
+    report = oracle.verify_local(str(tmp_path))
+    assert report["ok"] is False
+    assert any("upstream.mp4 is missing" in p for p in report["problems"])
+
+
+def test_verify_local_invalid_json_fails(tmp_path):
+    _make_local_package(tmp_path)
+    (tmp_path / "protocol.json").write_text("{not valid json")
+    report = oracle.verify_local(str(tmp_path))
+    assert report["ok"] is False
+    assert any("protocol.json" in p for p in report["problems"])

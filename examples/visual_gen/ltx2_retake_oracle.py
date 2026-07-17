@@ -265,36 +265,80 @@ def build_protocol(
     }
 
 
+# Only these invariants may legitimately be ``None`` (Not-Applicable). Every
+# other hard invariant must be exactly ``True``; an unexpected ``None`` (e.g. a
+# helper that silently returned nothing) fails the native gate rather than being
+# ignored.
+_NONE_OK_INVARIANTS = frozenset({"audio_preserved"})
+
+
+def native_invariants_ok(invariants: dict, invariant_errors: dict) -> bool:
+    """Strict per-key native-invariant check (pure).
+
+    ``invariant_errors`` must be empty, and every invariant must be exactly
+    ``True`` — except the keys in ``_NONE_OK_INVARIANTS``, which may be ``None``
+    (N/A). A ``None`` for any other key, or any non-``True`` value, fails.
+    """
+    if invariant_errors:
+        return False
+    for key, value in invariants.items():
+        if value is None:
+            if key not in _NONE_OK_INVARIANTS:
+                return False
+        elif value is not True:
+            return False
+    return True
+
+
 def assemble_gate(
     invariants: dict,
     invariant_errors: dict,
     upstream_available: bool,
     native_only: bool,
+    provenance_ok: bool = True,
 ) -> tuple:
     """Compute ``(all_checks_passed, task6_satisfied)`` from the invariant state.
 
     Pure and side-effect free so it is unit testable without a GPU.
 
-    - The native hard invariants pass only when every applicable (non-``None``)
-      invariant is ``True`` AND ``invariant_errors`` is empty. Only
-      ``audio_preserved`` may legitimately be ``None`` (no source audio, N/A);
-      every other invariant is a strict bool, and an invariant that raised is
-      recorded ``False`` with an entry in ``invariant_errors``.
-    - Default (native-vs-upstream) mode: ``all_checks_passed`` requires the
-      upstream oracle to have produced output AND the native invariants to pass.
-      ``task6_satisfied`` is ``True`` only under those same two conditions.
+    - Native hard invariants pass only when :func:`native_invariants_ok` holds
+      (strict per-key: only ``audio_preserved`` may be ``None``).
+    - Default (native-vs-upstream) mode: ``all_checks_passed`` / ``task6_satisfied``
+      require the upstream oracle to have produced output, the native invariants
+      to pass, AND authoritative provenance (``provenance_ok``).
     - ``--native-only`` diagnostic mode: ``task6_satisfied`` is always ``False``
       (this is not the native-vs-upstream oracle) and ``all_checks_passed``
-      reflects the native hard invariants alone.
+      reflects the native hard invariants alone (provenance not required).
     """
-    native_ok = (
-        all(v is True for k, v in invariants.items() if v is not None) and not invariant_errors
-    )
+    native_ok = native_invariants_ok(invariants, invariant_errors)
     if native_only:
         return native_ok, False
     if not upstream_available:
         return False, False
-    return native_ok, native_ok
+    passed = native_ok and provenance_ok
+    return passed, passed
+
+
+def validate_provenance(protocol: dict, native_only: bool) -> tuple:
+    """Whether the protocol carries authoritative, reproducible provenance (pure).
+
+    In default (native-vs-upstream) mode a satisfied oracle result must be
+    reproducible, so it requires an authoritative ``code_commit`` and non-null
+    ``commit``/``dirty`` for both repos. In ``--native-only`` diagnostic mode
+    provenance is not required. Returns ``(ok, reasons)``.
+    """
+    if native_only:
+        return True, []
+    reasons = []
+    if not protocol.get("code_commit"):
+        reasons.append("missing code_commit (pass --code-commit or set LTX2_ORACLE_CODE_COMMIT)")
+    for repo in ("native_repo", "eval_repo"):
+        info = protocol.get(repo) or {}
+        if not info.get("commit"):
+            reasons.append(f"{repo}.commit is null")
+        if info.get("dirty") is None:
+            reasons.append(f"{repo}.dirty is null (git status unavailable)")
+    return (not reasons), reasons
 
 
 # ----------------------------------------------------------------------------
@@ -362,6 +406,67 @@ def _json_parses(path: str) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+# Artifacts that must be present in a pulled-back local package vs optional heavy
+# tensors that may be intentionally trimmed locally (their digest stays in the
+# manifest for cluster-side verification).
+_REQUIRED_LOCAL_ARTIFACTS = ("protocol.json", "metrics.json", "native.mp4", "upstream.mp4")
+_OPTIONAL_LOCAL_ARTIFACTS = ("native.pt", "upstream.pt")
+
+
+def verify_local(local_dir: str) -> dict:
+    """Validate a pulled-back local artifact package for self-consistency.
+
+    Checks that ``protocol.json`` / ``metrics.json`` / ``manifest.json`` parse as
+    JSON; that every required artifact is present locally; and that each
+    locally-present artifact's SHA-256 matches the generation manifest. Heavy
+    ``*.pt`` tensors may be intentionally absent locally (trimmed) — their
+    absence is recorded, not failed, but a present tensor whose digest mismatches
+    fails. Returns a report dict whose ``ok`` field is the overall pass/fail.
+    """
+    d = Path(local_dir)
+    problems = []
+    json_valid = {
+        name: _json_parses(str(d / name))
+        for name in ("protocol.json", "metrics.json", "manifest.json")
+    }
+    for name, ok in json_valid.items():
+        if not ok:
+            problems.append(f"{name} missing or not valid JSON")
+
+    manifest_artifacts = {}
+    if json_valid["manifest.json"]:
+        with open(d / "manifest.json") as f:
+            manifest_artifacts = json.load(f).get("artifacts") or {}
+
+    artifacts = {}
+    for name in MANIFEST_ARTIFACTS:
+        p = d / name
+        present = p.exists() and p.is_file()
+        entry = {
+            "present_local": present,
+            "size_bytes": p.stat().st_size if present else None,
+            "sha256": sha256_file(str(p)) if present else None,
+            "sha256_matches_manifest": None,
+        }
+        if present:
+            man_sha = (manifest_artifacts.get(name) or {}).get("sha256")
+            if man_sha is not None:
+                entry["sha256_matches_manifest"] = entry["sha256"] == man_sha
+                if not entry["sha256_matches_manifest"]:
+                    problems.append(f"{name} sha256 does not match the manifest")
+        elif name in _REQUIRED_LOCAL_ARTIFACTS:
+            problems.append(f"required artifact {name} is missing locally")
+        artifacts[name] = entry
+
+    return {
+        "local_dir": str(d),
+        "json_valid": json_valid,
+        "artifacts": artifacts,
+        "problems": problems,
+        "ok": not problems,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -783,17 +888,37 @@ def compute_similarity(native_thwc, other_thwc, pixel_window, label):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Native-vs-upstream LTX-2 retake comparison oracle.")
-    p.add_argument("--checkpoint", required=True, help="LTX-2 checkpoint directory.")
-    p.add_argument("--gemma", required=True, help="Gemma text-encoder directory.")
-    p.add_argument("--lora", required=True, help="Retake LoRA path (fused into transformer).")
-    p.add_argument("--source", required=True, help="Source video path.")
-    p.add_argument("--output-dir", required=True, help="Directory for outputs + protocol.")
+    # Pipeline args are required for a run, but not for ``--verify-local`` (which
+    # only validates an already-produced local artifact package); enforced below.
+    p.add_argument("--checkpoint", help="LTX-2 checkpoint directory.")
+    p.add_argument("--gemma", help="Gemma text-encoder directory.")
+    p.add_argument("--lora", help="Retake LoRA path (fused into transformer).")
+    p.add_argument("--source", help="Source video path.")
+    p.add_argument("--output-dir", help="Directory for outputs + protocol.")
     p.add_argument("--reference", default=None, help="Optional committed reference video.")
     p.add_argument("--prompt", default="a person talking to the camera")
     p.add_argument("--negative-prompt", default="")
-    p.add_argument("--start", type=float, required=True, help="Retake window start (seconds).")
-    p.add_argument("--end", type=float, required=True, help="Retake window end (seconds).")
+    p.add_argument("--start", type=float, help="Retake window start (seconds).")
+    p.add_argument("--end", type=float, help="Retake window end (seconds).")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--eval-repo",
+        default=None,
+        help=(
+            "Path to the sibling LTX2.3-eval repo (upstream oracle source). "
+            "Defaults to <TensorRT-LLM>/../LTX2.3-eval. In default mode its git "
+            "commit/dirty must be probeable (provenance requirement)."
+        ),
+    )
+    p.add_argument(
+        "--verify-local",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Verify an already-pulled local artifact package (JSON validity + "
+            "presence + SHA-256 vs manifest) and exit; does not run the pipeline."
+        ),
+    )
     p.add_argument(
         "--dtype",
         default="bf16",
@@ -822,6 +947,18 @@ def parse_args(argv=None):
         ),
     )
     args = p.parse_args(argv)
+    if args.verify_local:
+        return args
+    missing = [
+        name
+        for name in ("checkpoint", "gemma", "lora", "source", "output_dir", "start", "end")
+        if getattr(args, name) is None
+    ]
+    if missing:
+        p.error(
+            "the following arguments are required for a run: "
+            + ", ".join("--" + m.replace("_", "-") for m in missing)
+        )
     if args.dtype != "bf16":
         p.error(
             f"--dtype only supports 'bf16' on the native path; got {args.dtype!r}. "
@@ -831,6 +968,18 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
+    args = parse_args(argv)
+
+    # ``--verify-local`` validates an already-pulled local artifact package and
+    # exits without importing torch / tensorrt_llm or touching a GPU.
+    if args.verify_local:
+        report = verify_local(args.verify_local)
+        report_path = Path(args.verify_local) / "local_verify.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2)
+        print("LOCAL_VERIFY", json.dumps({"ok": report["ok"], "problems": report["problems"]}))
+        return 0 if report["ok"] else 1
+
     import torch
 
     from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.types import VIDEO_SCALE_FACTORS
@@ -840,7 +989,6 @@ def main(argv=None) -> int:
         _retake_pixel_window,
     )
 
-    args = parse_args(argv)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -995,13 +1143,29 @@ def main(argv=None) -> int:
     invariants["seed_deterministic"] = seed_deterministic
     invariants["audio_regen_failfast"] = audio_regen_failfast
 
-    # Hard gate: every applicable (non-None) invariant must be True and there
-    # must be no invariant_errors. In the default mode the upstream oracle must
-    # also have produced output; task6_satisfied additionally requires that.
+    # ---- Provenance (required in default native-vs-upstream mode) ------
+    # Anchor git probing on this script's repo (examples/visual_gen/<file>) so
+    # the protocol is correct regardless of the invocation working directory.
+    trtllm_repo = Path(__file__).resolve().parents[2]
+    eval_repo_dir = (
+        Path(args.eval_repo).resolve()
+        if args.eval_repo
+        else (trtllm_repo.parent / "LTX2.3-eval").resolve()
+    )
+    native_repo_info = _git_info(str(trtllm_repo))
+    eval_repo_info = _git_info(str(eval_repo_dir))
+    provenance_ok, provenance_reasons = validate_provenance(
+        {"code_commit": code_commit, "native_repo": native_repo_info, "eval_repo": eval_repo_info},
+        args.native_only,
+    )
+
+    # Hard gate: strict per-key native invariants (only audio_preserved may be
+    # None) + no invariant_errors; in default mode the upstream oracle must also
+    # have produced output AND authoritative provenance must be present.
     # Similarity metrics are excluded by construction.
     upstream_available = upstream_thwc is not None
     all_checks_passed, task6_satisfied = assemble_gate(
-        invariants, invariant_errors, upstream_available, args.native_only
+        invariants, invariant_errors, upstream_available, args.native_only, provenance_ok
     )
 
     # ---- 4. Advisory similarity (never gates) --------------------------
@@ -1032,13 +1196,9 @@ def main(argv=None) -> int:
     _latent_window, conditioned_latent_ranges = _retake_conditioned_latent_ranges(
         pixel_start, pixel_end, num_frames, temporal_ratio
     )
-    # Anchor git probing on this script's repo (examples/visual_gen/<file>) so
-    # the protocol is correct regardless of the invocation working directory.
-    trtllm_repo = Path(__file__).resolve().parents[2]
-    eval_repo = (trtllm_repo.parent / "LTX2.3-eval").resolve()
     protocol = build_protocol(
-        native_repo=_git_info(str(trtllm_repo)),
-        eval_repo=_git_info(str(eval_repo)),
+        native_repo=native_repo_info,
+        eval_repo=eval_repo_info,
         checkpoint=str(Path(args.checkpoint).resolve()),
         gemma=str(Path(args.gemma).resolve()),
         lora=str(Path(args.lora).resolve()) if args.lora else None,
@@ -1072,6 +1232,8 @@ def main(argv=None) -> int:
         "all_checks_passed": all_checks_passed,
         "task6_satisfied": task6_satisfied,
         "native_only": args.native_only,
+        "provenance_ok": provenance_ok,
+        "provenance_reasons": provenance_reasons,
         "similarity_informational": similarity,
         "upstream_reason": upstream_reason,
         "native_mp4_written": native_mp4,
@@ -1086,8 +1248,15 @@ def main(argv=None) -> int:
             f"native-vs-upstream oracle: upstream run was required but unavailable "
             f"({upstream_reason}); gate failed."
         )
+    elif not provenance_ok:
+        mode_note = (
+            "native-vs-upstream oracle: upstream produced output but provenance is "
+            f"incomplete ({'; '.join(provenance_reasons)}); gate failed."
+        )
     else:
-        mode_note = "native-vs-upstream oracle: upstream produced output."
+        mode_note = (
+            "native-vs-upstream oracle: upstream produced output with authoritative provenance."
+        )
     metrics["mode_note"] = mode_note
 
     with open(output_dir / "protocol.json", "w") as f:
