@@ -554,12 +554,29 @@ def _env_metadata() -> dict:
 # ----------------------------------------------------------------------------
 
 
-def build_pipeline(checkpoint, gemma, lora, device, attention_backend, extra_overrides=None):
+def build_pipeline(
+    checkpoint,
+    gemma,
+    lora,
+    device,
+    attention_backend,
+    extra_overrides=None,
+    cuda_graph_enable=False,
+    quant_algo=None,
+):
     """Build and load an LTX-2 retake pipeline (native or upstream-stage).
 
     ``extra_overrides`` merges into the pipeline ``extra_attrs`` so the caller
     can flip ``retake_use_upstream_stage`` to select the preserved oracle path
     while every other setting stays identical.
+
+    ``cuda_graph_enable`` and ``quant_algo`` drive the config-driven native
+    acceleration axes for the smoke matrix; both default off, so the oracle's own
+    bf16/VANILLA/no-graph call is unchanged. ``quant_algo`` (e.g. ``"NVFP4"``)
+    enables the native runtime dynamic-quant path (`DynamicLinearWeightLoader`
+    keys on the transformer model config's ``dynamic_weight_quant``), so the
+    quant config is threaded onto both the transformer model config and the
+    pipeline config.
     """
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
@@ -579,15 +596,31 @@ def build_pipeline(checkpoint, gemma, lora, device, attention_backend, extra_ove
     }
     if extra_overrides:
         extra.update(extra_overrides)
-    pipeline_config = DiffusionPipelineConfig(
-        model_configs={
-            "transformer": DiffusionModelConfig(
-                pretrained_config=SimpleNamespace(**transformer_cfg)
+
+    quant_config = None
+    dynamic_weight_quant = False
+    if quant_algo:
+        quant_config, _layer, dynamic_weight_quant, _dyn_act = (
+            DiffusionPipelineConfig.load_diffusion_quant_config(
+                {"quant_algo": quant_algo, "dynamic": True}
             )
-        },
-        extra_attrs=extra,
+        )
+
+    model_config_kwargs = {"pretrained_config": SimpleNamespace(**transformer_cfg)}
+    pipeline_config_kwargs = {"extra_attrs": extra}
+    if quant_config is not None:
+        model_config_kwargs["quant_config"] = quant_config
+        model_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
+        pipeline_config_kwargs["quant_config"] = quant_config
+        pipeline_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
+        pipeline_config_kwargs["force_dynamic_quantization"] = True
+
+    pipeline_config = DiffusionPipelineConfig(
+        model_configs={"transformer": DiffusionModelConfig(**model_config_kwargs)},
+        **pipeline_config_kwargs,
     )
     pipeline_config.attention.backend = attention_backend
+    pipeline_config.cuda_graph.enable = cuda_graph_enable
     pipe = LTX2RetakePipeline(pipeline_config)
     pipe.load_standard_components(checkpoint, device, text_encoder_path=gemma)
     pipe.load_weights(pipe.load_transformer_weights(checkpoint))
