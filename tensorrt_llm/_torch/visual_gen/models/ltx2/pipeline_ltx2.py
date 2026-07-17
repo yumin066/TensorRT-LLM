@@ -364,6 +364,14 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             yield (f"{prefix}.context", tuple(v.context.shape))
             if v.context_mask is not None:
                 yield (f"{prefix}.context_mask", tuple(v.context_mask.shape))
+            # sigma drives prompt AdaLN (cross_attention_adaln=True). A
+            # sigma-bearing Modality and a sigma-absent one must never share a
+            # captured graph: the former needs a static sigma buffer to copy
+            # into at replay, the latter does not.
+            yield (
+                f"{prefix}.sigma",
+                tuple(v.sigma.shape) if v.sigma is not None else None,
+            )
         elif isinstance(v, BatchedPerturbationConfig):
             fp = self._perturbation_fingerprint(v)
             yield (prefix, f"perturbed:{fp}")
@@ -421,6 +429,12 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
                 context=v.context.clone(),
                 enabled=v.enabled,
                 context_mask=v.context_mask.clone() if v.context_mask is not None else None,
+                # sigma is the per-step noise level prompt AdaLN reads
+                # (cross_attention_adaln=True). Cloning it into the static
+                # buffer is what lets capture see a non-None sigma and replay
+                # update it in-place; omitting it made the captured Modality
+                # carry sigma=None and raised at capture on the 22b.
+                sigma=v.sigma.clone() if v.sigma is not None else None,
             )
         return v
 
@@ -460,6 +474,11 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             dst.context.copy_(src.context)
             if src.context_mask is not None and dst.context_mask is not None:
                 dst.context_mask.copy_(src.context_mask)
+            # Refresh the per-step sigma into the captured static buffer so each
+            # replay uses the current noise level (paired with the sigma clone
+            # in _clone_value and the sigma graph-key part).
+            if src.sigma is not None and dst.sigma is not None:
+                dst.sigma.copy_(src.sigma)
             return dst
         return src
 

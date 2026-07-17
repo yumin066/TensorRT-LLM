@@ -908,5 +908,71 @@ class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
         )
 
 
+def _cpu_modality(sigma=None):
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+
+    return Modality(
+        latent=torch.zeros(1, 4, 8),
+        timesteps=torch.tensor([0.5]),
+        positions=torch.zeros(1, 3, 4),
+        context=torch.zeros(1, 2, 8),
+        sigma=sigma,
+    )
+
+
+def test_ltx2_cuda_graph_runner_clones_and_copies_modality_sigma():
+    # cross_attention_adaln=True (22b) feeds Modality.sigma to prompt AdaLN.
+    # The CUDA-graph static buffer must clone sigma (else capture sees None and
+    # raises) and refresh it in-place at replay (else every step reuses the
+    # capture-time noise level).
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+
+    src = _cpu_modality(sigma=torch.tensor([0.7]))
+    static = _LTX2CUDAGraphRunner._clone_value(src)
+
+    assert static.sigma is not None
+    assert static.sigma is not src.sigma  # distinct static buffer
+    assert torch.equal(static.sigma, src.sigma)
+
+    buf_sigma = static.sigma
+    new_src = _cpu_modality(sigma=torch.tensor([0.2]))
+    _LTX2CUDAGraphRunner._copy_value(static, new_src)
+
+    assert static.sigma is buf_sigma  # same buffer, updated in place
+    assert torch.equal(static.sigma, new_src.sigma)
+
+
+def test_ltx2_cuda_graph_runner_modality_sigma_none_is_backward_compatible():
+    # Configs without prompt AdaLN leave sigma=None; clone must stay None and
+    # copy must be a no-op for sigma while still refreshing the other fields.
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+
+    static = _LTX2CUDAGraphRunner._clone_value(_cpu_modality(sigma=None))
+    assert static.sigma is None
+
+    new_src = _cpu_modality(sigma=None)
+    new_src.latent.fill_(1.0)
+    _LTX2CUDAGraphRunner._copy_value(static, new_src)
+
+    assert static.sigma is None
+    assert torch.equal(static.latent, new_src.latent)
+
+
+def test_ltx2_cuda_graph_runner_key_distinguishes_sigma_presence():
+    # A sigma-bearing Modality and a sigma-absent one must derive different
+    # graph keys: the former needs a static sigma buffer, the latter does not.
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+
+    # _key_parts_for does not use ``self`` for a Modality, so an unbound call is
+    # sufficient to exercise the key derivation without constructing a runner.
+    key_parts = _LTX2CUDAGraphRunner._key_parts_for
+    parts_with = list(key_parts(None, "video", _cpu_modality(sigma=torch.tensor([0.7]))))
+    parts_without = list(key_parts(None, "video", _cpu_modality(sigma=None)))
+
+    assert parts_with != parts_without
+    assert ("video.sigma", (1,)) in parts_with
+    assert ("video.sigma", None) in parts_without
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
