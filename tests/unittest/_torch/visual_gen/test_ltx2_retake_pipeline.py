@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import builtins
+import json
 from enum import Enum
 from types import SimpleNamespace
 
@@ -1146,14 +1147,47 @@ def test_ltx2_registry_accepts_retake_lora_keys():
     assert "retake_lora_strength" in entry.defaults
 
 
-def test_ltx2_config_propagates_retake_lora_to_extra_attrs():
-    # config.py from_pretrained must copy retake_lora_path/retake_lora_strength
-    # from the resolved pipeline_config into extra_attrs (where the retake load
-    # path reads them). Test the propagation key list directly.
-    import inspect
+def _write_minimal_ltx2_native_checkpoint(tmp_path):
+    # Single-safetensors LTX-2 checkpoint whose embedded metadata carries just
+    # enough config for DiffusionPipelineConfig.from_pretrained to build a
+    # config object (mirrors _write_minimal_ltx2_native_checkpoint in
+    # test_ltx2_pipeline.py; kept self-contained here).
+    import safetensors.torch
 
-    from tensorrt_llm._torch.visual_gen import config as vg_config
+    checkpoint_path = tmp_path / "ltx-2-19b-dev.safetensors"
+    safetensors.torch.save_file(
+        {"__metadata_marker__": torch.zeros(1)},
+        str(checkpoint_path),
+        metadata={"config": json.dumps({"transformer": {"_class_name": "LTX2"}})},
+    )
+    return checkpoint_path
 
-    src = inspect.getsource(vg_config.DiffusionPipelineConfig.from_pretrained)
-    assert "retake_lora_path" in src
-    assert "retake_lora_strength" in src
+
+def test_ltx2_config_propagates_retake_lora_to_extra_attrs(tmp_path):
+    # Behavioral regression: the serve config path (a validated pipeline_config
+    # carrying the retake LoRA) must actually reach the pipeline consumer as
+    # DiffusionPipelineConfig.extra_attrs -- where LTX2RetakePipeline fuses
+    # retake_lora_path/retake_lora_strength. Drive a real from_pretrained load
+    # of a minimal checkpoint (not a source-string inspection, which would pass
+    # even if the keys only appeared in a comment).
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+    args = VisualGenArgs(
+        model=str(checkpoint_path),
+        pipeline_config={
+            "workflow": "retake",
+            "retake_lora_path": "/models/talkvid-lora/lora_weights.safetensors",
+            "retake_lora_strength": 0.8,
+            "retake_use_upstream_stage": False,
+        },
+    )
+
+    config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
+
+    assert config.extra_attrs["workflow"] == "retake"
+    assert config.extra_attrs["retake_lora_path"] == "/models/talkvid-lora/lora_weights.safetensors"
+    assert config.extra_attrs["retake_lora_strength"] == 0.8
+    # False is a meaningful propagated value (native default path), not a
+    # "missing/None" that the propagation loop drops.
+    assert config.extra_attrs["retake_use_upstream_stage"] is False
