@@ -224,8 +224,18 @@ def test_timing_pure_helpers_run_without_numpy():
 
 
 def test_build_overrides_selects_upstream_stage():
-    # The native Stage-2 default needs no override; the upstream-stage
+    # The native pre/post default needs no override; the upstream-orchestration
     # persistent baseline must flip retake_use_upstream_stage so the same
     # resident worker runs the preserved upstream orchestration.
     assert timing.build_overrides(False) is None
     assert timing.build_overrides(True) == {"retake_use_upstream_stage": True}
+
+
+def test_timing_runner_has_no_plan_process_labels():
+    # PLAN.md bans plan-process terminology in implementation code/comments.
+    # Keep runtime identifiers (mode=..., retake_use_upstream_stage) but no
+    # AC-*/Stage /Milestone/Phase plan labels (recurring hygiene regression).
+    text = _TIMING_PATH.read_text()
+    assert "AC-" not in text
+    for label in ("Stage 1", "Stage 2", "Stage-2", "Milestone", "Phase "):
+        assert label not in text

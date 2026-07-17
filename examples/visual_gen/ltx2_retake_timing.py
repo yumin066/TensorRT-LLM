@@ -206,11 +206,12 @@ def parse_args(argv=None):
         "--use-upstream-stage",
         action="store_true",
         help=(
-            "measure the upstream-stage (Stage 1) persistent baseline instead of "
-            "the native Stage-2 pre/post default: same resident load-once-serve-many "
+            "measure the upstream-orchestration persistent baseline instead of "
+            "the native pre/post default: same resident load-once-serve-many "
             "worker, but retake runs through upstream DiffusionStage.run (native "
-            "LTXModel adapter + upstream pre/post). Isolates what the persistent "
-            "worker buys from what the native pre/post buys. Not an acceleration axis."
+            "LTXModel adapter + upstream pre/post). Contrasting it with the "
+            "every-rebuild reference (same path, rebuilt per call) isolates the "
+            "pure-persistence benefit. Not an acceleration axis."
         ),
     )
     return p.parse_args(argv)
@@ -219,7 +220,7 @@ def parse_args(argv=None):
 def build_overrides(use_upstream_stage: bool):
     """Return the ``build_pipeline`` extra_overrides for the selected path.
 
-    The native Stage-2 pre/post default needs no override; the upstream-stage
+    The native pre/post default needs no override; the upstream-orchestration
     persistent baseline flips ``retake_use_upstream_stage`` so the same resident
     worker runs the preserved upstream orchestration.
     """
@@ -326,10 +327,11 @@ def main(argv=None) -> int:
             "retake_offload_mode": "none",
             "cuda_graph": False,
             "quant_algo": None,
-            # The upstream-stage baseline is the SAME resident worker running the
-            # preserved upstream orchestration (native LTXModel adapter + upstream
-            # pre/post), NOT the native Stage-2 pre/post default and NOT an
-            # acceleration axis — it isolates the persistent-worker benefit.
+            # The upstream-orchestration baseline is the SAME resident worker
+            # running the preserved upstream orchestration (native LTXModel
+            # adapter + upstream pre/post), NOT the native pre/post default and
+            # NOT an acceleration axis — contrasting it with the every-rebuild
+            # reference (same path, rebuilt per call) isolates pure persistence.
             "retake_use_upstream_stage": bool(args.use_upstream_stage),
         },
         "quality_informational": quality,
