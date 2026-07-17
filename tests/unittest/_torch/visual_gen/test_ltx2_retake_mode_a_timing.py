@@ -127,6 +127,30 @@ def test_packages_pristine_unchanged_but_preexisting_dirty():
 
 
 # --------------------------------------------------------------------------- #
+# mode_a_exit_ok (Round 31: pristine gate must require clean, not just unchanged)
+# --------------------------------------------------------------------------- #
+
+
+def test_exit_ok_true_only_when_records_and_pristine_clean():
+    clean = mode_a.packages_pristine("", "")
+    assert mode_a.mode_a_exit_ok(True, clean) is True
+
+
+def test_exit_ok_false_when_dirty_but_unchanged():
+    # The Round-30 bug: dirty-but-unchanged used to pass. It must now FAIL.
+    dirty = " M packages/x.py\n"
+    p = mode_a.packages_pristine(dirty, dirty)
+    assert p["unchanged"] is True
+    assert mode_a.mode_a_exit_ok(True, p) is False
+
+
+def test_exit_ok_false_when_changed_or_no_records():
+    changed = mode_a.packages_pristine("", " M packages/x.py\n")
+    assert mode_a.mode_a_exit_ok(True, changed) is False
+    assert mode_a.mode_a_exit_ok(False, mode_a.packages_pristine("", "")) is False
+
+
+# --------------------------------------------------------------------------- #
 # stdlib-only import (Round 30)
 # --------------------------------------------------------------------------- #
 

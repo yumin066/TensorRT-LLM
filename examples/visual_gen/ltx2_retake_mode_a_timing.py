@@ -96,6 +96,16 @@ def packages_pristine(status_before: str, status_after: str) -> dict:
     }
 
 
+def mode_a_exit_ok(has_records: bool, pristine: dict) -> bool:
+    """Whether the CLI should exit success: a measured call AND pristine packages.
+
+    "Pristine" means both unchanged by this tool AND clean (no pre-existing
+    dirt): a dirty-but-unchanged ``../LTX2.3-eval/packages/`` must FAIL, because
+    the plan requires the reference tree to be pristine, not merely untouched.
+    """
+    return bool(has_records) and bool(pristine.get("unchanged")) and bool(pristine.get("clean"))
+
+
 # ----------------------------------------------------------------------------
 # Heavy path (imports live here so the pure helpers load on a plain host).
 # ----------------------------------------------------------------------------
@@ -343,8 +353,7 @@ def main(argv=None) -> int:
         json.dumps({"total": summary.get("total"), "pristine": pristine["unchanged"]}),
     )
     # A meaningful run needs at least one measured rebuild and a pristine packages tree.
-    ok = bool(records) and pristine["unchanged"]
-    return 0 if ok else 1
+    return 0 if mode_a_exit_ok(bool(records), pristine) else 1
 
 
 if __name__ == "__main__":
