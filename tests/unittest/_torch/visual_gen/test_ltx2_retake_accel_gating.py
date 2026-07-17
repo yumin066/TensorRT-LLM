@@ -29,6 +29,43 @@ def _load_accel():
 
 accel = _load_accel()
 
+_ORACLE_PATH = (
+    Path(__file__).resolve().parents[4] / "examples" / "visual_gen" / "ltx2_retake_oracle.py"
+)
+
+
+def _load_oracle():
+    spec = importlib.util.spec_from_file_location("ltx2_retake_oracle", _ORACLE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+oracle = _load_oracle()
+
+
+class _FakeCompilePipe:
+    """Records whether the torch.compile setup was invoked."""
+
+    def __init__(self):
+        self.compile_calls = 0
+
+    def torch_compile(self):
+        self.compile_calls += 1
+
+
+def test_apply_torch_compile_invokes_compile_only_when_enabled():
+    # The torch_compile acceleration axis is a real compiled measurement only if
+    # build_pipeline actually calls pipe.torch_compile() (setting the config flag
+    # alone never compiles). Guarded import keeps this runnable without torch.
+    disabled = _FakeCompilePipe()
+    assert oracle._apply_torch_compile(disabled, False) is disabled
+    assert disabled.compile_calls == 0
+
+    enabled = _FakeCompilePipe()
+    assert oracle._apply_torch_compile(enabled, True) is enabled
+    assert enabled.compile_calls == 1
+
 
 def _steady(p50):
     """A minimal steady_warm dict for constructing test records."""

@@ -635,6 +635,37 @@ def build_pipeline(
     pipe.load_standard_components(checkpoint, device, text_encoder_path=gemma)
     pipe.load_weights(pipe.load_transformer_weights(checkpoint))
     pipe.post_load_weights()
+    # Setting torch_compile.enable alone does NOT compile anything; the
+    # production loader (pipeline_loader.py) applies torch.compile as a separate
+    # post-load step. Mirror it so the torch_compile acceleration axis is a real
+    # compiled measurement, not just a config flag.
+    _apply_torch_compile(pipe, torch_compile_enable)
+    return pipe
+
+
+def _apply_torch_compile(pipe, enable: bool):
+    """Apply torch.compile to a loaded pipeline, mirroring the production loader.
+
+    ``PipelineLoader`` calls this after ``post_load_weights``:
+    ``torch._dynamo.config.cache_size_limit = 128`` then ``pipeline.torch_compile()``
+    (which wraps the transformer blocks/modules with ``torch.compile``). Flipping
+    ``pipeline_config.torch_compile.enable`` alone never compiles the model.
+
+    The dynamo cache-limit tweak is guarded so this helper stays importable/host-
+    testable without torch (numpy-only venv); the essential ``pipe.torch_compile()``
+    call always fires when enabled.
+    """
+    if not enable:
+        return pipe
+    try:
+        import torch
+
+        torch._dynamo.config.cache_size_limit = 128
+    except (ImportError, AttributeError):
+        # torch (or torch._dynamo) unavailable — this is the host-test env; the
+        # cache-limit is only a perf tweak, so skip it and still compile.
+        pass
+    pipe.torch_compile()
     return pipe
 
 
