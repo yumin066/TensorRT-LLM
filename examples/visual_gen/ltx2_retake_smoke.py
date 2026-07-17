@@ -148,12 +148,30 @@ def build_record(
     }
 
 
+def baseline_ran_ok(records: list) -> bool:
+    """Whether the baseline config ran ``ok``.
+
+    The baseline (bf16/VANILLA) is the informational-quality anchor every other
+    config is compared against, so the sweep is only meaningful when it ran. A
+    later config succeeding while the baseline failed is NOT a meaningful sweep.
+    """
+    for r in records:
+        if r.get("baseline"):
+            return r.get("status") == "ok"
+    return False
+
+
 def summarize_matrix(records: list) -> dict:
-    """Count records by status; ``ok`` is surfaced for the exit code."""
+    """Count records by status; ``baseline_ok`` drives the exit code."""
     counts: dict = {}
     for r in records:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    return {"total": len(records), "by_status": counts, "ok": counts.get("ok", 0)}
+    return {
+        "total": len(records),
+        "by_status": counts,
+        "ok": counts.get("ok", 0),
+        "baseline_ok": baseline_ran_ok(records),
+    }
 
 
 def _json_safe(obj):
@@ -346,15 +364,17 @@ def main(argv=None) -> int:
         "num_frames": num_frames,
         "note": (
             "Early acceleration feasibility smoke (which native-retake configs run); "
-            "NOT authoritative AC-4 per-axis gating. PSNR/SSIM informational only."
+            "NOT authoritative per-axis capability gating. PSNR/SSIM informational only."
         ),
     }
     (output_dir / "smoke_matrix.json").write_text(
         json.dumps(_json_safe(result), indent=2, sort_keys=True, allow_nan=False)
     )
     print("SMOKE_DONE", json.dumps(summary))
-    # At least the bf16/VANILLA baseline must run for the smoke to be meaningful.
-    return 0 if summary["ok"] >= 1 else 1
+    # The baseline (bf16/VANILLA) is the quality anchor; the sweep is only
+    # meaningful when it ran, regardless of how many other configs happened to
+    # pass.
+    return 0 if summary["baseline_ok"] else 1
 
 
 if __name__ == "__main__":

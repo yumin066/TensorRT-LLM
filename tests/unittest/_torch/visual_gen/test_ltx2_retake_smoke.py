@@ -163,6 +163,47 @@ def test_summarize_counts_by_status():
     assert summary["total"] == 4
     assert summary["ok"] == 2
     assert summary["by_status"] == {"ok": 2, "error": 1, "unsupported": 1}
+    # records[0] is the bf16/VANILLA baseline and it is ok here.
+    assert summary["baseline_ok"] is True
+
+
+# --------------------------------------------------------------------------- #
+# baseline-anchored success gate (Round 26)
+# --------------------------------------------------------------------------- #
+
+
+def test_baseline_ran_ok_true_when_baseline_ok():
+    matrix = smoke.build_config_matrix()
+    records = [smoke.build_record(matrix[0], "ok", None, None, 1.0)]
+    assert smoke.baseline_ran_ok(records) is True
+
+
+def test_baseline_ran_ok_false_when_baseline_failed_even_if_other_ok():
+    # The quality anchor (bf16/VANILLA) failed but a later config passed: the
+    # sweep is NOT meaningful, so the success gate must fail.
+    matrix = smoke.build_config_matrix()
+    records = [
+        smoke.build_record(matrix[0], "error", "baseline boom", None, 1.0),  # baseline
+        smoke.build_record(matrix[1], "ok", None, None, 1.0),  # later config ok
+    ]
+    assert smoke.baseline_ran_ok(records) is False
+    # And the summary the exit code is derived from agrees.
+    assert smoke.summarize_matrix(records)["baseline_ok"] is False
+
+
+def test_baseline_ran_ok_false_when_no_baseline_record():
+    matrix = smoke.build_config_matrix()
+    records = [smoke.build_record(matrix[1], "ok", None, None, 1.0)]  # no baseline
+    assert smoke.baseline_ran_ok(records) is False
+
+
+def test_runner_has_no_plan_process_labels():
+    # PLAN.md forbids plan-process terms (AC-*, Milestone, Step, Phase) in
+    # implementation code / runtime strings.
+    text = _SMOKE_PATH.read_text()
+    assert "AC-" not in text
+    for label in ("Milestone", "Phase "):
+        assert label not in text
 
 
 # --------------------------------------------------------------------------- #
