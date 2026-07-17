@@ -55,7 +55,35 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
-import numpy as np
+
+class _LazyNumpy:
+    """Import numpy lazily on first attribute access.
+
+    The ``--verify-local`` verifier path (and ``parse_args``) use only
+    ``json`` / ``hashlib`` / ``pathlib``, so validating a pulled artifact
+    package must not require numpy to be installed. Every numpy-using helper
+    references the module global ``np``; deferring the import to first use keeps
+    those stdlib-only paths runnable on a machine without numpy while leaving all
+    call sites unchanged. ``from __future__ import annotations`` (above) makes the
+    ``np.ndarray`` annotations strings, so they never trigger the import either.
+    """
+
+    __slots__ = ()
+    _module = None
+
+    def _load(self):
+        module = _LazyNumpy._module
+        if module is None:
+            import numpy as _numpy
+
+            module = _LazyNumpy._module = _numpy
+        return module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+np = _LazyNumpy()
 
 # ----------------------------------------------------------------------------
 # Pure helpers (numpy / torch only; no tensorrt_llm imports at module scope).
@@ -590,7 +618,10 @@ def _make_request(prompt, negative_prompt, source, start, end, seed, steps, rege
 
 def _run_pipeline(pipe, request):
     out = pipe.infer(request)
-    return out.video, out.audio, float(out.frame_rate)
+    audio_sample_rate = getattr(out, "audio_sample_rate", None)
+    if audio_sample_rate is not None:
+        audio_sample_rate = int(audio_sample_rate)
+    return out.video, out.audio, float(out.frame_rate), audio_sample_rate
 
 
 # ----------------------------------------------------------------------------
@@ -721,15 +752,32 @@ def _tensor_equal(a, b) -> bool:
         return False
 
 
-def _audio_preserved(native_audio, source_audio) -> Optional[bool]:
-    """Whether native audio matches the source audio (None when no source audio)."""
-    import torch
+def _audio_preserved(native_audio, source_audio, native_audio_sample_rate=None) -> Optional[bool]:
+    """Whether native audio matches the source audio (None when no source audio).
 
+    Sample rate is part of "the same audio": a waveform that matches
+    sample-for-sample at a different sampling rate is a different signal. So for
+    an audio-bearing source the native sample rate must be present and equal to
+    the source sampling rate (``source_audio[1]``) before the waveform is
+    compared. ``None`` is reserved for the no-source-audio case only.
+    """
     if source_audio is None:
         return None
     src_wave = source_audio[0]
+    src_rate = source_audio[1] if len(source_audio) > 1 else None
     if native_audio is None:
         return False
+    # Audio-bearing source: a missing or mismatched native sample rate is not
+    # "preserved", independent of the waveform samples. These sample-rate checks
+    # precede the torch import so the sample-rate contract is verifiable without
+    # torch installed.
+    if native_audio_sample_rate is None:
+        return False
+    if src_rate is not None and int(native_audio_sample_rate) != int(src_rate):
+        return False
+
+    import torch
+
     try:
         nat = native_audio.detach().to("cpu").float()
         src = src_wave.detach().to("cpu").float()
@@ -768,6 +816,7 @@ def check_invariants(
     pixel_window,
     source_fps,
     native_frame_rate,
+    native_audio_sample_rate,
     invariant_errors: dict,
 ):
     """Re-check the retake hard invariants on the native output.
@@ -829,7 +878,7 @@ def check_invariants(
 
     def _audio():
         # Passes through a legitimate None (no source audio -> N/A).
-        return _audio_preserved(native_audio, source_audio)
+        return _audio_preserved(native_audio, source_audio, native_audio_sample_rate)
 
     results["audio_preserved"] = _safe_invariant("audio_preserved", _audio, invariant_errors)
     return results
@@ -1034,7 +1083,9 @@ def main(argv=None) -> int:
     native_request = _make_request(
         args.prompt, args.negative_prompt, args.source, args.start, args.end, args.seed, args.steps
     )
-    native_video, native_audio, fps = _run_pipeline(native_pipe, native_request)
+    native_video, native_audio, fps, native_audio_sample_rate = _run_pipeline(
+        native_pipe, native_request
+    )
     native_thwc = _video_to_thwc_uint8(native_video)
 
     pixel_start, pixel_end = _retake_pixel_window(args.start, args.end, fps, num_frames)
@@ -1044,7 +1095,7 @@ def main(argv=None) -> int:
     # hard invariant fails the gate and is recorded in invariant_errors.
     seed_deterministic = None
     try:
-        native_video2, _, _ = _run_pipeline(native_pipe, native_request)
+        native_video2, _, _, _ = _run_pipeline(native_pipe, native_request)
         seed_deterministic = _tensor_equal(
             _video_to_thwc_uint8(native_video).cpu(), _video_to_thwc_uint8(native_video2).cpu()
         )
@@ -1112,7 +1163,7 @@ def main(argv=None) -> int:
                 args.seed,
                 args.steps,
             )
-            upstream_video, _upstream_audio, _ = _run_pipeline(upstream_pipe, upstream_request)
+            upstream_video, _upstream_audio, _, _ = _run_pipeline(upstream_pipe, upstream_request)
             upstream_thwc = _video_to_thwc_uint8(upstream_video)
             save_video_pt(upstream_video, str(output_dir / "upstream.pt"))
             encode_mp4(upstream_thwc, fps, str(output_dir / "upstream.mp4"))
@@ -1138,6 +1189,7 @@ def main(argv=None) -> int:
         (pixel_start, pixel_end),
         source_fps,
         fps,
+        native_audio_sample_rate,
         invariant_errors,
     )
     invariants["seed_deterministic"] = seed_deterministic

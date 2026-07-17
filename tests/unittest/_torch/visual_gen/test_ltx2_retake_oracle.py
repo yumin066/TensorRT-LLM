@@ -432,3 +432,103 @@ def test_verify_local_invalid_json_fails(tmp_path):
     report = oracle.verify_local(str(tmp_path))
     assert report["ok"] is False
     assert any("protocol.json" in p for p in report["problems"])
+
+
+# --------------------------------------------------------------------------- #
+# _audio_preserved sample-rate comparison (Round 24)
+# --------------------------------------------------------------------------- #
+
+
+def test_audio_preserved_none_when_no_source_audio():
+    # No source audio is genuinely N/A (excluded from the hard gate as None).
+    assert oracle._audio_preserved(object(), None, 44100) is None
+
+
+def test_audio_preserved_missing_native_sample_rate_fails():
+    # Audio-bearing source but the native output reported no sample rate.
+    src = (object(), 44100)
+    assert oracle._audio_preserved(object(), src, None) is False
+
+
+def test_audio_preserved_sample_rate_mismatch_fails():
+    # Even a sample-for-sample identical waveform at a different sampling rate is
+    # a different signal; the mismatch fails before any waveform comparison
+    # (so this path needs neither torch nor a real waveform).
+    src = (object(), 44100)
+    assert oracle._audio_preserved(object(), src, 48000) is False
+
+
+def test_audio_preserved_missing_native_audio_fails():
+    src = (object(), 44100)
+    assert oracle._audio_preserved(None, src, 44100) is False
+
+
+def _require_real_torch():
+    # Some host envs ship a stub ``torch`` (importable but missing ops), so
+    # ``importorskip`` alone is not enough to gate the waveform-comparison path.
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "zeros") or not hasattr(torch, "allclose"):
+        pytest.skip("host environment has a stub torch; real torch required")
+    return torch
+
+
+def test_audio_preserved_matching_rate_and_waveform_true():
+    torch = _require_real_torch()
+    wave = torch.zeros(2, 128)
+    # Same sampling rate + identical waveform -> preserved.
+    assert oracle._audio_preserved(wave, (wave.clone(), 44100), 44100) is True
+
+
+def test_audio_preserved_matching_waveform_wrong_rate_false():
+    torch = _require_real_torch()
+    wave = torch.zeros(2, 128)
+    # A real identical waveform but a different native sample rate must still
+    # fail -- the rate gate applies even when the samples would compare equal.
+    assert oracle._audio_preserved(wave, (wave.clone(), 44100), 22050) is False
+
+
+# --------------------------------------------------------------------------- #
+# --verify-local runs stdlib-only, without numpy (Round 24)
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_local_cli_runs_without_numpy(tmp_path):
+    """The checked-in ``--verify-local`` mode must run on a machine without numpy.
+
+    The verifier uses only ``json`` / ``hashlib`` / ``pathlib``; numpy is used
+    solely on the GPU/similarity paths and is now imported lazily. This spawns a
+    subprocess whose import system raises on any ``numpy`` import, then runs the
+    real script with ``--verify-local`` and asserts a clean exit -- proving that
+    neither module import nor the verifier path touches numpy.
+    """
+    import json
+    import subprocess
+    import sys
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    _make_local_package(pkg)
+
+    bootstrap = (
+        "import sys, runpy\n"
+        "class _BlockNumpy:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'numpy' or name.startswith('numpy.'):\n"
+        "            raise ImportError('numpy blocked for test')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _BlockNumpy())\n"
+        f"sys.argv = ['ltx2_retake_oracle', '--verify-local', {str(pkg)!r}]\n"
+        f"runpy.run_path({str(_ORACLE_PATH)!r}, run_name='__main__')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", bootstrap],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "LOCAL_VERIFY" in proc.stdout
+    payload = json.loads(proc.stdout.split("LOCAL_VERIFY", 1)[1].strip())
+    assert payload["ok"] is True, payload
+    # The verifier wrote its report and never imported numpy.
+    assert (pkg / "local_verify.json").exists()
+    assert "No module named 'numpy'" not in proc.stderr
