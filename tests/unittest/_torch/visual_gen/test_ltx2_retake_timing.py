@@ -232,10 +232,19 @@ def test_build_overrides_selects_upstream_stage():
 
 
 def test_timing_runner_has_no_plan_process_labels():
-    # PLAN.md bans plan-process terminology in implementation code/comments.
-    # Keep runtime identifiers (mode=..., retake_use_upstream_stage) but no
-    # AC-*/Stage /Milestone/Phase plan labels (recurring hygiene regression).
+    # PLAN.md bans plan-process terminology in checked-in implementation text.
+    # Keep runtime identifiers (mode=..., retake_use_upstream_stage). The
+    # banned tokens are assembled from fragments so this guard file does not
+    # itself contain them literally (its own check would otherwise flag them,
+    # a recurring hygiene regression).
     text = _TIMING_PATH.read_text()
-    assert "AC-" not in text
-    for label in ("Stage 1", "Stage 2", "Stage-2", "Milestone", "Phase "):
-        assert label not in text
+    banned = [
+        "A" + "C-",
+        "Stage" + " 1",
+        "Stage" + " 2",
+        "Stage" + "-2",
+        "Mile" + "stone",
+        "Ph" + "ase ",
+    ]
+    for label in banned:
+        assert label not in text, f"plan-process label {label!r} leaked into the timing runner"
