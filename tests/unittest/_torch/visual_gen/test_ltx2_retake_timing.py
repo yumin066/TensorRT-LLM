@@ -221,3 +221,11 @@ def test_timing_pure_helpers_run_without_numpy():
     proc = subprocess.run([sys.executable, "-c", bootstrap], capture_output=True, text=True)
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert "TIMING_PURE_OK" in proc.stdout
+
+
+def test_build_overrides_selects_upstream_stage():
+    # The native Stage-2 default needs no override; the upstream-stage
+    # persistent baseline must flip retake_use_upstream_stage so the same
+    # resident worker runs the preserved upstream orchestration.
+    assert timing.build_overrides(False) is None
+    assert timing.build_overrides(True) == {"retake_use_upstream_stage": True}

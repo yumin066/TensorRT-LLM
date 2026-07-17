@@ -202,7 +202,28 @@ def parse_args(argv=None):
     p.add_argument("--prompt", default="a person talking to the camera")
     p.add_argument("--negative-prompt", default="")
     p.add_argument("--code-commit", default=None)
+    p.add_argument(
+        "--use-upstream-stage",
+        action="store_true",
+        help=(
+            "measure the upstream-stage (Stage 1) persistent baseline instead of "
+            "the native Stage-2 pre/post default: same resident load-once-serve-many "
+            "worker, but retake runs through upstream DiffusionStage.run (native "
+            "LTXModel adapter + upstream pre/post). Isolates what the persistent "
+            "worker buys from what the native pre/post buys. Not an acceleration axis."
+        ),
+    )
     return p.parse_args(argv)
+
+
+def build_overrides(use_upstream_stage: bool):
+    """Return the ``build_pipeline`` extra_overrides for the selected path.
+
+    The native Stage-2 pre/post default needs no override; the upstream-stage
+    persistent baseline flips ``retake_use_upstream_stage`` so the same resident
+    worker runs the preserved upstream orchestration.
+    """
+    return {"retake_use_upstream_stage": True} if use_upstream_stage else None
 
 
 def main(argv=None) -> int:
@@ -225,7 +246,14 @@ def main(argv=None) -> int:
     # ---- Cold model build + load (once) --------------------------------
     _sync()
     t0 = time.perf_counter()
-    pipe = oracle.build_pipeline(args.checkpoint, args.gemma, args.lora, device, "VANILLA")
+    pipe = oracle.build_pipeline(
+        args.checkpoint,
+        args.gemma,
+        args.lora,
+        device,
+        "VANILLA",
+        extra_overrides=build_overrides(args.use_upstream_stage),
+    )
     _sync()
     model_build_load = time.perf_counter() - t0
 
@@ -282,7 +310,11 @@ def main(argv=None) -> int:
     steady_fine_stages = aggregate_fine_stages(steady)
     native_repo = oracle._git_info(str(Path(__file__).resolve().parents[2]))
     result = {
-        "mode": "resident_warm_native_retake",
+        "mode": (
+            "resident_warm_upstream_stage_baseline"
+            if args.use_upstream_stage
+            else "resident_warm_native_retake"
+        ),
         "timeline": timeline,
         "steady_warm_fine_stages": steady_fine_stages,
         "records": records,
@@ -294,6 +326,11 @@ def main(argv=None) -> int:
             "retake_offload_mode": "none",
             "cuda_graph": False,
             "quant_algo": None,
+            # The upstream-stage baseline is the SAME resident worker running the
+            # preserved upstream orchestration (native LTXModel adapter + upstream
+            # pre/post), NOT the native Stage-2 pre/post default and NOT an
+            # acceleration axis — it isolates the persistent-worker benefit.
+            "retake_use_upstream_stage": bool(args.use_upstream_stage),
         },
         "quality_informational": quality,
         "env": oracle._env_metadata(),
