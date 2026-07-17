@@ -75,6 +75,12 @@ class PipelineOutput:
     pre_denoise: float = 0.0
     denoise: float = 0.0
     post_denoise: float = 0.0
+    # Optional fine-grained per-stage seconds (a superset of the three public
+    # phases), populated by pipelines that record more than the pre/denoise/post
+    # boundaries (e.g. the LTX-2 retake path: source_read, vae_encode,
+    # conditioning, denoise_total, denoise_per_step, vae_decode, composite).
+    # ``None`` for pipelines that only emit the three phases.
+    stage_timings: Optional[dict] = None
 
 
 class CudaPhaseTimer:
@@ -148,6 +154,85 @@ class CudaPhaseTimer:
         output.pre_denoise = float(self._pre_start.elapsed_time(self._denoise_start)) * ms_to_s
         output.denoise = float(self._denoise_start.elapsed_time(self._post_start)) * ms_to_s
         output.post_denoise = float(self._post_start.elapsed_time(self._end)) * ms_to_s
+        return output
+
+
+class RetakeStageTimer:
+    """Fine-grained CUDA-event timer for the native retake stages.
+
+    Records ``torch.cuda.Event`` markers at the retake stage boundaries and, in
+    ``fill``, derives BOTH the three public :class:`PipelineOutput` phases
+    (``pre_denoise`` / ``denoise`` / ``post_denoise``) AND a fine
+    ``stage_timings`` dict (``source_read``, ``vae_encode``, ``conditioning``,
+    ``denoise_total``, ``vae_decode``, ``composite``, and a ``denoise_per_step``
+    list). ``mark(label)`` is called at each boundary in order:
+
+        source_read -> vae_encode -> conditioning -> denoise -> decode
+        -> composite -> end
+
+    with ``mark_step()`` after each denoise step. Each ``mark(label)`` records
+    the event that BEGINS that stage (so the duration of ``vae_encode`` is the
+    span from its mark to the next, ``conditioning``). On non-CUDA runs the
+    markers are no-ops and the timing fields keep their defaults.
+
+    Timing methodology mirrors :class:`CudaPhaseTimer`: ``fill`` synchronizes on
+    the final ``end`` event before reading ``elapsed_time`` (all events are
+    recorded in order on the default stream, so syncing ``end`` covers them all),
+    and the sync cost is amortized into the executor-side device->host transfer.
+    """
+
+    def __init__(self) -> None:
+        self._enabled = torch.cuda.is_available()
+        self._marks: dict = {}
+        self._steps: list = []
+
+    def mark(self, label: str) -> None:
+        if self._enabled:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self._marks[label] = ev
+
+    def mark_step(self) -> None:
+        if self._enabled:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self._steps.append(ev)
+
+    def fill(self, output: "PipelineOutput") -> "PipelineOutput":
+        """Populate ``stage_timings`` + the three public phases (seconds)."""
+        end = self._marks.get("end")
+        if not self._enabled or end is None:
+            return output
+        end.synchronize()
+        ms_to_s = 1.0 / 1000.0
+
+        def _dur(a: str, b: str) -> Optional[float]:
+            ea, eb = self._marks.get(a), self._marks.get(b)
+            if ea is None or eb is None:
+                return None
+            return float(ea.elapsed_time(eb)) * ms_to_s
+
+        per_step = []
+        prev = self._marks.get("denoise")
+        for ev in self._steps:
+            if prev is not None:
+                per_step.append(float(prev.elapsed_time(ev)) * ms_to_s)
+            prev = ev
+
+        output.stage_timings = {
+            "source_read": _dur("source_read", "vae_encode"),
+            "vae_encode": _dur("vae_encode", "conditioning"),
+            "conditioning": _dur("conditioning", "denoise"),
+            "denoise_total": _dur("denoise", "decode"),
+            "denoise_per_step": per_step,
+            "vae_decode": _dur("decode", "composite"),
+            "composite": _dur("composite", "end"),
+        }
+        # Public three-phase view (back-compatible): pre = source_read + encode +
+        # conditioning, denoise = the loop, post = decode + composite.
+        output.pre_denoise = _dur("source_read", "denoise") or 0.0
+        output.denoise = _dur("denoise", "decode") or 0.0
+        output.post_denoise = _dur("decode", "end") or 0.0
         return output
 
 

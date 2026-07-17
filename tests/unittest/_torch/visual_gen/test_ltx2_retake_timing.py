@@ -97,6 +97,58 @@ def test_aggregate_stages_skips_missing_keys():
 
 
 # --------------------------------------------------------------------------- #
+# cpu_io_seconds / aggregate_fine_stages
+# --------------------------------------------------------------------------- #
+
+
+def test_cpu_io_is_wall_minus_gpu_stages():
+    rec = {"wall": 2.0, "pre_denoise": 0.5, "denoise": 1.0, "post_denoise": 0.2}
+    # host-side remainder = 2.0 - (0.5 + 1.0 + 0.2) = 0.3
+    assert timing.cpu_io_seconds(rec) == pytest.approx(0.3)
+
+
+def test_cpu_io_clamps_negative_to_zero():
+    # If GPU-stage sum slightly exceeds wall (timer/sync skew), clamp at 0.
+    rec = {"wall": 1.0, "pre_denoise": 0.6, "denoise": 0.6, "post_denoise": 0.0}
+    assert timing.cpu_io_seconds(rec) == 0.0
+
+
+def test_cpu_io_treats_missing_stages_as_zero():
+    rec = {"wall": 1.5}
+    assert timing.cpu_io_seconds(rec) == 1.5
+
+
+def test_aggregate_fine_stages_summarizes_and_flattens_per_step():
+    records = [
+        {
+            "stage_timings": {
+                "vae_encode": 0.20,
+                "denoise_total": 1.0,
+                "denoise_per_step": [0.1, 0.12],
+            }
+        },
+        {
+            "stage_timings": {
+                "vae_encode": 0.24,
+                "denoise_total": 1.2,
+                "denoise_per_step": [0.11, 0.13],
+            }
+        },
+    ]
+    agg = timing.aggregate_fine_stages(records)
+    assert agg["vae_encode"]["min"] == 0.20
+    assert agg["denoise_total"]["count"] == 2
+    # per-step values are flattened across records (4 total).
+    assert agg["denoise_per_step"]["count"] == 4
+    assert agg["denoise_per_step"]["min"] == pytest.approx(0.1)
+
+
+def test_aggregate_fine_stages_handles_missing_stage_timings():
+    records = [{"wall": 1.0}, {"stage_timings": None}]
+    assert timing.aggregate_fine_stages(records) == {}
+
+
+# --------------------------------------------------------------------------- #
 # build_timeline
 # --------------------------------------------------------------------------- #
 

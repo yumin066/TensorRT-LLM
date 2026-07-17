@@ -43,7 +43,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-_STAGE_KEYS = ("wall", "pre_denoise", "denoise", "post_denoise")
+_STAGE_KEYS = ("wall", "pre_denoise", "denoise", "post_denoise", "cpu_io")
+_FINE_STAGE_KEYS = (
+    "source_read",
+    "vae_encode",
+    "conditioning",
+    "denoise_total",
+    "vae_decode",
+    "composite",
+)
 
 
 # ----------------------------------------------------------------------------
@@ -96,6 +104,41 @@ def aggregate_stages(records: list, stage_keys=_STAGE_KEYS) -> dict:
         samples = [r[key] for r in records if key in r and r[key] is not None]
         if samples:
             out[key] = summarize_samples(samples)
+    return out
+
+
+def cpu_io_seconds(record: dict) -> float:
+    """Host-side I/O / gap = ``wall - (pre_denoise + denoise + post_denoise)``.
+
+    CUDA events time GPU-stream stages only; the remainder of the synchronized
+    wall time (PyAV video decode, tensor moves, source-audio read) is host-side
+    and is reported explicitly rather than hidden inside a GPU phase.
+    """
+    gpu = (
+        (record.get("pre_denoise") or 0.0)
+        + (record.get("denoise") or 0.0)
+        + (record.get("post_denoise") or 0.0)
+    )
+    return max(0.0, record["wall"] - gpu)
+
+
+def aggregate_fine_stages(records: list, fine_keys=_FINE_STAGE_KEYS) -> dict:
+    """Summarize each fine ``stage_timings`` stage + flattened ``denoise_per_step``."""
+    out = {}
+    for key in fine_keys:
+        samples = [
+            r["stage_timings"][key]
+            for r in records
+            if r.get("stage_timings") and r["stage_timings"].get(key) is not None
+        ]
+        if samples:
+            out[key] = summarize_samples(samples)
+    steps = []
+    for r in records:
+        st = r.get("stage_timings") or {}
+        steps.extend(st.get("denoise_per_step") or [])
+    if steps:
+        out["denoise_per_step"] = summarize_samples(steps)
     return out
 
 
@@ -205,15 +248,16 @@ def main(argv=None) -> int:
         out = pipe.infer(request)
         _sync()
         wall = time.perf_counter() - w0
-        records.append(
-            {
-                "index": i,
-                "wall": wall,
-                "pre_denoise": float(out.pre_denoise),
-                "denoise": float(out.denoise),
-                "post_denoise": float(out.post_denoise),
-            }
-        )
+        rec = {
+            "index": i,
+            "wall": wall,
+            "pre_denoise": float(out.pre_denoise),
+            "denoise": float(out.denoise),
+            "post_denoise": float(out.post_denoise),
+            "stage_timings": out.stage_timings,
+        }
+        rec["cpu_io"] = cpu_io_seconds(rec)
+        records.append(rec)
         thwc = oracle._video_to_thwc_uint8(out.video)
         if first_thwc is None:
             first_thwc = thwc
@@ -234,10 +278,13 @@ def main(argv=None) -> int:
         }
 
     timeline = build_timeline(model_build_load, records)
+    _first, steady = split_measured(records)
+    steady_fine_stages = aggregate_fine_stages(steady)
     native_repo = oracle._git_info(str(Path(__file__).resolve().parents[2]))
     result = {
         "mode": "resident_warm_native_retake",
         "timeline": timeline,
+        "steady_warm_fine_stages": steady_fine_stages,
         "records": records,
         "warmup_iterations": max(0, args.warmup),
         "measured_iterations": args.measured,
@@ -260,9 +307,12 @@ def main(argv=None) -> int:
         "note": (
             "Resident warm (load-once, serve-many) native retake staged timing. "
             "first_served is reported separately from steady-warm p50/p90/min. "
-            "Mode-A (upstream every-rebuild) reference and the trtllm-serve HTTP "
-            "path are separate tools; denoise_per_step and the vae_encode/vae_decode "
-            "fine split are follow-ons."
+            "Per-sample cpu_io = wall - (pre_denoise + denoise + post_denoise) is "
+            "the host-side remainder (video decode, tensor moves, audio read). "
+            "steady_warm_fine_stages breaks the GPU phases into source_read / "
+            "vae_encode / conditioning / denoise_total / denoise_per_step / "
+            "vae_decode / composite. The Mode-A (upstream every-rebuild) reference "
+            "and the trtllm-serve HTTP path are separate tools."
         ),
     }
     (output_dir / "timing.json").write_text(

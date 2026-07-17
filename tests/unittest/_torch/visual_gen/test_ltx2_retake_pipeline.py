@@ -924,6 +924,50 @@ def test_ltx2_retake_routes_to_native_pre_post_by_default(monkeypatch):
     assert out.audio_sample_rate == 48000
 
 
+def test_ltx2_retake_infer_threads_stage_timer(monkeypatch):
+    # infer() must construct a stage timer, thread it into the native driver,
+    # have the driver mark the stage boundaries in order (plus one per-step mark
+    # per denoise step), and return the fill()-populated PipelineOutput. A fake
+    # recording timer captures the wiring without needing real CUDA events.
+    import tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake as retake_mod
+
+    pipeline, fake = _prepare_native_pre_post_pipeline(monkeypatch)
+
+    calls = {"marks": [], "steps": 0, "filled": 0}
+
+    class _RecordingTimer:
+        def mark(self, label):
+            calls["marks"].append(label)
+
+        def mark_step(self):
+            calls["steps"] += 1
+
+        def fill(self, output):
+            calls["filled"] += 1
+            output.stage_timings = {"denoise_total": 0.5}
+            return output
+
+    monkeypatch.setattr(retake_mod, "RetakeStageTimer", _RecordingTimer)
+
+    out = pipeline.infer(_native_pre_post_req())
+
+    # The timer was built, threaded through, and used to fill the output.
+    assert calls["filled"] == 1
+    assert out.stage_timings == {"denoise_total": 0.5}
+    # Fine stage boundaries are marked in the documented order.
+    assert calls["marks"] == [
+        "source_read",
+        "vae_encode",
+        "conditioning",
+        "denoise",
+        "decode",
+        "composite",
+        "end",
+    ]
+    # One per-step mark per denoise step actually executed.
+    assert calls["steps"] == fake.masked_step_calls
+
+
 def test_ltx2_retake_native_builds_two_sided_denoise_mask(monkeypatch):
     # fps=8, [1s, 2s) -> pixel window [8, 16); 25 frames -> 4 latent frames.
     # Latent window (1, 3) => leading (0,1) and trailing (3,4) context ranges.

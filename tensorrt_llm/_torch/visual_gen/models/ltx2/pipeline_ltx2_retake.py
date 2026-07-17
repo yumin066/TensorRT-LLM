@@ -33,7 +33,7 @@ from typing import Any, Optional
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput, RetakeStageTimer
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
@@ -756,11 +756,12 @@ class LTX2RetakePipeline(BasePipeline):
 
         if self._native is None:
             raise RuntimeError("LTX-2 native retake pipeline has not been loaded.")
-        # CUDA-event stage timing: the native driver marks pre/denoise/post
-        # boundaries so ``PipelineOutput`` carries per-stage seconds
-        # (pre_denoise = source read + VAE-encode + conditioning; denoise = the
-        # masked denoise loop; post_denoise = VAE-decode + composite-back).
-        timer = CudaPhaseTimer()
+        # Fine CUDA-event stage timing: the native driver marks each retake stage
+        # boundary so ``PipelineOutput`` carries both the three public phases and
+        # a fine ``stage_timings`` breakdown (source_read / vae_encode /
+        # conditioning / denoise_total / denoise_per_step / vae_decode /
+        # composite).
+        timer = RetakeStageTimer()
         video, audio, output_shape = self._run_native_pre_post_retake(
             req, extra, video_path, start_time, end_time, prompt, timer=timer
         )
@@ -981,11 +982,9 @@ class LTX2RetakePipeline(BasePipeline):
         generator = torch.Generator(device=device).manual_seed(seed)
 
         # ---- 1. Source read + validation --------------------------------
-        # Stage-timing boundary: pre_denoise spans source read + window
-        # VAE-encode + latent init + prompt/connector encode (everything up to
-        # the denoise loop). No-op on CPU.
+        # Stage-timing boundaries (no-op on CPU): source_read begins here.
         if timer is not None:
-            timer.mark_pre_start()
+            timer.mark("source_read")
         output_shape = self._get_videostream_metadata(video_path)
         num_frames = int(output_shape.frames)
         height = int(output_shape.height)
@@ -1011,7 +1010,11 @@ class LTX2RetakePipeline(BasePipeline):
         video_shape = VideoLatentShape.from_pixel_shape(
             pixel_shape, latent_channels=native.transformer_in_channels
         )
+        if timer is not None:
+            timer.mark("vae_encode")
         source_window_latents = native._encode_video_window(source_norm_5d).float()
+        if timer is not None:
+            timer.mark("conditioning")
         expected_latent_shape = tuple(video_shape.to_torch_shape())
         if tuple(source_window_latents.shape) != expected_latent_shape:
             raise ValueError(
@@ -1104,10 +1107,13 @@ class LTX2RetakePipeline(BasePipeline):
                 num_steps=num_steps,
                 text_cache=text_cache,
             )
+            # Per-step denoise boundary (records after each transformer step).
+            if timer is not None:
+                timer.mark_step()
             return denoised_video, {}
 
         if timer is not None:
-            timer.mark_denoise_start()
+            timer.mark("denoise")
         denoised_latents = native.denoise(
             latents=latents,
             scheduler=scheduler,
@@ -1118,9 +1124,9 @@ class LTX2RetakePipeline(BasePipeline):
         )
 
         # ---- 6. Native decode -------------------------------------------
-        # Stage-timing boundary: post_denoise spans VAE-decode + composite-back.
+        # Stage-timing boundary: decode (VAE-decode) begins here.
         if timer is not None:
-            timer.mark_post_start()
+            timer.mark("decode")
         video_latents_5d = native.video_patchifier.unpatchify(denoised_latents, video_shape).to(
             dtype
         )
@@ -1134,13 +1140,15 @@ class LTX2RetakePipeline(BasePipeline):
 
         # ---- 7. Composite regenerated window back into the source -------
         regenerated_pixel_window = decoded[:, pixel_start:pixel_end]
+        if timer is not None:
+            timer.mark("composite")
         composited_video = _composite_retake_window(
             source_uint8, regenerated_pixel_window, pixel_start, pixel_end
         ).contiguous()
         # End of the GPU stage timeline (decode + composite). Source-audio read
         # below is host-side I/O and stays out of the CUDA phase measurement.
         if timer is not None:
-            timer.mark_end()
+            timer.mark("end")
 
         # ---- 8. Source audio passthrough --------------------------------
         source_audio = self._read_source_audio(video_path, device)
