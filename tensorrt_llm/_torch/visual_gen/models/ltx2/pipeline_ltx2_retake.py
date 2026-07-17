@@ -1107,10 +1107,16 @@ class LTX2RetakePipeline(BasePipeline):
                 num_steps=num_steps,
                 text_cache=text_cache,
             )
-            # Per-step denoise boundary (records after each transformer step).
+            return denoised_video, {}
+
+        def retake_post_step_fn(step_latents):
+            # Per-step denoise boundary: recorded AFTER the scheduler step
+            # completes (``denoise`` applies ``post_step_fn`` once per timestep,
+            # after ``_scheduler_step``), so each interval is exactly one
+            # completed denoise-loop iteration. Passthrough (no latent change).
             if timer is not None:
                 timer.mark_step()
-            return denoised_video, {}
+            return step_latents
 
         if timer is not None:
             timer.mark("denoise")
@@ -1121,6 +1127,7 @@ class LTX2RetakePipeline(BasePipeline):
             guidance_scale=1.0,
             forward_fn=retake_forward_fn,
             timesteps=timesteps,
+            post_step_fn=retake_post_step_fn,
         )
 
         # ---- 6. Native decode -------------------------------------------

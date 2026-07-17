@@ -809,6 +809,7 @@ class _FakeNativeCompanion:
         self.built_mask_ranges = None
         self.masked_step_calls = 0
         self.denoise_calls = 0
+        self.num_timesteps = 0
         self.clean_latent_seen = None
         self.encode_shape_override = None
 
@@ -853,11 +854,27 @@ class _FakeNativeCompanion:
         assert text_cache == "native_text_cache"
         return v_latents, None
 
-    def denoise(self, latents, scheduler, prompt_embeds, guidance_scale, forward_fn, timesteps):
+    def denoise(
+        self,
+        latents,
+        scheduler,
+        prompt_embeds,
+        guidance_scale,
+        forward_fn,
+        timesteps,
+        post_step_fn=None,
+    ):
         self.denoise_calls += 1
+        self.num_timesteps = len(timesteps)
         assert guidance_scale == 1.0
-        out, extra = forward_fn(latents, {}, 0, timesteps[0], prompt_embeds, {})
-        assert extra == {}
+        out = latents
+        # Mirror BasePipeline.denoise: one forward per timestep, then the
+        # post-step hook AFTER the (simulated) scheduler step, once per step.
+        for i, t in enumerate(timesteps):
+            out, extra = forward_fn(out, {}, i, t, prompt_embeds, {})
+            assert extra == {}
+            if post_step_fn is not None:
+                out = post_step_fn(out)
         return out
 
 
@@ -917,7 +934,9 @@ def test_ltx2_retake_routes_to_native_pre_post_by_default(monkeypatch):
     out = pipeline.infer(_native_pre_post_req())
 
     assert fake.denoise_calls == 1
-    assert fake.masked_step_calls == 1  # native masked-denoise seam invoked
+    # native masked-denoise seam invoked once per timestep (distilled schedule).
+    assert fake.masked_step_calls == fake.num_timesteps
+    assert fake.num_timesteps > 1
     assert out.video.dtype == torch.uint8
     assert out.video.shape == (1, 25, 32, 32, 3)
     assert out.frame_rate == 8.0
@@ -964,8 +983,11 @@ def test_ltx2_retake_infer_threads_stage_timer(monkeypatch):
         "composite",
         "end",
     ]
-    # One per-step mark per denoise step actually executed.
-    assert calls["steps"] == fake.masked_step_calls
+    # Exactly one per-step mark per COMPLETED denoise iteration (marked by the
+    # post_step_fn after each scheduler step), so a single-forward fake cannot
+    # satisfy this.
+    assert calls["steps"] == fake.num_timesteps
+    assert fake.num_timesteps > 1
 
 
 def test_ltx2_retake_native_builds_two_sided_denoise_mask(monkeypatch):
