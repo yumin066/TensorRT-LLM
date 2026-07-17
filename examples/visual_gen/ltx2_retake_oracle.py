@@ -563,6 +563,7 @@ def build_pipeline(
     extra_overrides=None,
     cuda_graph_enable=False,
     quant_algo=None,
+    torch_compile_enable=False,
 ):
     """Build and load an LTX-2 retake pipeline (native or upstream-stage).
 
@@ -570,13 +571,16 @@ def build_pipeline(
     can flip ``retake_use_upstream_stage`` to select the preserved oracle path
     while every other setting stays identical.
 
-    ``cuda_graph_enable`` and ``quant_algo`` drive the config-driven native
-    acceleration axes for the smoke matrix; both default off, so the oracle's own
-    bf16/VANILLA/no-graph call is unchanged. ``quant_algo`` (e.g. ``"NVFP4"``)
-    enables the native runtime dynamic-quant path (`DynamicLinearWeightLoader`
-    keys on the transformer model config's ``dynamic_weight_quant``), so the
-    quant config is threaded onto both the transformer model config and the
-    pipeline config.
+    ``cuda_graph_enable``, ``quant_algo``, and ``torch_compile_enable`` drive the
+    config-driven native acceleration axes for the smoke / gating matrices; all
+    default off, so the oracle's own bf16/VANILLA/no-graph/no-compile call is
+    unchanged. ``quant_algo`` (e.g. ``"NVFP4"``) enables the native runtime
+    dynamic-quant path (`DynamicLinearWeightLoader` keys on the transformer model
+    config's ``dynamic_weight_quant``), so the quant config is threaded onto both
+    the transformer model config and the pipeline config. ``torch_compile_enable``
+    flips the pipeline ``torch_compile.enable`` acceleration axis (and, when the
+    ``TorchCompileConfig`` exposes them, requests full-graph compilation with
+    autotune off for a stable warm-latency measurement).
     """
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
@@ -621,6 +625,12 @@ def build_pipeline(
     )
     pipeline_config.attention.backend = attention_backend
     pipeline_config.cuda_graph.enable = cuda_graph_enable
+    if torch_compile_enable:
+        pipeline_config.torch_compile.enable = True
+        if hasattr(pipeline_config.torch_compile, "enable_fullgraph"):
+            pipeline_config.torch_compile.enable_fullgraph = True
+        if hasattr(pipeline_config.torch_compile, "enable_autotune"):
+            pipeline_config.torch_compile.enable_autotune = False
     pipe = LTX2RetakePipeline(pipeline_config)
     pipe.load_standard_components(checkpoint, device, text_encoder_path=gemma)
     pipe.load_weights(pipe.load_transformer_weights(checkpoint))
