@@ -624,6 +624,17 @@ def build_pipeline(
         **pipeline_config_kwargs,
     )
     pipeline_config.attention.backend = attention_backend
+    # The transformer's attention modules read ``model_config.attention.backend``
+    # (``build_ltx2_transformer`` builds the LTXModel from
+    # ``model_configs["transformer"]``); the pipeline-level attention config alone
+    # never reaches them, so an FA4 / CUTEDSL request would silently fall back to
+    # the default VANILLA (PyTorch SDPA) kernels. Set the model-level backend too
+    # so the attention backend is a REAL measured axis rather than a config flag.
+    _txf_mc = pipeline_config.model_configs["transformer"]
+    try:
+        _txf_mc.attention.backend = attention_backend
+    except (AttributeError, TypeError, ValueError):
+        _txf_mc.attention = _txf_mc.attention.model_copy(update={"backend": attention_backend})
     pipeline_config.cuda_graph.enable = cuda_graph_enable
     if torch_compile_enable:
         pipeline_config.torch_compile.enable = True
