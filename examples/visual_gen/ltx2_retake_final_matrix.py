@@ -64,8 +64,10 @@ def amortization(
     """Mode B (resident) vs Mode A (every-rebuild) amortization.
 
     Mode B cost for N calls = ``cold_load + N*warm``; Mode A = ``N*every_rebuild``.
-    Returns the break-even N where Mode B first wins (``ceil(cold_load /
-    (every_rebuild - warm))``) and the per-call and 100-call ratios.
+    Returns the break-even N — the smallest N where Mode B is STRICTLY cheaper
+    (``N > cold_load / (every_rebuild - warm)`` → ``floor(...) + 1``; ``ceil``
+    would return the tie point when the ratio is an exact integer) — and the
+    per-call and 100-call ratios.
     """
     if not cold_load_s or not warm_s or not every_rebuild_s:
         return {"break_even_calls": None, "per_call_speedup": None, "ratio_100_calls": None}
@@ -75,7 +77,7 @@ def amortization(
             "per_call_speedup": speedup(every_rebuild_s, warm_s),
             "ratio_100_calls": None,
         }
-    break_even = math.ceil(cold_load_s / (every_rebuild_s - warm_s))
+    break_even = math.floor(cold_load_s / (every_rebuild_s - warm_s)) + 1
     mode_b_100 = cold_load_s + 100 * warm_s
     mode_a_100 = 100 * every_rebuild_s
     return {
@@ -106,7 +108,12 @@ def build_latency_section(
     cold_load = _p50(timing, "timeline", "cold_model_build_load_seconds") if timing else None
     if cold_load is None and mode_a_load is not None:
         cold_load = mode_a_load
-    amort = amortization(cold_load, warm_wall or serve_gen, mode_a_total)
+    # Prefer a WALL time for the amortization (production Mode B is measured by
+    # wall latency, incl. HTTP/serialization): pipeline-direct wall, then serve
+    # HTTP wall, and only fall back to engine ``generation`` (which excludes HTTP
+    # overhead and would make the break-even optimistic) if no wall time exists.
+    warm_for_amort = warm_wall or serve_wall or serve_gen
+    amort = amortization(cold_load, warm_for_amort, mode_a_total)
     return {
         "mode_a_every_rebuild_total_p50_s": mode_a_total,
         "mode_b_serve_http_wall_p50_s": serve_wall,

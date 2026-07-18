@@ -44,6 +44,13 @@ def test_amortization_break_even_and_ratios():
     assert a["ratio_100_calls"] == pytest.approx(8330 / 273, abs=0.5)
 
 
+def test_amortization_break_even_strict_on_integer_ratio():
+    # cold 100, warm 1, rebuild 51 -> ratio = 100/50 = 2.0 exactly. At N=2 the two
+    # are a TIE, so the first STRICT win is N=3 (floor(2.0)+1), not ceil(2.0)=2.
+    a = fm.amortization(100.0, 1.0, 51.0)
+    assert a["break_even_calls"] == 3
+
+
 def test_amortization_none_on_missing():
     a = fm.amortization(None, 1.0, 83.0)
     assert a["break_even_calls"] is None
@@ -71,6 +78,16 @@ def test_build_latency_section_extracts_and_records_gaps():
     assert sec["mode_b_cold_load_s"] == 90.0
     assert sec["amortization"]["break_even_calls"] == 2
     assert sec["gaps"] == []
+
+
+def test_build_latency_amortization_prefers_wall_over_generation():
+    # No pipeline-direct timing; serve has both wall + generation. The amortization
+    # must use the serve WALL (incl. HTTP overhead), not the optimistic generation.
+    mode_a = {"summary": {"total": {"p50": 83.3}, "model_build_load": {"p50": 68.0}}}
+    serve = {"steady_warm": {"wall": {"p50": 2.12}, "generation": {"p50": 1.73}}}
+    sec = fm.build_latency_section(mode_a, serve, None)
+    # per_call_speedup = 83.3 / warm; wall(2.12) -> 39.3, generation(1.73) -> 48.2.
+    assert sec["amortization"]["per_call_speedup"] == pytest.approx(83.3 / 2.12, abs=0.1)
 
 
 def test_build_latency_section_falls_back_to_mode_a_load_and_flags_gaps():

@@ -376,6 +376,14 @@ def _run_single_backend(args) -> int:
     except Exception as exc:  # noqa: BLE001 - per-backend isolation: record + continue
         error_reason = f"{type(exc).__name__}: {exc}"
 
+    # A CUTEDSL head-dim cubin rejection is a capability limit, not a runtime
+    # error: the video attention is head_dim=128 (passes the precheck) but the
+    # LTX-2 AudioVideo model also builds audio attention at head_dim=64, which
+    # the cubins reject during the forward. Reclassify it as ``unsupported`` so
+    # the status taxonomy matches reality (eligible-but-crashed vs ineligible).
+    if error_reason and "require head_dim" in error_reason.lower():
+        supported, precheck_reason = False, error_reason
+
     status, reason = classify_backend_status(supported, precheck_reason, ran_ok, error_reason)
     result = {
         "backend": backend,
