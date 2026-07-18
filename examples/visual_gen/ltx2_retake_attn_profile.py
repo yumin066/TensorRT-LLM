@@ -220,6 +220,23 @@ def backend_delta(baseline_p50: Optional[float], p50: Optional[float]) -> dict:
     }
 
 
+def reclassify_cutedsl_capability_error(
+    supported: bool, precheck_reason: Optional[str], error_reason: Optional[str]
+) -> tuple:
+    """Fold a CUTEDSL head-dim cubin rejection into ``(supported, precheck_reason)``.
+
+    The CUTEDSL precheck only sees the video attention head_dim (128, which
+    passes), but the LTX-2 AudioVideo model also builds audio attention at
+    head_dim=64, which the cubins reject during the forward. That raises at
+    runtime and would otherwise be recorded as ``error`` — but it is a capability
+    limit, not a crash, so map it to ``unsupported``. Returns the (possibly
+    updated) ``(supported, precheck_reason)`` pair.
+    """
+    if error_reason and "require head_dim" in error_reason.lower():
+        return False, error_reason
+    return supported, precheck_reason
+
+
 def classify_backend_status(
     supported: bool,
     precheck_reason: Optional[str],
@@ -377,13 +394,11 @@ def _run_single_backend(args) -> int:
         error_reason = f"{type(exc).__name__}: {exc}"
 
     # A CUTEDSL head-dim cubin rejection is a capability limit, not a runtime
-    # error: the video attention is head_dim=128 (passes the precheck) but the
-    # LTX-2 AudioVideo model also builds audio attention at head_dim=64, which
-    # the cubins reject during the forward. Reclassify it as ``unsupported`` so
-    # the status taxonomy matches reality (eligible-but-crashed vs ineligible).
-    if error_reason and "require head_dim" in error_reason.lower():
-        supported, precheck_reason = False, error_reason
-
+    # error — fold it into (supported, precheck_reason) so it classifies as
+    # ``unsupported`` rather than ``error``.
+    supported, precheck_reason = reclassify_cutedsl_capability_error(
+        supported, precheck_reason, error_reason
+    )
     status, reason = classify_backend_status(supported, precheck_reason, ran_ok, error_reason)
     result = {
         "backend": backend,

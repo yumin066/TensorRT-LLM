@@ -144,6 +144,35 @@ def test_classify_error_keeps_run_reason():
 
 
 # --------------------------------------------------------------------------- #
+# reclassify_cutedsl_capability_error (head_dim cubin failure -> unsupported)
+# --------------------------------------------------------------------------- #
+
+
+def test_cutedsl_head_dim_error_reclassified_unsupported():
+    # A runtime head_dim cubin rejection (audio attention head_dim=64) is a
+    # capability limit, so it folds into supported=False -> classifies as
+    # ``unsupported``, not ``error``.
+    reason = "ValueError: CUTEDSL cubins require head_dim=128, got head_dim=64."
+    supported, precheck = prof.reclassify_cutedsl_capability_error(True, None, reason)
+    assert supported is False and precheck == reason
+    status, _ = prof.classify_backend_status(supported, precheck, False, reason)
+    assert status == "unsupported"
+
+
+def test_reclassify_leaves_other_errors_as_error():
+    # A non-capability runtime error stays supported=True -> classifies as error.
+    reason = "RuntimeError: 'NoneType' object has no attribute '_trait'"
+    supported, precheck = prof.reclassify_cutedsl_capability_error(True, None, reason)
+    assert supported is True and precheck is None
+    status, _ = prof.classify_backend_status(supported, precheck, False, reason)
+    assert status == "error"
+
+
+def test_reclassify_noop_when_no_error():
+    assert prof.reclassify_cutedsl_capability_error(True, None, None) == (True, None)
+
+
+# --------------------------------------------------------------------------- #
 # summarize_profile (deltas vs VANILLA baseline)
 # --------------------------------------------------------------------------- #
 
