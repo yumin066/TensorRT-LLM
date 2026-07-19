@@ -545,15 +545,15 @@ def main():
         retake_meta = ffprobe(Path(r["retake_mp4"]))
         is_trt = r["kind"] in ("native", "serve")
         checks = {}
-        # AC-7 (TRT retake is video-only) applies to native/serve variants; the
-        # upstream RetakePipeline legitimately passes source audio through its retake.
+        # the audio-source check (TRT retake is video-only) applies to native/serve variants;
+        # the upstream RetakePipeline legitimately passes source audio through its retake.
         if is_trt:
             checks["retake_video_only"] = retake_meta.get("has_audio") is False
         else:
             checks["retake_video_only"] = "n/a (upstream retake carries source audio)"
         checks["final_has_audio"] = final_meta.get("has_audio") is True
-        # AC-7: prove final audio DERIVES from edited (decoded content), not the
-        # external retake. final is edited's audio re-encoded to AAC + truncated
+        # prove final audio DERIVES from edited (decoded content), not the external
+        # retake. final is edited's audio re-encoded to AAC + truncated
         # (-shortest), so require: final duration <= edited (+tol), and the decoded
         # overlapping content is highly correlated with edited (not TRT audio).
         asim = audio_similarity(fdir / "final.mp4", fdir / "edited_full.mp4")

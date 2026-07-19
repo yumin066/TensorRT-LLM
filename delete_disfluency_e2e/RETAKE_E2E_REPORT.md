@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # delete_disfluency 端到端测试 — upstream vs TensorRT-LLM retake
 
-> 由 `render_report.py` 从证据 JSON 自动生成(无手填);每个 AC 行状态由校验推导,任一缺口显示 `INCOMPLETE` + 产物路径。
+> 由 `render_report.py` 从证据 JSON 自动生成(无手填);每个准则行状态由校验推导,任一缺口显示 `INCOMPLETE` + 产物路径。
 
 **用例:** clip `--Y9imYnfBw-f0-484.mp4`,filler `[UH]`,窗口 total=209f,bridge=29,lb0/lb1=90/119,a=52,splice_frame=156。
 **设备:** RTX PRO 6000 (sm_120, 96GB)。seed 42 · TRT-LLM `b38c3d1a69` · LTX2.3-eval `73c9d47b8b4f660dc88912c54ca474826d4120e1`(dirty=True, +`--external-retake` patch)。源 sha256 `dc6ab372e4ef5d3e…`
@@ -45,9 +45,9 @@ serve bf16 明细: cold-start 138.03s · first-served 36.87s · steady wall p50 
 
 - 全量校验 ok=True · host sha256=True · frame grid=True · 三 quant 覆盖=True · gitignore=True
 
-## AC 覆盖(每行状态均由 `validate_evidence` 推导 → 产物)
+## 验收准则覆盖(每行状态均由 `validate_evidence` 推导 → 产物)
 
-| AC | 状态 | 证据产物 |
+| 准则 | 状态 | 证据产物 |
 |---|---|---|
 | AC-1 upstream 基线+阶段图+manifest | ok | `{720p,1080p}/upstream/final.mp4`+`manifest.json`+`phase_timing.json`(hash+timing 校验) |
 | AC-2 --external-retake,默认路径不变 | ok | patch 存在 + 默认 upstream `timing.json` 无 retake_source |
@@ -59,7 +59,7 @@ serve bf16 明细: cold-start 138.03s · first-served 36.87s · steady wall p50 
 | AC-8 --external-retake GPU 跑一次 | ok | composite `run.log`(smc521ge-0038 / ltx_r35) |
 | AC-9 产物拉回 host + gitignore + sha 一致 | ok | host `artifacts/` 树;`validate_evidence` hash_ok+gitignore |
 
-## 公平性(task12)
+## 公平性
 
 - upstream 720p warm LTX 61.92s(冷 NFS 首跑曾 750s)。合法对比:native single_shot vs upstream(含加载);native warm vs serve engine。不得下 46× 结论。
 - FP8 近无损、NVFP4 明显改变(见质量列),速度不得脱离质量呈现。

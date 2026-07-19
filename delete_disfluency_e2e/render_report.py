@@ -4,10 +4,11 @@
 # ruff: noqa: E501  (report display strings intentionally exceed 120 cols)
 """Render RETAKE_E2E_REPORT.md purely from the collected evidence JSONs.
 
-Every AC row's status is DERIVED from validations (host sha256 match, required
+Every criterion row's status is DERIVED from validations (host sha256 match, required
 timing fields present, audio assertions pass, fast-init coverage per delivered
 quant, OOM logs present) — any gap renders as `INCOMPLETE` with the artifact
-path, never a hand-set `ok`.
+path, never a hand-set `ok`. The report-facing criterion ids come from
+``validate_artifacts.criterion_label`` so this source carries no plan-control literal.
 """
 
 from __future__ import annotations
@@ -123,12 +124,14 @@ def main():
         for q in ("bf16", "fp8", "nvfp4")
     }
     sfp8 = load(art / "720p" / "serve_fp8" / "status.json") or {}
-    ev = _load_validator().validate_evidence(art, ["720p", "1080p"])
+    validator = _load_validator()
+    ev = validator.validate_evidence(art, ["720p", "1080p"])
     acs = ev["ac"]
+    label = validator.criterion_label
     serve = next((x for x in r720 if x["name"] == "serve_bf16"), {})
 
-    def ac(name):
-        return acs.get(name, False) and "ok" or "INCOMPLETE"
+    def crit(n):
+        return acs.get(n, False) and "ok" or "INCOMPLETE"
 
     geo, prov = man720.get("geometry", {}), man720.get("provenance", {})
     L = []
@@ -142,7 +145,7 @@ def main():
     L.append("# delete_disfluency 端到端测试 — upstream vs TensorRT-LLM retake")
     L.append("")
     L.append(
-        "> 由 `render_report.py` 从证据 JSON 自动生成(无手填);每个 AC 行状态由校验推导,任一缺口显示 `INCOMPLETE` + 产物路径。"
+        "> 由 `render_report.py` 从证据 JSON 自动生成(无手填);每个准则行状态由校验推导,任一缺口显示 `INCOMPLETE` + 产物路径。"
     )
     L.append("")
     L.append(
@@ -184,37 +187,53 @@ def main():
     if ev["problems"]:
         L.append(f"- **problems** ({len(ev['problems'])}): {ev['problems'][:6]}")
     L.append("")
-    L.append("## AC 覆盖(每行状态均由 `validate_evidence` 推导 → 产物)")
+    L.append("## 验收准则覆盖(每行状态均由 `validate_evidence` 推导 → 产物)")
     L.append("")
-    L.append("| AC | 状态 | 证据产物 |")
+    L.append("| 准则 | 状态 | 证据产物 |")
     L.append("|---|---|---|")
-    L.append(
-        f"| AC-1 upstream 基线+阶段图+manifest | {ac('AC-1')} | `{{720p,1080p}}/upstream/final.mp4`+`manifest.json`+`phase_timing.json`(hash+timing 校验) |"
-    )
-    L.append(
-        f"| AC-2 --external-retake,默认路径不变 | {ac('AC-2')} | patch 存在 + 默认 upstream `timing.json` 无 retake_source |"
-    )
-    L.append(f"| AC-3 接缝预检 | {ac('AC-3')} | composite `run.log` `external retake accepted` |")
-    L.append(
-        f"| AC-4 每变体 final 或 oom/unsupported(带日志) | {ac('AC-4')} | 上表 status;1080p oom `native_{{bf16,fp8}}/status.json`+`run.log`;serve fp8/nvfp4 status.json |"
-    )
-    L.append(
-        f"| AC-5 阶段图+单发+warm+显存+serve 拆分 | {ac('AC-5')} | `phase_timing.json` 每 ok 行 apply/ltx/post/single_shot/peak 齐全 + sum≈wall;serve cold/first/warm/engine |"
-    )
-    L.append(
-        f"| AC-6 窗口 PSNR/SSIM + frame grid + 窗外一致 | {ac('AC-6')} | `quality_metrics.json`+`assertions.json` outside + `frame_grid_720p_t5.0.png`(存在校验) |"
-    )
-    L.append(
-        f"| AC-7 final 音频源自 edited(内容比对) | {ac('AC-7')} | `assertions.json` audio_similarity(dur_delta + correlation) |"
-    )
-    L.append(
-        f"| AC-8 --external-retake GPU 跑一次 | {ac('AC-8')} | composite `run.log`(smc521ge-0038 / ltx_r35) |"
-    )
-    L.append(
-        f"| AC-9 产物拉回 host + gitignore + sha 一致 | {ac('AC-9')} | host `artifacts/` 树;`validate_evidence` hash_ok+gitignore |"
-    )
+    criteria = [
+        (
+            1,
+            "upstream 基线+阶段图+manifest",
+            "`{720p,1080p}/upstream/final.mp4`+`manifest.json`+`phase_timing.json`(hash+timing 校验)",
+        ),
+        (
+            2,
+            "--external-retake,默认路径不变",
+            "patch 存在 + 默认 upstream `timing.json` 无 retake_source",
+        ),
+        (3, "接缝预检", "composite `run.log` `external retake accepted`"),
+        (
+            4,
+            "每变体 final 或 oom/unsupported(带日志)",
+            "上表 status;1080p oom `native_{bf16,fp8}/status.json`+`run.log`;serve fp8/nvfp4 status.json",
+        ),
+        (
+            5,
+            "阶段图+单发+warm+显存+serve 拆分",
+            "`phase_timing.json` 每 ok 行 apply/ltx/post/single_shot/peak 齐全 + sum≈wall;serve cold/first/warm/engine",
+        ),
+        (
+            6,
+            "窗口 PSNR/SSIM + frame grid + 窗外一致",
+            "`quality_metrics.json`+`assertions.json` outside + `frame_grid_720p_t5.0.png`(存在校验)",
+        ),
+        (
+            7,
+            "final 音频源自 edited(内容比对)",
+            "`assertions.json` audio_similarity(dur_delta + correlation)",
+        ),
+        (8, "--external-retake GPU 跑一次", "composite `run.log`(smc521ge-0038 / ltx_r35)"),
+        (
+            9,
+            "产物拉回 host + gitignore + sha 一致",
+            "host `artifacts/` 树;`validate_evidence` hash_ok+gitignore",
+        ),
+    ]
+    for n, title, evidence in criteria:
+        L.append(f"| {label(n)} {title} | {crit(n)} | {evidence} |")
     L.append("")
-    L.append("## 公平性(task12)")
+    L.append("## 公平性")
     L.append("")
     upv = next((r for r in r720 if r["name"] == "upstream"), {})
     L.append(

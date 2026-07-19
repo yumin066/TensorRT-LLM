@@ -67,7 +67,7 @@ def test_real_bundle_passes():
 def test_missing_required_variant_row_fails(bundle):
     _patch(bundle / "720p" / "manifest.json", lambda d: d["variant_status"].pop("serve_bf16"))
     ev = _ev(bundle)
-    assert ev["ac"]["AC-4"] is False
+    assert ev["ac"][4] is False
     assert ev["ok"] is False
 
 
@@ -77,7 +77,7 @@ def test_native_missing_ltx_seconds_fails(bundle):
         lambda d: d["variants"]["native_fp8"].pop("ltx_seconds"),
     )
     ev = _ev(bundle)
-    assert ev["ac"]["AC-5"] is False
+    assert ev["ac"][5] is False
 
 
 def test_quality_status_only_fails(bundle):
@@ -86,7 +86,7 @@ def test_quality_status_only_fails(bundle):
         lambda d: d["variants"].__setitem__("native_fp8", {"status": "ok"}),
     )
     ev = _ev(bundle)
-    assert ev["ac"]["AC-6"] is False
+    assert ev["ac"][6] is False
 
 
 def test_bad_ffprobe_geometry_fails(bundle):
@@ -95,13 +95,13 @@ def test_bad_ffprobe_geometry_fails(bundle):
 
     _patch(bundle / "720p" / "quality_metrics.json", bad)
     ev = _ev(bundle)
-    assert ev["ac"]["AC-6"] is False
+    assert ev["ac"][6] is False
 
 
 def test_contradictory_non_ok_status_fails(bundle):
     _patch(bundle / "720p" / "serve_fp8" / "status.json", lambda d: d.__setitem__("status", "ok"))
     ev = _ev(bundle)
-    assert ev["ac"]["AC-4"] is False
+    assert ev["ac"][4] is False
 
 
 @pytest.mark.parametrize("field", ["status", "mode", "quant"])
@@ -111,7 +111,7 @@ def test_phase_identity_missing_fails(bundle, field):
         lambda d: d["variants"]["native_fp8"].pop(field),
     )
     ev = _ev(bundle)
-    assert ev["ac"]["AC-5"] is False
+    assert ev["ac"][5] is False
 
 
 def test_non_ok_phase_identity_missing_fails(bundle):
@@ -120,7 +120,7 @@ def test_non_ok_phase_identity_missing_fails(bundle):
         lambda d: d["variants"]["serve_fp8"].pop("status"),
     )
     ev = _ev(bundle)
-    assert ev["ac"]["AC-5"] is False
+    assert ev["ac"][5] is False
 
 
 def test_weak_oom_diagnostic_fails(bundle):
@@ -132,7 +132,7 @@ def test_weak_oom_diagnostic_fails(bundle):
     _patch(bundle / "1080p" / "native_bf16" / "status.json", weak)
     (bundle / "1080p" / "native_bf16" / "run.log").write_text("startup ok\ninference done\n")
     ev = _ev(bundle)
-    assert ev["ac"]["AC-4"] is False
+    assert ev["ac"][4] is False
 
 
 def test_weak_unsupported_diagnostic_fails(bundle):
@@ -144,14 +144,14 @@ def test_weak_unsupported_diagnostic_fails(bundle):
     _patch(bundle / "720p" / "serve_fp8" / "status.json", weak)
     (bundle / "720p" / "serve_fp8" / "run.log").write_text("startup ok\nserved request\n")
     ev = _ev(bundle)
-    assert ev["ac"]["AC-4"] is False
+    assert ev["ac"][4] is False
 
 
 def test_non_ignored_artifact_path_fails(tmp_path):
     dst = tmp_path / "artifacts"
     shutil.copytree(ART, dst, ignore=shutil.ignore_patterns(".mut"))
     ev = _ev(dst)
-    assert ev["ac"]["AC-9"] is False
+    assert ev["ac"][9] is False
     assert ev["ok"] is False
 
 
