@@ -97,6 +97,56 @@ def rows(art: Path, res: str):
     return man, out
 
 
+def substage_section(art: Path):
+    """LTX sub-stage breakdown (§2-aligned): upstream every-rebuild vs warm native FP8."""
+    up = (load(art / "720p" / "upstream_substage" / "upstream_substage_timing.json") or {}).get(
+        "ltx_substage"
+    )
+    nv = (load(art / "720p" / "native_fp8" / "variant.json") or {}).get("ltx_substage")
+    if not up or not nv:
+        return []
+
+    def c(v):
+        return "N/A" if v is None else _n(v)
+
+    spec = [
+        ("subprocess_start", "python + torch/CUDA import(一次性)"),
+        ("model_load", "载 22B transformer + VAE + Gemma"),
+        ("video_vae_encode", "条件视频 → latent(upstream 含 VAE 加载¹)"),
+        ("audio_vae_encode", "编辑音频 → latent(native 纯视频 → N/A)"),
+        ("text_encode", "Gemma(upstream 含 Gemma 加载¹)"),
+        ("diffusion", "**瓶颈**:8 步 Euler 去噪(upstream 含 22B 加载¹)"),
+        ("video_vae_decode", "latent → 像素(upstream 流式,折入 mp4)"),
+        ("audio_vae_decode", "latent → 波形(native 纯视频 → N/A)"),
+        ("mp4_encode", "libx264 编码"),
+    ]
+    L = [
+        "## LTX 阶段图细分(§2 对齐 · 720p · upstream 每次重建 vs 常驻 native FP8 warm)",
+        "",
+        "| LTX 子阶段 | upstream(fp8-cast,单发) | native FP8(常驻 warm) | 说明 |",
+        "|---|---|---|---|",
+    ]
+    for k, desc in spec:
+        uv, nv_v = c(up.get(k)), c(nv.get(k))
+        if k == "model_load":
+            uv, nv_v = "0.03(惰性¹)", "≈88(一次性²)"
+        L.append(f"| {k} | {uv} | {nv_v} | {desc} |")
+    L.append(
+        f"| **LTX wall** | **{c(up.get('ltx_wall'))}** | **{c(nv.get('ltx_wall_p50'))}** | upstream 每次重建(含加载);native warm 常驻 |"
+    )
+    L.append("")
+    L.append(
+        "*单位秒。**upstream 权重惰性加载**:构造阶段 model_load≈0,各计算阶段首次调用才把对应权重载入 —— "
+        "¹22B transformer 折入 `diffusion`(44.3s = 加载 + 8 步去噪)、Gemma 折入 `text_encode`、VAE 折入 `video_vae_encode`。"
+        "**native FP8 常驻 warm**:权重已在显存,各阶段为纯计算(`diffusion` 24.2s 为纯 8 步去噪),²model_load 仅 server 启动时一次"
+        "(此次 NFS 冷启容器测得 760s,页缓存热约 88s;不计入 warm wall)。"
+        "故 native warm 相对 upstream 的 67→31s(2.2×)提速,既来自免去每次重建的权重加载,也来自 FP8 计算更快。"
+        "upstream 的 video/audio VAE 解码流式化,真实开销折入 `mp4_encode`;native 纯视频路径无 audio VAE。设备 RTX PRO 6000(非 §2 的 H100)。*"
+    )
+    L.append("")
+    return L
+
+
 def table(res_rows):
     L = [
         "| variant | status | APPLY | LTX | POST | single-shot | warm p50 | peak GiB | win PSNR/SSIM vs upstream | assert |",
@@ -175,6 +225,7 @@ def main():
         f"*serve 仅 720p 表征。serve FP8/NVFP4 = `unsupported`,证据 `artifacts/720p/serve_{{fp8,nvfp4}}/status.json`+`run.log`:`{g(sfp8, 'error_excerpt')[:110]}…`*"
     )
     L.append("")
+    L.extend(substage_section(art))
     L.append("## fast-init 安全性(每交付 quant)")
     L.append("")
     for q in ("bf16", "fp8", "nvfp4"):

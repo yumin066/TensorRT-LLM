@@ -16,7 +16,15 @@ import sys
 import time
 from pathlib import Path
 
+# process-entry marker for the subprocess-start (python + torch import) stage
+_PROC_START = time.time()
+
 QUANT = {"bf16": None, "fp8": "FP8", "nvfp4": "NVFP4"}
+
+
+def _p50(xs):
+    xs = sorted(x for x in xs if isinstance(x, (int, float)))
+    return round(xs[len(xs) // 2], 4) if xs else None
 
 
 def load_oracle(repo):
@@ -199,25 +207,53 @@ def main():
 
     torch.cuda.reset_peak_memory_stats()
     times = []
+    stage_samples: dict = {}  # native LTX sub-stage (CUDA-event) -> list of warm seconds
     video = fps = None
     first_infer_s = None
     for i in range(args.measured + 1):
         torch.cuda.synchronize()
         t0 = time.time()
-        video, _audio, fps, _asr = oracle._run_pipeline(pipe, req)
+        # call infer directly (not oracle._run_pipeline) so the pipeline's
+        # RetakeStageTimer breakdown on the output is preserved
+        out = pipe.infer(req)
         torch.cuda.synchronize()
         dt = time.time() - t0
+        video, fps = out.video, float(out.frame_rate)
         if i == 0:
             first_infer_s = dt
         else:
             times.append(dt)
+            for k, v in (getattr(out, "stage_timings", None) or {}).items():
+                if isinstance(v, (int, float)):
+                    stage_samples.setdefault(k, []).append(v)
     infer_peak_resv = torch.cuda.max_memory_reserved() / 2**30
     ts = sorted(times)
     p50 = ts[len(ts) // 2]
+    sp = {k: _p50(v) for k, v in stage_samples.items()}
 
+    # mp4 encode is outside the pipeline (post-inference), timed on its own
+    torch.cuda.synchronize()
+    _tm = time.time()
     thwc = oracle._video_to_thwc_uint8(video)
     mp4 = str(outdir / "native.mp4")
     ok = oracle.encode_mp4(thwc, fps, mp4)
+    mp4_encode_s = round(time.time() - _tm, 3)
+
+    # §2-aligned warm LTX sub-stage breakdown (audio stages are N/A: video-only path)
+    ltx_substage = {
+        "subprocess_start": round(tb - _PROC_START, 3),
+        "model_load": round(build_s, 3),
+        "source_read": sp.get("source_read"),
+        "video_vae_encode": sp.get("vae_encode"),
+        "audio_vae_encode": None,
+        "text_encode": sp.get("conditioning"),
+        "diffusion": sp.get("denoise_total"),
+        "video_vae_decode": sp.get("vae_decode"),
+        "audio_vae_decode": None,
+        "composite": sp.get("composite"),
+        "mp4_encode": mp4_encode_s,
+        "ltx_wall_p50": round(p50, 3),
+    }
 
     result = {
         "quant": args.quant,
@@ -243,6 +279,7 @@ def main():
         },
         "mp4": mp4,
         "mp4_ok": bool(ok),
+        "ltx_substage": ltx_substage,
         "code_commit": args.code_commit,
     }
     (outdir / "variant.json").write_text(json.dumps(result, indent=2))

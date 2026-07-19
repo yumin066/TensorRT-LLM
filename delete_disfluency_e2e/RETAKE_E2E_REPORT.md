@@ -35,6 +35,23 @@ serve bf16 明细: cold-start 138.03s · first-served 36.87s · steady wall p50 
 
 *serve 仅 720p 表征。serve FP8/NVFP4 = `unsupported`,证据 `artifacts/720p/serve_{fp8,nvfp4}/status.json`+`run.log`:`Unknown pipeline_config keys for LTX2Pipeline (/home/scratch.minyu_gpu/ltx-retake-assets/ltx2-22b-distilled): …`*
 
+## LTX 阶段图细分(§2 对齐 · 720p · upstream 每次重建 vs 常驻 native FP8 warm)
+
+| LTX 子阶段 | upstream(fp8-cast,单发) | native FP8(常驻 warm) | 说明 |
+|---|---|---|---|
+| subprocess_start | 18.75 | 3.49 | python + torch/CUDA import(一次性) |
+| model_load | 0.03(惰性¹) | ≈88(一次性²) | 载 22B transformer + VAE + Gemma |
+| video_vae_encode | 6.51 | 1.88 | 条件视频 → latent(upstream 含 VAE 加载¹) |
+| audio_vae_encode | 1.62 | N/A | 编辑音频 → latent(native 纯视频 → N/A) |
+| text_encode | 7.88 | 0.18 | Gemma(upstream 含 Gemma 加载¹) |
+| diffusion | 44.29 | 24.22 | **瓶颈**:8 步 Euler 去噪(upstream 含 22B 加载¹) |
+| video_vae_decode | 0.16 | 3.7 | latent → 像素(upstream 流式,折入 mp4) |
+| audio_vae_decode | 1.18 | N/A | latent → 波形(native 纯视频 → N/A) |
+| mp4_encode | 5.6 | 1.47 | libx264 编码 |
+| **LTX wall** | **67.28** | **30.94** | upstream 每次重建(含加载);native warm 常驻 |
+
+*单位秒。**upstream 权重惰性加载**:构造阶段 model_load≈0,各计算阶段首次调用才把对应权重载入 —— ¹22B transformer 折入 `diffusion`(44.3s = 加载 + 8 步去噪)、Gemma 折入 `text_encode`、VAE 折入 `video_vae_encode`。**native FP8 常驻 warm**:权重已在显存,各阶段为纯计算(`diffusion` 24.2s 为纯 8 步去噪),²model_load 仅 server 启动时一次(此次 NFS 冷启容器测得 760s,页缓存热约 88s;不计入 warm wall)。故 native warm 相对 upstream 的 67→31s(2.2×)提速,既来自免去每次重建的权重加载,也来自 FP8 计算更快。upstream 的 video/audio VAE 解码流式化,真实开销折入 `mp4_encode`;native 纯视频路径无 audio VAE。设备 RTX PRO 6000(非 §2 的 H100)。*
+
 ## fast-init 安全性(每交付 quant)
 
 - **bf16**: touched 1061 nn.init 张量, uncovered_nan=0 → `fast_init_safe=True` (`artifacts/init_coverage/init_coverage_bf16.json`)
