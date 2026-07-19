@@ -38,13 +38,13 @@ def _n(x, d=2):
     return round(x, d) if isinstance(x, (int, float)) else x
 
 
-def _validate(art: Path, res_list):
+def _load_validator():
     p = Path(__file__).with_name("validate_artifacts.py")
     spec = importlib.util.spec_from_file_location("validate_artifacts", p)
     m = importlib.util.module_from_spec(spec)
     sys.modules["validate_artifacts"] = m
     spec.loader.exec_module(m)
-    return m.validate(art, res_list)
+    return m
 
 
 ORDER = [
@@ -120,23 +120,12 @@ def main():
         for q in ("bf16", "fp8", "nvfp4")
     }
     sfp8 = load(art / "720p" / "serve_fp8" / "status.json") or {}
-    hashv = _validate(art, ["720p", "1080p"])
-
+    ev = _load_validator().validate_evidence(art, ["720p", "1080p"])
+    acs = ev["ac"]
     serve = next((x for x in r720 if x["name"] == "serve_bf16"), {})
-    serve_timing_ok = all(
-        serve.get(k) not in (None, "—") for k in ("warm", "engine", "first", "cold")
-    )
-    asr720 = (load(art / "720p" / "assertions.json") or {}).get("variants", {})
-    audio_ok = all(
-        v.get("pass") for k, v in asr720.items() if isinstance(v, dict) and v.get("status") == "ok"
-    )
-    coverage_ok = all(g(cov[q], "fast_init_safe") is True for q in ("bf16", "fp8", "nvfp4"))
-    oom_ok = (art / "1080p" / "native_bf16" / "run.log").exists() and (
-        art / "1080p" / "native_fp8" / "run.log"
-    ).exists()
 
-    def ac(cond):
-        return "ok" if cond else "INCOMPLETE"
+    def ac(name):
+        return acs.get(name, False) and "ok" or "INCOMPLETE"
 
     geo, prov = man720.get("geometry", {}), man720.get("provenance", {})
     L = []
@@ -184,44 +173,42 @@ def main():
             f"- **{q}**: touched {g(c, 'fast_init_touched_tensors')} nn.init 张量, uncovered_nan={g(c, 'uncovered_nan_count')} → `fast_init_safe={g(c, 'fast_init_safe')}` (`artifacts/init_coverage/init_coverage_{q}.json`)"
         )
     L.append("")
-    L.append("## 校验")
+    L.append("## 校验(单一 `validate_evidence` 汇总,报告与 CLI 共用)")
     L.append("")
     L.append(
-        f"- **host sha256 校验** (`validate_artifacts.py`): checked {hashv['checked']}, ok={hashv['ok']}"
-        + ("" if hashv["ok"] else f", problems={hashv['problems'][:3]}")
+        f"- 全量校验 ok={ev['ok']} · host sha256={ev['hash_ok']} · frame grid={ev['grid_ok']} · 三 quant 覆盖={ev['coverage_ok']} · gitignore={ev['gitignore_ok']}"
     )
-    L.append(
-        f"- serve 计时字段齐全: {serve_timing_ok} · 音频断言全过: {audio_ok} · 三 quant 覆盖: {coverage_ok} · 1080p OOM 日志: {oom_ok}"
-    )
+    if ev["problems"]:
+        L.append(f"- **problems** ({len(ev['problems'])}): {ev['problems'][:6]}")
     L.append("")
-    L.append("## AC 覆盖(状态由校验推导 → 产物)")
+    L.append("## AC 覆盖(每行状态均由 `validate_evidence` 推导 → 产物)")
     L.append("")
     L.append("| AC | 状态 | 证据产物 |")
     L.append("|---|---|---|")
     L.append(
-        f"| AC-1 upstream 基线+阶段图+manifest | {ac(g(man720, 'variant_status', 'upstream', 'status') == 'ok' and hashv['ok'])} | `{{720p,1080p}}/upstream/final.mp4`+`manifest.json`+`phase_timing.json` |"
+        f"| AC-1 upstream 基线+阶段图+manifest | {ac('AC-1')} | `{{720p,1080p}}/upstream/final.mp4`+`manifest.json`+`phase_timing.json`(hash+timing 校验) |"
     )
     L.append(
-        "| AC-2 --external-retake,默认路径不变 | ok | patch + 默认 timing.json 无 retake_source(GPU 验证) |"
+        f"| AC-2 --external-retake,默认路径不变 | {ac('AC-2')} | patch 存在 + 默认 upstream `timing.json` 无 retake_source |"
     )
-    L.append("| AC-3 接缝预检 | ok | composite run.log `external retake accepted` |")
+    L.append(f"| AC-3 接缝预检 | {ac('AC-3')} | composite `run.log` `external retake accepted` |")
     L.append(
-        f"| AC-4 每变体 final 或 oom/unsupported(带日志) | {ac(oom_ok)} | 上表 status;1080p oom `native_{{bf16,fp8}}/status.json`+`run.log`;serve fp8/nvfp4 status.json |"
-    )
-    L.append(
-        f"| AC-5 阶段图+单发+warm+显存+serve 拆分 | {ac(serve_timing_ok)} | `phase_timing.json`(apply/ltx/post/single_shot + serve cold/first/warm/engine) |"
+        f"| AC-4 每变体 final 或 oom/unsupported(带日志) | {ac('AC-4')} | 上表 status;1080p oom `native_{{bf16,fp8}}/status.json`+`run.log`;serve fp8/nvfp4 status.json |"
     )
     L.append(
-        "| AC-6 窗口 PSNR/SSIM + frame grid + 窗外一致 | ok | `quality_metrics.json`(PSNR+SSIM vs bf16 & upstream)+`assertions.json` outside + `frame_grid_720p_t5.0.png` |"
+        f"| AC-5 阶段图+单发+warm+显存+serve 拆分 | {ac('AC-5')} | `phase_timing.json` 每 ok 行 apply/ltx/post/single_shot/peak 齐全 + sum≈wall;serve cold/first/warm/engine |"
     )
     L.append(
-        f"| AC-7 final 音频源自 edited(内容比对) | {ac(audio_ok)} | `assertions.json` audio_similarity(dur_delta + correlation) |"
+        f"| AC-6 窗口 PSNR/SSIM + frame grid + 窗外一致 | {ac('AC-6')} | `quality_metrics.json`+`assertions.json` outside + `frame_grid_720p_t5.0.png`(存在校验) |"
     )
     L.append(
-        "| AC-8 --external-retake GPU 跑一次 | ok | composite run.log(smc521ge-0038 / ltx_r35) |"
+        f"| AC-7 final 音频源自 edited(内容比对) | {ac('AC-7')} | `assertions.json` audio_similarity(dur_delta + correlation) |"
     )
     L.append(
-        f"| AC-9 产物拉回 host + gitignore + sha 一致 | {ac(hashv['ok'])} | host `artifacts/` 树;`validate_artifacts.py` ok={hashv['ok']};`/artifacts/` gitignored |"
+        f"| AC-8 --external-retake GPU 跑一次 | {ac('AC-8')} | composite `run.log`(smc521ge-0038 / ltx_r35) |"
+    )
+    L.append(
+        f"| AC-9 产物拉回 host + gitignore + sha 一致 | {ac('AC-9')} | host `artifacts/` 树;`validate_evidence` hash_ok+gitignore |"
     )
     L.append("")
     L.append("## 公平性(task12)")
@@ -233,9 +220,7 @@ def main():
     L.append("- FP8 近无损、NVFP4 明显改变(见质量列),速度不得脱离质量呈现。")
     L.append("")
     Path(args.out).write_text("\n".join(L) + "\n")
-    print(
-        f"REPORT_RENDERED {args.out} (hash_ok={hashv['ok']}, serve_timing_ok={serve_timing_ok}, audio_ok={audio_ok}, coverage_ok={coverage_ok})"
-    )
+    print(f"REPORT_RENDERED {args.out} (evidence_ok={ev['ok']}, ac={ev['ac']})")
 
 
 if __name__ == "__main__":

@@ -19,9 +19,54 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
+
+
+class _GpuPeak:
+    """Poll nvidia-smi in a thread to capture the serve process's peak GPU memory."""
+
+    def __init__(self):
+        self.max_mib = 0
+        self._stop = False
+        self._t = None
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                out = (
+                    subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=memory.used",
+                            "--format=csv,noheader,nounits",
+                            "-i",
+                            "0",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    .stdout.strip()
+                    .splitlines()
+                )
+                if out:
+                    self.max_mib = max(self.max_mib, int(out[0]))
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+    def start(self):
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def stop(self):
+        self._stop = True
+        if self._t:
+            self._t.join(timeout=3)
+        return round(self.max_mib / 1024, 2)
 
 
 def _load_mod(repo: str, name: str):
@@ -121,10 +166,13 @@ def main():
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        gpu = _GpuPeak()
+        gpu.start()
         t0 = time.time()
         with urllib.request.urlopen(req, timeout=args.request_timeout) as r:
             body = json.loads(r.read())
         wall = time.time() - t0
+        peak_gib = gpu.stop()
         b64 = body.get("b64_json")
         if not b64:
             print("SERVE_ARTIFACT_FAIL no b64_json: " + json.dumps(body)[:300])
@@ -152,6 +200,8 @@ def main():
                 {
                     "cold_start_seconds": cold_start_s,
                     "request_wall_seconds": round(wall, 2),
+                    "single_shot_seconds": cold_start_s + round(wall, 2),
+                    "peak_reserved_gib": peak_gib,
                     "frames": n,
                     "served_format": body.get("format"),
                 },

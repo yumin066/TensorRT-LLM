@@ -376,6 +376,9 @@ def main():
                             "post_seconds",
                             "wall_seconds",
                             "sum_delta_seconds",
+                            "single_shot_seconds",
+                            "warm_p50_seconds",
+                            "peak_reserved_gib",
                         )
                     }
                 )
@@ -430,6 +433,9 @@ def main():
                         "http_wall_p50_seconds": wall_p50,
                         "warm_p50_seconds": wall_p50,
                         "ltx_seconds": gen_p50,  # serve LTX ~= steady engine time
+                        # single-shot for the resident serve = cold start + first served request
+                        "single_shot_seconds": cs.get("single_shot_seconds"),
+                        "peak_reserved_gib": cs.get("peak_reserved_gib"),
                     }
                 )
             if pt:

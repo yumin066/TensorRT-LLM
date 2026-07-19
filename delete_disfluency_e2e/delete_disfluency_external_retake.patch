@@ -1,5 +1,5 @@
 diff --git a/script_editing/delete_disfluency.py b/script_editing/delete_disfluency.py
-index 77bb6df..0c2662b 100644
+index 77bb6df..0628eef 100644
 --- a/script_editing/delete_disfluency.py
 +++ b/script_editing/delete_disfluency.py
 @@ -33,6 +33,8 @@ from __future__ import annotations
@@ -158,7 +158,7 @@ index 77bb6df..0c2662b 100644
  
      timing = {
          "video": args.video,
-@@ -345,13 +394,44 @@ def main() -> None:
+@@ -345,13 +394,51 @@ def main() -> None:
                            "width": args.width, "height": args.height, "fps": fps},
          "quantization": args.quantization,
          "lora": args.lora,
@@ -196,7 +196,14 @@ index 77bb6df..0c2662b 100644
 +            "wall_seconds": wall_s,
 +            "sum_delta_seconds": round(wall_s - (apply_s + ltx_s + post_s), 3),
 +            "diffusion_seconds": round(diffusion_s, 2) if diffusion_s is not None else None,
++            "single_shot_seconds": wall_s,  # every-rebuild single-shot = whole-run wall
++            "warm_p50_seconds": None,  # upstream is every-rebuild; no resident warm
 +        }
++        # Peak GPU memory (upstream loads/runs the model here; the external path is ~0).
++        try:
++            phase_timing["peak_reserved_gib"] = round(torch.cuda.max_memory_reserved() / 2**30, 2)
++        except (RuntimeError, AssertionError):
++            phase_timing["peak_reserved_gib"] = None
 +        (outdir / "phase_timing.json").write_text(json.dumps(phase_timing, indent=2))
      print(f"[done] final cleaned clip -> {final}")
 -    print(f"[done] timing -> {outdir/'timing.json'}  (diffusion {diffusion_s:.1f}s, total {timing['total_seconds']}s)")
