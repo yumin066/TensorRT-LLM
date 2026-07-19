@@ -122,3 +122,6 @@ tests/integration/defs/stress_test/artifacts/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
+
+# delete_disfluency E2E test artifacts pulled back from the GPU node (final/retake mp4s, timing, reports)
+/artifacts/
