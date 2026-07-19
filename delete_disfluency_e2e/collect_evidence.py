@@ -21,7 +21,21 @@ import json
 import subprocess
 from pathlib import Path
 
-import numpy as np
+
+class _LazyNumpy:
+    """Defer the numpy import so stdlib-only callers (variant_specs) stay numpy-free."""
+
+    _m = None
+
+    def __getattr__(self, name):
+        if _LazyNumpy._m is None:
+            import numpy as _np
+
+            _LazyNumpy._m = _np
+        return getattr(_LazyNumpy._m, name)
+
+
+np = _LazyNumpy()
 
 
 # ---- variant registry -------------------------------------------------------
