@@ -47,16 +47,19 @@ def variant_specs(res: str):
             "kind": "native",
             "quant": x,
         }
-    for x in q:
-        specs[f"serve_{x}"] = {
-            "retake": f"serve_{x}/retake_serve_{x}.mp4",
-            "final_dir": f"serve_{x}_final",
-            "serve_timing": f"serve_{x}/serve_timing.json",
-            "status": f"serve_{x}/status.json",
-            "phase": f"serve_{x}_final/phase_timing.json",
-            "kind": "serve",
-            "quant": x,
-        }
+    # The serve (HTTP Mode B) surface is characterized at 720p only, per the plan
+    # matrix; it is not part of the 1080p rows.
+    if res == "720p":
+        for x in q:
+            specs[f"serve_{x}"] = {
+                "retake": f"serve_{x}/retake_serve_{x}.mp4",
+                "final_dir": f"serve_{x}_final",
+                "serve_timing": f"serve_{x}/serve_timing.json",
+                "status": f"serve_{x}/status.json",
+                "phase": f"serve_{x}_final/phase_timing.json",
+                "kind": "serve",
+                "quant": x,
+            }
     return specs
 
 
