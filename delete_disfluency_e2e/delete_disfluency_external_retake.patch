@@ -1,16 +1,17 @@
 diff --git a/script_editing/delete_disfluency.py b/script_editing/delete_disfluency.py
-index 77bb6df..d8b6fef 100644
+index 77bb6df..0c2662b 100644
 --- a/script_editing/delete_disfluency.py
 +++ b/script_editing/delete_disfluency.py
-@@ -33,6 +33,7 @@ from __future__ import annotations
+@@ -33,6 +33,8 @@ from __future__ import annotations
  
  import argparse
  import json
++import os
 +import shutil
  import subprocess
  import time
  from dataclasses import dataclass
-@@ -186,6 +187,34 @@ def composite_bridge(edited_path: str, retake_path: str, a: int, lb0: int, lb1:
+@@ -186,6 +188,34 @@ def composite_bridge(edited_path: str, retake_path: str, a: int, lb0: int, lb1:
      Path(tmp).unlink(missing_ok=True)
  
  
@@ -45,7 +46,7 @@ index 77bb6df..d8b6fef 100644
  def side_by_side(left: str, right: str, out_path: str, timeout_s: float = 180.0) -> None:
      # Scale both to the SAME height (hstack requires equal heights); pad widths so
      # portrait clips of slightly different aspect still stack cleanly.
-@@ -236,6 +265,11 @@ def main() -> None:
+@@ -236,6 +266,11 @@ def main() -> None:
      ap.add_argument("--height", type=int, default=1280, help="Retake height (multiple of 32). Default 1280.")
      ap.add_argument("--prompt", default="a person talking to the camera, natural head motion, clear speech")
      ap.add_argument("--seed", type=int, default=42)
@@ -57,9 +58,11 @@ index 77bb6df..d8b6fef 100644
      args = ap.parse_args()
  
      outdir = Path(args.output_dir)
-@@ -290,42 +324,53 @@ def main() -> None:
+@@ -289,43 +324,56 @@ def main() -> None:
+     crop_window(edited, a, total, fps, args.width, args.height, retake_in)
      meta_in = get_videostream_metadata(retake_in)
      print(f"[window] retake input: {meta_in.width}x{meta_in.height} {meta_in.frames}f @ {fps:.0f}fps")
++    t_apply_end = time.time()  # APPLY block (steps 1-4: transcript/splice/crop) done
  
 -    # ---- 5. the ONE model call: upstream RetakePipeline ---------------------
 -    quant = None if args.quantization == "none" else QuantizationKind(args.quantization).to_policy(checkpoint_path=args.checkpoint)
@@ -143,20 +146,58 @@ index 77bb6df..d8b6fef 100644
 +        diffusion_s = time.time() - t_diff0
 +        retake_source = "upstream_retakepipeline"
 +        print(f"[retake] LTX retake done in {diffusion_s:.1f}s -> {retake_out}")
++    t_ltx_end = time.time()  # LTX block (model call, or external copy) done
  
      # ---- 6. composite the WHOLE regenerated window back + compare -----------
      # Replacing the entire window (not just the bridge) keeps the action region
-@@ -345,13 +390,15 @@ def main() -> None:
+@@ -334,6 +382,7 @@ def main() -> None:
+     # at the window edges, where the retake output ≈ the input frames.
+     final = str(outdir / "final.mp4")
+     composite_bridge(edited, retake_out, a, 0, total, fps, final)
++    t_post_end = time.time()  # POST block (composite + mux) done
+ 
+     timing = {
+         "video": args.video,
+@@ -345,13 +394,44 @@ def main() -> None:
                            "width": args.width, "height": args.height, "fps": fps},
          "quantization": args.quantization,
          "lora": args.lora,
 -        "diffusion_seconds": round(diffusion_s, 2),
-+        "retake_source": retake_source,
 +        "diffusion_seconds": round(diffusion_s, 2) if diffusion_s is not None else None,
          "total_seconds": round(time.time() - t_run0, 2),
          "outputs": {"edited_full": edited, "retake_input": retake_in, "retake_output": retake_out, "final": final},
      }
++    # Only the external-retake path (a new feature) annotates the retake source;
++    # the no-flag default path keeps the pristine timing.json schema byte-identical.
++    if args.external_retake:
++        timing["retake_source"] = retake_source
      (outdir / "timing.json").write_text(json.dumps(timing, indent=2))
++
++    # Additive APPLY/LTX/POST phase-timing sidecar, opt-in via env var so the
++    # default CLI produces exactly the pristine output set (no extra file, no
++    # extra flag). Written for both the upstream baseline and external composites.
++    if os.environ.get("DD_EMIT_PHASE_TIMING"):
++        apply_s = round(t_apply_end - t_run0, 3)
++        ltx_s = round(t_ltx_end - t_apply_end, 3)
++        post_s = round(t_post_end - t_ltx_end, 3)
++        wall_s = round(t_post_end - t_run0, 3)
++        phase_timing = {
++            "mode": "external_retake" if args.external_retake else "upstream_retakepipeline",
++            "retake_source": retake_source,
++            "quantization": args.quantization,
++            "resolution": {"width": args.width, "height": args.height, "fps": fps},
++            "geometry": {"a": a, "lb0": lb0, "lb1": lb1, "splice_frame": splice_frame,
++                         "total_frames": total, "bridge_frames": bridge,
++                         "cond_frames_per_side": args.cond_frames, "edited_frames": n_edited,
++                         "disfluency_span_s": [disf.start, disf.end]},
++            "apply_seconds": apply_s,
++            "ltx_seconds": ltx_s,
++            "post_seconds": post_s,
++            "wall_seconds": wall_s,
++            "sum_delta_seconds": round(wall_s - (apply_s + ltx_s + post_s), 3),
++            "diffusion_seconds": round(diffusion_s, 2) if diffusion_s is not None else None,
++        }
++        (outdir / "phase_timing.json").write_text(json.dumps(phase_timing, indent=2))
      print(f"[done] final cleaned clip -> {final}")
 -    print(f"[done] timing -> {outdir/'timing.json'}  (diffusion {diffusion_s:.1f}s, total {timing['total_seconds']}s)")
 +    _diff_str = f"{diffusion_s:.1f}s" if diffusion_s is not None else "external"
