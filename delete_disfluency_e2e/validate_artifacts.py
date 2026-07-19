@@ -121,17 +121,18 @@ _REQ = {
     ),
 }
 
-# substrings that must appear in run.log / status.json for a non-ok row of each status
+# substantive status-specific evidence that must appear in run.log / status.json for a
+# non-ok row — broad placeholders (bare "oom" / "quant") are intentionally excluded so a
+# generic reason + a dummy success log cannot certify a failure.
 _NONOK_TOKENS = {
-    "oom": ("out of memory", "outofmemory", "oom"),
+    "oom": ("out of memory", "outofmemory"),
     "unsupported": (
-        "unsupported",
         "unknown pipeline_config",
-        "not support",
+        "quant_algo",
+        "dynamic_weight_quant",
         "worker died",
-        "quant",
     ),
-    "timeout": ("timeout", "timed out", "timelimit", "deadline"),
+    "timeout": ("timed out", "timeout", "timelimit", "deadline exceeded"),
 }
 
 
@@ -253,18 +254,20 @@ def validate_evidence(art: Path, res_list) -> dict:
             if row is None:
                 add(("AC-4", "AC-5"), f"{res}/{name}: missing phase_timing row")
                 row = {}
-            if row.get("status") not in (None, status):
-                add(
-                    ("AC-5",),
-                    f"{res}/{name}: phase status {row.get('status')!r} != manifest {status!r}",
-                )
-            if row.get("mode") not in (None, kind):
-                add(("AC-5",), f"{res}/{name}: phase mode {row.get('mode')!r} != spec {kind!r}")
-            if row.get("quant") not in (None, s.get("quant")):
-                add(
-                    ("AC-5",),
-                    f"{res}/{name}: phase quant {row.get('quant')!r} != spec {s.get('quant')!r}",
-                )
+            else:
+                # identity fields must be PRESENT and match the manifest/spec exactly
+                if row.get("status") != status:
+                    add(
+                        ("AC-5",),
+                        f"{res}/{name}: phase status {row.get('status')!r} != manifest {status!r}",
+                    )
+                if row.get("mode") != kind:
+                    add(("AC-5",), f"{res}/{name}: phase mode {row.get('mode')!r} != spec {kind!r}")
+                if row.get("quant") != s.get("quant"):
+                    add(
+                        ("AC-5",),
+                        f"{res}/{name}: phase quant {row.get('quant')!r} != spec {s.get('quant')!r}",
+                    )
 
             if status == "ok":
                 for f in _REQ.get(kind, ()):

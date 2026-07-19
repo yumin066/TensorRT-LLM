@@ -104,6 +104,49 @@ def test_contradictory_non_ok_status_fails(bundle):
     assert ev["ac"]["AC-4"] is False
 
 
+@pytest.mark.parametrize("field", ["status", "mode", "quant"])
+def test_phase_identity_missing_fails(bundle, field):
+    _patch(
+        bundle / "720p" / "phase_timing.json",
+        lambda d: d["variants"]["native_fp8"].pop(field),
+    )
+    ev = _ev(bundle)
+    assert ev["ac"]["AC-5"] is False
+
+
+def test_non_ok_phase_identity_missing_fails(bundle):
+    _patch(
+        bundle / "720p" / "phase_timing.json",
+        lambda d: d["variants"]["serve_fp8"].pop("status"),
+    )
+    ev = _ev(bundle)
+    assert ev["ac"]["AC-5"] is False
+
+
+def test_weak_oom_diagnostic_fails(bundle):
+    def weak(d):
+        d["status"] = "oom"
+        d["reason"] = "oom"
+        d.pop("oom_excerpt", None)
+
+    _patch(bundle / "1080p" / "native_bf16" / "status.json", weak)
+    (bundle / "1080p" / "native_bf16" / "run.log").write_text("startup ok\ninference done\n")
+    ev = _ev(bundle)
+    assert ev["ac"]["AC-4"] is False
+
+
+def test_weak_unsupported_diagnostic_fails(bundle):
+    def weak(d):
+        d["status"] = "unsupported"
+        d["reason"] = "quant"
+        d.pop("error_excerpt", None)
+
+    _patch(bundle / "720p" / "serve_fp8" / "status.json", weak)
+    (bundle / "720p" / "serve_fp8" / "run.log").write_text("startup ok\nserved request\n")
+    ev = _ev(bundle)
+    assert ev["ac"]["AC-4"] is False
+
+
 def test_non_ignored_artifact_path_fails(tmp_path):
     dst = tmp_path / "artifacts"
     shutil.copytree(ART, dst, ignore=shutil.ignore_patterns(".mut"))
