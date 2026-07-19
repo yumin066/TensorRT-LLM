@@ -238,80 +238,8 @@ def variant_status(
     return "missing", "no final.mp4 and no status/log evidence"
 
 
-# ---- main -------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--res", required=True)
-    ap.add_argument("--out-dir", required=True, help="e2e out/<res> dir on the cluster")
-    ap.add_argument("--source", required=True)
-    ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--gemma", required=True)
-    ap.add_argument("--lora", required=True)
-    ap.add_argument("--code-commit", required=True)
-    ap.add_argument("--eval-repo", required=True)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--steps", type=int, default=8)
-    ap.add_argument(
-        "--outside-tol-db", type=float, default=30.0, help="min outside-window PSNR vs edited"
-    )
-    ap.add_argument(
-        "--audio-dur-tol-s",
-        type=float,
-        default=0.2,
-        help="max (final_dur - edited_dur); final is a -shortest truncation so <= tol",
-    )
-    ap.add_argument(
-        "--audio-corr-min",
-        type=float,
-        default=0.9,
-        help="min decoded-audio correlation of final vs edited (content match)",
-    )
-    args = ap.parse_args()
-
-    out = Path(args.out_dir)
-    specs = variant_specs(args.res)
-
-    # geometry from any available phase_timing.json (all identical for a resolution)
-    geom, fps, resw, resh = None, None, None, None
-    for s in specs.values():
-        pt = load_json(out / s["phase"]) if "phase" in s else None
-        if pt and pt.get("geometry"):
-            geom = pt["geometry"]
-            fps = pt["resolution"]["fps"]
-            resw = pt["resolution"]["width"]
-            resh = pt["resolution"]["height"]
-            break
-    # fall back to upstream timing.json retake_window
-    if geom is None:
-        ut = load_json(out / "upstream/timing.json")
-        if ut:
-            rw = ut["retake_window"]
-            fps, resw, resh = rw["fps"], rw["width"], rw["height"]
-            geom = {"total_frames": rw["total_frames"], "bridge_frames": rw["bridge_frames"]}
-
-    lb0 = (geom or {}).get("lb0")
-    lb1 = (geom or {}).get("lb1")
-
-    def eval_git():
-        try:
-            rev = subprocess.run(
-                ["git", "-C", args.eval_repo, "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-            dirty = bool(
-                subprocess.run(
-                    ["git", "-C", args.eval_repo, "status", "--porcelain"],
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
-            )
-            return {"base_rev": rev, "dirty": dirty}
-        except Exception as e:
-            return {"error": str(e)}
-
-    # ---- per-variant status + artifact bookkeeping --------------------------
+def build_variant_rows(out: Path, specs: dict) -> dict:
+    """Resolve each variant's status + canonical paths from the pulled tree (pure file/JSON)."""
     rows = {}
     for name, s in specs.items():
         final_dir = out / s["final_dir"]
@@ -330,36 +258,11 @@ def main():
             "final_dir": str(final_dir),
             "spec": s,
         }
+    return rows
 
-    # ---- manifest -----------------------------------------------------------
-    artifacts = {}
-    for name, r in rows.items():
-        if r["status"] == "ok":
-            fp = Path(r["final_mp4"])
-            artifacts[name] = {
-                "final_sha256": sha256_file(fp),
-                "final_mtime": fp.stat().st_mtime if fp.exists() else None,
-                "retake_sha256": sha256_file(Path(r["retake_mp4"])),
-            }
-    manifest = {
-        "resolution": args.res,
-        "width": resw,
-        "height": resh,
-        "fps": fps,
-        "source": {"path": args.source, "sha256": sha256_file(Path(args.source))},
-        "geometry": geom,
-        "seed": args.seed,
-        "steps": args.steps,
-        "assets": {"checkpoint": args.checkpoint, "gemma": args.gemma, "lora": args.lora},
-        "provenance": {"tensorrt_llm_rev": args.code_commit, "ltx2_eval": eval_git()},
-        "variant_status": {
-            k: {"status": v["status"], "reason": v["reason"]} for k, v in rows.items()
-        },
-        "artifacts": artifacts,
-    }
-    (out / "manifest.json").write_text(dumps(manifest))
 
-    # ---- phase timing -------------------------------------------------------
+def build_phase_timing(out: Path, rows: dict) -> dict:
+    """Assemble the per-variant §2 timing rows from the pulled JSON sidecars (no ffprobe/decode)."""
     phase_rows = {}
     for name, r in rows.items():
         s = r["spec"]
@@ -438,14 +341,140 @@ def main():
                         "peak_reserved_gib": cs.get("peak_reserved_gib"),
                     }
                 )
-            if pt:
+            if pt:  # serve APPLY/POST come from the same external-retake composite run
                 row.update(
                     {
                         "apply_seconds": pt.get("apply_seconds"),
                         "post_seconds": pt.get("post_seconds"),
+                        "composite_wall_seconds": pt.get("wall_seconds"),
                     }
                 )
         phase_rows[name] = row
+    return phase_rows
+
+
+# ---- main -------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--res", required=True)
+    ap.add_argument("--out-dir", required=True, help="e2e out/<res> dir on the cluster")
+    ap.add_argument(
+        "--phase-only",
+        action="store_true",
+        help="rebuild ONLY phase_timing.json from the pulled JSON sidecars (host regen, no ffprobe/GPU)",
+    )
+    ap.add_argument("--source")
+    ap.add_argument("--checkpoint")
+    ap.add_argument("--gemma")
+    ap.add_argument("--lora")
+    ap.add_argument("--code-commit")
+    ap.add_argument("--eval-repo")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--steps", type=int, default=8)
+    ap.add_argument(
+        "--outside-tol-db", type=float, default=30.0, help="min outside-window PSNR vs edited"
+    )
+    ap.add_argument(
+        "--audio-dur-tol-s",
+        type=float,
+        default=0.2,
+        help="max (final_dur - edited_dur); final is a -shortest truncation so <= tol",
+    )
+    ap.add_argument(
+        "--audio-corr-min",
+        type=float,
+        default=0.9,
+        help="min decoded-audio correlation of final vs edited (content match)",
+    )
+    args = ap.parse_args()
+
+    out = Path(args.out_dir)
+    specs = variant_specs(args.res)
+
+    if args.phase_only:
+        # Host-side regeneration of the aggregate timing sidecar from the already-pulled
+        # per-variant JSON sidecars. Deterministic and identical to the full-collect path.
+        rows = build_variant_rows(out, specs)
+        phase_rows = build_phase_timing(out, rows)
+        (out / "phase_timing.json").write_text(
+            dumps({"resolution": args.res, "variants": phase_rows})
+        )
+        print(f"PHASE_ONLY_DONE {out / 'phase_timing.json'}")
+        return
+
+    # geometry from any available phase_timing.json (all identical for a resolution)
+    geom, fps, resw, resh = None, None, None, None
+    for s in specs.values():
+        pt = load_json(out / s["phase"]) if "phase" in s else None
+        if pt and pt.get("geometry"):
+            geom = pt["geometry"]
+            fps = pt["resolution"]["fps"]
+            resw = pt["resolution"]["width"]
+            resh = pt["resolution"]["height"]
+            break
+    # fall back to upstream timing.json retake_window
+    if geom is None:
+        ut = load_json(out / "upstream/timing.json")
+        if ut:
+            rw = ut["retake_window"]
+            fps, resw, resh = rw["fps"], rw["width"], rw["height"]
+            geom = {"total_frames": rw["total_frames"], "bridge_frames": rw["bridge_frames"]}
+
+    lb0 = (geom or {}).get("lb0")
+    lb1 = (geom or {}).get("lb1")
+
+    def eval_git():
+        try:
+            rev = subprocess.run(
+                ["git", "-C", args.eval_repo, "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            dirty = bool(
+                subprocess.run(
+                    ["git", "-C", args.eval_repo, "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            return {"base_rev": rev, "dirty": dirty}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ---- per-variant status + artifact bookkeeping --------------------------
+    rows = build_variant_rows(out, specs)
+
+    # ---- manifest -----------------------------------------------------------
+    artifacts = {}
+    for name, r in rows.items():
+        if r["status"] == "ok":
+            fp = Path(r["final_mp4"])
+            artifacts[name] = {
+                "final_sha256": sha256_file(fp),
+                "final_mtime": fp.stat().st_mtime if fp.exists() else None,
+                "retake_sha256": sha256_file(Path(r["retake_mp4"])),
+            }
+    manifest = {
+        "resolution": args.res,
+        "width": resw,
+        "height": resh,
+        "fps": fps,
+        "source": {"path": args.source, "sha256": sha256_file(Path(args.source))},
+        "geometry": geom,
+        "seed": args.seed,
+        "steps": args.steps,
+        "assets": {"checkpoint": args.checkpoint, "gemma": args.gemma, "lora": args.lora},
+        "provenance": {"tensorrt_llm_rev": args.code_commit, "ltx2_eval": eval_git()},
+        "variant_status": {
+            k: {"status": v["status"], "reason": v["reason"]} for k, v in rows.items()
+        },
+        "artifacts": artifacts,
+    }
+    (out / "manifest.json").write_text(dumps(manifest))
+
+    # ---- phase timing -------------------------------------------------------
+    phase_rows = build_phase_timing(out, rows)
     (out / "phase_timing.json").write_text(dumps({"resolution": args.res, "variants": phase_rows}))
 
     # ---- quality metrics ----------------------------------------------------

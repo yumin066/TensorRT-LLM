@@ -222,7 +222,8 @@ def main():
     )
     L.append("- FP8 近无损、NVFP4 明显改变(见质量列),速度不得脱离质量呈现。")
     L.append("")
-    Path(args.out).write_text("\n".join(L) + "\n")
+    # rstrip so the output is idempotent with the end-of-file-fixer pre-commit hook
+    Path(args.out).write_text("\n".join(L).rstrip("\n") + "\n")
     print(f"REPORT_RENDERED {args.out} (evidence_ok={ev['ok']}, ac={ev['ac']})")
 
 
