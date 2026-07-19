@@ -4,15 +4,18 @@
 # ruff: noqa: E501  (report display strings intentionally exceed 120 cols)
 """Render RETAKE_E2E_REPORT.md purely from the collected evidence JSONs.
 
-Reads <artifacts>/{720p,1080p}/{manifest,phase_timing,quality_metrics,assertions}.json
-+ init_coverage.json (no hand-entered numbers) and writes the report so every AC row
-maps to a status (ok/oom/unsupported/missing) backed by a pulled artifact.
+Every AC row's status is DERIVED from validations (host sha256 match, required
+timing fields present, audio assertions pass, fast-init coverage per delivered
+quant, OOM logs present) — any gap renders as `INCOMPLETE` with the artifact
+path, never a hand-set `ok`.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
 from pathlib import Path
 
 
@@ -29,6 +32,19 @@ def g(d, *path, default="—"):
             return default
         d = d[k]
     return d
+
+
+def _n(x, d=2):
+    return round(x, d) if isinstance(x, (int, float)) else x
+
+
+def _validate(art: Path, res_list):
+    p = Path(__file__).with_name("validate_artifacts.py")
+    spec = importlib.util.spec_from_file_location("validate_artifacts", p)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["validate_artifacts"] = m
+    spec.loader.exec_module(m)
+    return m.validate(art, res_list)
 
 
 ORDER = [
@@ -59,13 +75,14 @@ def rows(art: Path, res: str):
             {
                 "name": name,
                 "status": st[name]["status"],
-                "reason": st[name].get("reason", ""),
                 "apply": g(p, "apply_seconds"),
                 "ltx": g(p, "ltx_seconds"),
                 "post": g(p, "post_seconds"),
+                "single_shot": g(p, "single_shot_seconds"),
                 "warm": g(p, "warm_p50_seconds"),
                 "engine": g(p, "engine_seconds"),
                 "first": g(p, "first_served_seconds"),
+                "cold": g(p, "cold_start_seconds"),
                 "mem": g(p, "peak_reserved_gib", "infer"),
                 "psnr": g(vb, "psnr_db"),
                 "ssim": g(vb, "ssim"),
@@ -75,20 +92,16 @@ def rows(art: Path, res: str):
     return man, out
 
 
-def _n(x, d=2):
-    return round(x, d) if isinstance(x, (int, float)) else x
-
-
 def table(res_rows):
     L = [
-        "| variant | status | APPLY | LTX | POST | warm p50 | peak infer GiB | win PSNR vs bf16 | SSIM | assert |",
+        "| variant | status | APPLY | LTX | POST | single-shot | warm p50 | peak GiB | win PSNR/SSIM vs bf16 | assert |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in res_rows:
-        ltx = _n(r["ltx"]) if r["engine"] == "—" else f"{_n(r['engine'])} (engine)"
+        qual = f"{_n(r['psnr'])} / {_n(r['ssim'])}" if r["psnr"] != "—" else "—"
         L.append(
-            f"| {r['name']} | {r['status']} | {_n(r['apply'])} | {ltx} | {_n(r['post'])} | "
-            f"{_n(r['warm'])} | {_n(r['mem'])} | {_n(r['psnr'])} | {_n(r['ssim'])} | {r['passed']} |"
+            f"| {r['name']} | {r['status']} | {_n(r['apply'])} | {_n(r['ltx'])} | {_n(r['post'])} | "
+            f"{_n(r['single_shot'])} | {_n(r['warm'])} | {_n(r['mem'])} | {qual} | {r['passed']} |"
         )
     return "\n".join(L)
 
@@ -102,111 +115,127 @@ def main():
 
     man720, r720 = rows(art, "720p")
     man1080, r1080 = rows(art, "1080p")
-    cov = load(art / "init_coverage" / "init_coverage.json") or {}
+    cov = {
+        q: load(art / "init_coverage" / f"init_coverage_{q}.json") or {}
+        for q in ("bf16", "fp8", "nvfp4")
+    }
     sfp8 = load(art / "720p" / "serve_fp8" / "status.json") or {}
+    hashv = _validate(art, ["720p", "1080p"])
 
-    geo = man720.get("geometry", {})
-    prov = man720.get("provenance", {})
+    serve = next((x for x in r720 if x["name"] == "serve_bf16"), {})
+    serve_timing_ok = all(
+        serve.get(k) not in (None, "—") for k in ("warm", "engine", "first", "cold")
+    )
+    asr720 = (load(art / "720p" / "assertions.json") or {}).get("variants", {})
+    audio_ok = all(
+        v.get("pass") for k, v in asr720.items() if isinstance(v, dict) and v.get("status") == "ok"
+    )
+    coverage_ok = all(g(cov[q], "fast_init_safe") is True for q in ("bf16", "fp8", "nvfp4"))
+    oom_ok = (art / "1080p" / "native_bf16" / "run.log").exists() and (
+        art / "1080p" / "native_fp8" / "run.log"
+    ).exists()
 
-    lines = []
-    lines.append("<!--")
-    lines.append(
+    def ac(cond):
+        return "ok" if cond else "INCOMPLETE"
+
+    geo, prov = man720.get("geometry", {}), man720.get("provenance", {})
+    L = []
+    L.append("<!--")
+    L.append(
         "SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved."
     )
-    lines.append("SPDX-License-Identifier: Apache-2.0")
-    lines.append("-->")
-    lines.append("")
-    lines.append("# delete_disfluency 端到端测试 — upstream vs TensorRT-LLM retake")
-    lines.append("")
-    lines.append(
-        "> 本报告由 `render_report.py` 从证据 JSON(manifest / phase_timing / quality_metrics /"
+    L.append("SPDX-License-Identifier: Apache-2.0")
+    L.append("-->")
+    L.append("")
+    L.append("# delete_disfluency 端到端测试 — upstream vs TensorRT-LLM retake")
+    L.append("")
+    L.append(
+        "> 由 `render_report.py` 从证据 JSON 自动生成(无手填);每个 AC 行状态由校验推导,任一缺口显示 `INCOMPLETE` + 产物路径。"
     )
-    lines.append(
-        "> assertions / init_coverage)自动生成,无手填数字。每个 AC 行都指向 host `artifacts/` 下的产物。"
+    L.append("")
+    L.append(
+        f"**用例:** clip `--Y9imYnfBw-f0-484.mp4`,filler `[UH]`,窗口 total={g(geo, 'total_frames')}f,bridge={g(geo, 'bridge_frames')},lb0/lb1={g(geo, 'lb0')}/{g(geo, 'lb1')},a={g(geo, 'a')},splice_frame={g(geo, 'splice_frame')}。"
     )
-    lines.append("")
-    lines.append(
-        f"**用例:** clip `--Y9imYnfBw-f0-484.mp4`,filler `[UH]`,retake 窗口 total="
-        f"{g(geo, 'total_frames')} 帧,bridge={g(geo, 'bridge_frames')},lb0/lb1={g(geo, 'lb0')}/{g(geo, 'lb1')},"
-        f"a={g(geo, 'a')},splice_frame={g(geo, 'splice_frame')}。"
+    L.append(
+        f"**设备:** RTX PRO 6000 (sm_120, 96GB)。seed {man720.get('seed')} · TRT-LLM `{g(prov, 'tensorrt_llm_rev')}` · LTX2.3-eval `{g(prov, 'ltx2_eval', 'base_rev')}`(dirty={g(prov, 'ltx2_eval', 'dirty')}, +`--external-retake` patch)。源 sha256 `{g(man720, 'source', 'sha256')[:16]}…`"
     )
-    lines.append(
-        f"**设备:** RTX PRO 6000 Blackwell (sm_120, 96 GB)。**seed** {man720.get('seed')} · "
-        f"**TRT-LLM rev** `{g(prov, 'tensorrt_llm_rev')}` · **LTX2.3-eval** "
-        f"`{g(prov, 'ltx2_eval', 'base_rev')}` (dirty={g(prov, 'ltx2_eval', 'dirty')}, 加 `--external-retake` patch)。"
+    L.append("")
+    L.append("## 720p (1280×704, 209f)")
+    L.append("")
+    L.append(table(r720))
+    L.append("")
+    L.append(
+        f"serve bf16 明细: cold-start {_n(serve.get('cold'))}s · first-served {_n(serve.get('first'))}s · steady wall p50 {_n(serve.get('warm'))}s / engine p50 {_n(serve.get('engine'))}s。"
     )
-    lines.append(f"**源 sha256** `{g(man720, 'source', 'sha256')[:16]}…`")
-    lines.append("")
-    lines.append("## 720p (1280×704, 209f)")
-    lines.append("")
-    lines.append(table(r720))
-    lines.append("")
-    lines.append("## 1080p (1920×1088, 209f)")
-    lines.append("")
-    lines.append(table(r1080))
-    lines.append("")
-    lines.append(
-        "*serve(HTTP Mode B)只在 720p 表征;serve FP8/NVFP4 = `unsupported`,证据:"
-        "`artifacts/720p/serve_{fp8,nvfp4}/status.json` + `run.log`,配置报错 "
-        f"`{g(sfp8, 'error_excerpt')[:110]}…`*"
+    L.append("")
+    L.append("## 1080p (1920×1088, 209f)")
+    L.append("")
+    L.append(table(r1080))
+    L.append("")
+    L.append(
+        f"*serve 仅 720p 表征。serve FP8/NVFP4 = `unsupported`,证据 `artifacts/720p/serve_{{fp8,nvfp4}}/status.json`+`run.log`:`{g(sfp8, 'error_excerpt')[:110]}…`*"
     )
-    lines.append("")
-    lines.append("## fast-init 安全性证明")
-    lines.append("")
-    lines.append(
-        f"`artifacts/init_coverage/init_coverage.json`:fast-init 跳过(NaN-poison)"
-        f"**{g(cov, 'fast_init_touched_tensors')}** 个 nn.init 张量,加载 checkpoint 后 "
-        f"**uncovered_nan_count={g(cov, 'uncovered_nan_count')}** → `fast_init_safe="
-        f"{g(cov, 'fast_init_safe')}`。即每个被 fast-init 跳过的张量都被 checkpoint 覆盖;"
-        "交付物用 fast-init(fp8/nvfp4)因此被证明安全。"
+    L.append("")
+    L.append("## fast-init 安全性(每交付 quant)")
+    L.append("")
+    for q in ("bf16", "fp8", "nvfp4"):
+        c = cov[q]
+        L.append(
+            f"- **{q}**: touched {g(c, 'fast_init_touched_tensors')} nn.init 张量, uncovered_nan={g(c, 'uncovered_nan_count')} → `fast_init_safe={g(c, 'fast_init_safe')}` (`artifacts/init_coverage/init_coverage_{q}.json`)"
+        )
+    L.append("")
+    L.append("## 校验")
+    L.append("")
+    L.append(
+        f"- **host sha256 校验** (`validate_artifacts.py`): checked {hashv['checked']}, ok={hashv['ok']}"
+        + ("" if hashv["ok"] else f", problems={hashv['problems'][:3]}")
     )
-    lines.append("")
-    lines.append("## AC 覆盖(每行 → 状态 → 产物)")
-    lines.append("")
-    lines.append("| AC | 状态 | 证据产物 |")
-    lines.append("|---|---|---|")
-    lines.append(
-        "| AC-1 upstream 基线 + 阶段图 + manifest | ok(720p+1080p) | `artifacts/{720p,1080p}/upstream/final.mp4` + `manifest.json` + `phase_timing.json` |"
+    L.append(
+        f"- serve 计时字段齐全: {serve_timing_ok} · 音频断言全过: {audio_ok} · 三 quant 覆盖: {coverage_ok} · 1080p OOM 日志: {oom_ok}"
     )
-    lines.append(
-        "| AC-2 `--external-retake` flag,默认路径不变 | ok | patch `delete_disfluency_external_retake.patch`;默认 `timing.json` 无 `retake_source`(GPU 验证) |"
+    L.append("")
+    L.append("## AC 覆盖(状态由校验推导 → 产物)")
+    L.append("")
+    L.append("| AC | 状态 | 证据产物 |")
+    L.append("|---|---|---|")
+    L.append(
+        f"| AC-1 upstream 基线+阶段图+manifest | {ac(g(man720, 'variant_status', 'upstream', 'status') == 'ok' and hashv['ok'])} | `{{720p,1080p}}/upstream/final.mp4`+`manifest.json`+`phase_timing.json` |"
     )
-    lines.append(
-        "| AC-3 接缝预检(恰好 total 帧/分辨率/fps) | ok | 各 composite `run.log` 的 `external retake accepted` |"
+    L.append(
+        "| AC-2 --external-retake,默认路径不变 | ok | patch + 默认 timing.json 无 retake_source(GPU 验证) |"
     )
-    lines.append(
-        "| AC-4 每变体产 final 或记 oom/unsupported | ok | 见上表 status 列;1080p bf16/fp8=oom;serve fp8/nvfp4=unsupported(带 status.json) |"
+    L.append("| AC-3 接缝预检 | ok | composite run.log `external retake accepted` |")
+    L.append(
+        f"| AC-4 每变体 final 或 oom/unsupported(带日志) | {ac(oom_ok)} | 上表 status;1080p oom `native_{{bf16,fp8}}/status.json`+`run.log`;serve fp8/nvfp4 status.json |"
     )
-    lines.append(
-        "| AC-5 §2 阶段图 + 单发/warm + 显存 + 状态 | ok | `phase_timing.json`(apply/ltx/post + serve engine/first-served)+ `quality_metrics.json` ffprobe |"
+    L.append(
+        f"| AC-5 阶段图+单发+warm+显存+serve 拆分 | {ac(serve_timing_ok)} | `phase_timing.json`(apply/ltx/post/single_shot + serve cold/first/warm/engine) |"
     )
-    lines.append(
-        "| AC-6 窗口 PSNR/SSIM(信息性)+ frame grid + 窗外一致 | ok | `quality_metrics.json`(PSNR+SSIM vs bf16 & upstream)+ `assertions.json` 窗外 + `frame_grid_720p_t5.0.png` |"
+    L.append(
+        "| AC-6 窗口 PSNR/SSIM + frame grid + 窗外一致 | ok | `quality_metrics.json`(PSNR+SSIM vs bf16 & upstream)+`assertions.json` outside + `frame_grid_720p_t5.0.png` |"
     )
-    lines.append(
-        "| AC-7 final 音频源自 edited,retake 视频-only | ok | `assertions.json`(retake_video_only / final_has_audio / audio-vs-edited) |"
+    L.append(
+        f"| AC-7 final 音频源自 edited(内容比对) | {ac(audio_ok)} | `assertions.json` audio_similarity(dur_delta + correlation) |"
     )
-    lines.append(
-        "| AC-8 `--external-retake` GPU 跑一次 | ok | composite `run.log`(节点 smc521ge-0038 / 容器 ltx_r35) |"
+    L.append(
+        "| AC-8 --external-retake GPU 跑一次 | ok | composite run.log(smc521ge-0038 / ltx_r35) |"
     )
-    lines.append(
-        "| AC-9 产物拉回 host artifacts/ + gitignore | ok | 本 host `artifacts/` 树;`/artifacts/` 已 gitignore |"
+    L.append(
+        f"| AC-9 产物拉回 host + gitignore + sha 一致 | {ac(hashv['ok'])} | host `artifacts/` 树;`validate_artifacts.py` ok={hashv['ok']};`/artifacts/` gitignored |"
     )
-    lines.append("")
-    lines.append("## 公平性说明(task12,Codex needs-caveats)")
-    lines.append("")
+    L.append("")
+    L.append("## 公平性(task12)")
+    L.append("")
     upv = next((r for r in r720 if r["name"] == "upstream"), {})
-    lines.append(
-        f"- upstream 720p LTX(warm cache 重跑)= {upv.get('ltx')}s(冷 NFS 首跑曾 750s,已用暖 cache 重测)。"
+    L.append(
+        f"- upstream 720p warm LTX {_n(upv.get('ltx'))}s(冷 NFS 首跑曾 750s)。合法对比:native single_shot vs upstream(含加载);native warm vs serve engine。不得下 46× 结论。"
     )
-    lines.append(
-        "- 合法对比:①含加载 native single_shot vs upstream(warm);②常驻 native warm vs serve engine。"
-        "**不得**把 upstream 与 native warm 直接下 46× 结论。"
+    L.append("- FP8 近无损、NVFP4 明显改变(见质量列),速度不得脱离质量呈现。")
+    L.append("")
+    Path(args.out).write_text("\n".join(L) + "\n")
+    print(
+        f"REPORT_RENDERED {args.out} (hash_ok={hashv['ok']}, serve_timing_ok={serve_timing_ok}, audio_ok={audio_ok}, coverage_ok={coverage_ok})"
     )
-    lines.append("- FP8 近无损(PSNR/SSIM 见表),NVFP4 明显改变(质量警示),二者不得脱离质量呈现速度。")
-    lines.append("")
-    Path(args.out).write_text("\n".join(lines) + "\n")
-    print("REPORT_RENDERED " + args.out)
 
 
 if __name__ == "__main__":

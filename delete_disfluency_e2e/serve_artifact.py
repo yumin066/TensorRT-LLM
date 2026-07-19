@@ -106,12 +106,14 @@ def main():
         "--port",
         str(port),
     ]
+    t_launch = time.time()
     with open(args.server_log, "w") as lg:
         srv = subprocess.Popen(cmd, stdout=lg, stderr=subprocess.STDOUT)
     try:
         if not wait_health(base, args.startup_timeout):
             print("SERVE_ARTIFACT_FAIL health timeout")
             sys.exit(2)
+        cold_start_s = round(time.time() - t_launch, 2)
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             base + "/v1/videos/generations",
@@ -144,6 +146,18 @@ def main():
         thwc = oracle._video_to_thwc_uint8(vid)
         ok = oracle.encode_mp4(thwc, args.fps, args.out_mp4)
         n = int(getattr(thwc, "shape", [None])[0]) if hasattr(thwc, "shape") else None
+        meta_path = str(Path(args.out_mp4).with_name("serve_cold_start.json"))
+        Path(meta_path).write_text(
+            json.dumps(
+                {
+                    "cold_start_seconds": cold_start_s,
+                    "request_wall_seconds": round(wall, 2),
+                    "frames": n,
+                    "served_format": body.get("format"),
+                },
+                indent=2,
+            )
+        )
         print(
             "SERVE_ARTIFACT_DONE "
             + json.dumps(

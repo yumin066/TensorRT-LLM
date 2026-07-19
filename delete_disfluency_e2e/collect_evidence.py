@@ -40,7 +40,9 @@ def variant_specs(res: str):
     }
     for x in q:
         specs[f"native_{x}"] = {
-            "retake": f"native_{x}/native.mp4",
+            # canonical retake = the composite's copy in the final dir (byte-identical
+            # to native.mp4) — this is the file pulled to host, so manifest sha matches.
+            "retake": f"native_{x}_final/retake_output.mp4",
             "final_dir": f"native_{x}_final",
             "variant": f"native_{x}/variant.json",
             "phase": f"native_{x}_final/phase_timing.json",
@@ -164,6 +166,48 @@ def ssim_mean(a: np.ndarray, b: np.ndarray):
     return round(float(np.mean(vals)), 4)
 
 
+def decode_audio_pcm(p: Path, sr: int = 16000):
+    """Decode an audio stream to mono int16 PCM at ``sr`` Hz via ffmpeg."""
+    if not p.exists():
+        return None
+    try:
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(p), "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"],
+            capture_output=True,
+            check=True,
+        ).stdout
+    except Exception:
+        return None
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+
+
+def audio_similarity(final_mp4: Path, edited_mp4: Path, sr: int = 16000) -> dict:
+    """Compare the final audio to edited_full audio: duration + decoded content.
+
+    The composite maps edited's audio (`-map 1:a`) and re-encodes to AAC with
+    `-shortest`, so the final audio is a (lossy) transcode of edited's audio
+    truncated to the final video length — high correlation, final duration <= edited.
+    """
+    fa, ea = decode_audio_pcm(final_mp4, sr), decode_audio_pcm(edited_mp4, sr)
+    if fa is None or ea is None or len(fa) == 0 or len(ea) == 0:
+        return {"error": "audio decode failed / empty"}
+    df, de = len(fa) / sr, len(ea) / sr
+    n = min(len(fa), len(ea))
+    f, e = fa[:n], ea[:n]
+    mse = float(np.mean((f - e) ** 2))
+    apsnr = None if mse == 0 else round(20 * np.log10(32768.0) - 10 * np.log10(mse), 2)
+    fz, ez = f - f.mean(), e - e.mean()
+    denom = float(np.sqrt((fz**2).sum()) * np.sqrt((ez**2).sum()))
+    corr = round(float((fz * ez).sum() / denom), 4) if denom > 0 else None
+    return {
+        "final_dur_s": round(df, 3),
+        "edited_dur_s": round(de, 3),
+        "dur_delta_s": round(df - de, 3),
+        "audio_psnr_db": apsnr,
+        "correlation": corr,
+    }
+
+
 def variant_status(
     final_mp4: Path, retake: Path, status_json: Path, logs: list[Path]
 ) -> tuple[str, str]:
@@ -195,6 +239,18 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument(
         "--outside-tol-db", type=float, default=30.0, help="min outside-window PSNR vs edited"
+    )
+    ap.add_argument(
+        "--audio-dur-tol-s",
+        type=float,
+        default=0.2,
+        help="max (final_dur - edited_dur); final is a -shortest truncation so <= tol",
+    )
+    ap.add_argument(
+        "--audio-corr-min",
+        type=float,
+        default=0.9,
+        help="min decoded-audio correlation of final vs edited (content match)",
     )
     args = ap.parse_args()
 
@@ -345,18 +401,21 @@ def main():
                 )
         elif r["kind"] == "serve":
             stj = load_json(out / s.get("serve_timing", "__none__"))
+            cs = load_json(out / f"{name}/serve_cold_start.json") or {}
             if stj:
                 fs = stj.get("first_served") or {}
                 sw = stj.get("steady_warm") or {}
+                wall_p50 = (sw.get("wall") or {}).get("p50")
+                gen_p50 = (sw.get("generation") or {}).get("p50")
                 row.update(
                     {
-                        "cold_start_seconds": stj.get("cold_start_seconds"),
+                        "cold_start_seconds": cs.get("cold_start_seconds"),
                         "first_served_seconds": fs.get("wall"),
-                        "engine_seconds": fs.get("generation"),
-                        "http_wall_p50_seconds": (sw.get("wall") or {}).get("p50")
-                        if isinstance(sw.get("wall"), dict)
-                        else sw.get("wall"),
-                        "warm_p50_seconds": stj.get("steady_wall_p50"),
+                        "first_served_engine_seconds": fs.get("generation"),
+                        "engine_seconds": gen_p50,  # steady generation (engine) p50
+                        "http_wall_p50_seconds": wall_p50,
+                        "warm_p50_seconds": wall_p50,
+                        "ltx_seconds": gen_p50,  # serve LTX ~= steady engine time
                     }
                 )
             if pt:
@@ -435,7 +494,6 @@ def main():
         fdir = Path(r["final_dir"])
         final_meta = ffprobe(fdir / "final.mp4")
         retake_meta = ffprobe(Path(r["retake_mp4"]))
-        edited_meta = ffprobe(fdir / "edited_full.mp4")
         is_trt = r["kind"] in ("native", "serve")
         checks = {}
         # AC-7 (TRT retake is video-only) applies to native/serve variants; the
@@ -445,10 +503,19 @@ def main():
         else:
             checks["retake_video_only"] = "n/a (upstream retake carries source audio)"
         checks["final_has_audio"] = final_meta.get("has_audio") is True
-        # audio derives from edited: final audio codec+sr match edited (an AAC transcode, -shortest)
-        fa, ea = final_meta.get("audio") or {}, edited_meta.get("audio") or {}
-        checks["final_audio_matches_edited_stream"] = bool(
-            fa and ea and fa.get("sample_rate") == ea.get("sample_rate")
+        # AC-7: prove final audio DERIVES from edited (decoded content), not the
+        # external retake. final is edited's audio re-encoded to AAC + truncated
+        # (-shortest), so require: final duration <= edited (+tol), and the decoded
+        # overlapping content is highly correlated with edited (not TRT audio).
+        asim = audio_similarity(fdir / "final.mp4", fdir / "edited_full.mp4")
+        checks["audio_similarity"] = asim
+        dd, corr = asim.get("dur_delta_s"), asim.get("correlation")
+        checks["final_audio_from_edited"] = bool(
+            "error" not in asim
+            and dd is not None
+            and dd <= args.audio_dur_tol_s
+            and corr is not None
+            and corr >= args.audio_corr_min
         )
         # outside-window decode-tolerance vs edited
         outside = {}
@@ -479,7 +546,7 @@ def main():
             "pass": bool(
                 retake_ok
                 and checks["final_has_audio"]
-                and checks["final_audio_matches_edited_stream"]
+                and checks["final_audio_from_edited"]
                 and checks.get("outside_window_pass") in (True, None)
             ),
         }
