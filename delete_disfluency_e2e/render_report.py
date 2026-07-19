@@ -83,7 +83,10 @@ def rows(art: Path, res: str):
                 "engine": g(p, "engine_seconds"),
                 "first": g(p, "first_served_seconds"),
                 "cold": g(p, "cold_start_seconds"),
-                "mem": g(p, "peak_reserved_gib", "infer"),
+                # native stores {build, infer}; upstream/serve store a flat float
+                "mem": (p.get("peak_reserved_gib", {}) or {}).get("infer")
+                if isinstance(p.get("peak_reserved_gib"), dict)
+                else g(p, "peak_reserved_gib"),
                 "psnr": g(vb, "psnr_db"),
                 "ssim": g(vb, "ssim"),
                 "passed": assr.get("pass") if isinstance(assr, dict) and "pass" in assr else "—",
