@@ -8,7 +8,7 @@ Every criterion row's status is DERIVED from validations (host sha256 match, req
 timing fields present, audio assertions pass, fast-init coverage per delivered
 quant, OOM logs present) — any gap renders as `INCOMPLETE` with the artifact
 path, never a hand-set `ok`. The report-facing criterion ids come from
-``validate_artifacts.criterion_label`` so this source carries no plan-control literal.
+``validate_artifacts.criterion_label`` so this source carries no forbidden source marker.
 """
 
 from __future__ import annotations

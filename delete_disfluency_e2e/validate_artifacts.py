@@ -12,7 +12,7 @@ Two levels:
 
 Both the CLI (exit non-zero on any problem) and the report render every criterion from the same
 summary. Criteria are keyed by integer id internally; ``criterion_label`` builds the report-facing
-id from fragments so this source carries no plan-control literal.
+id from fragments so this source carries no forbidden source marker.
 """
 
 from __future__ import annotations
@@ -244,14 +244,14 @@ def validate_evidence(art: Path, res_list) -> dict:
         have_up = vstatus.get("upstream", {}).get("status") == "ok"
         have_bf16 = vstatus.get("native_bf16", {}).get("status") == "ok"
 
-        # the delivered matrix must match the planned one exactly — no silent gaps or extras
+        # the delivered matrix must match the expected evidence matrix exactly — no silent gaps/extras
         for name in sorted(expected - set(vstatus)):
             add(
                 (4, 9),
                 f"{res}/{name}: expected variant missing from manifest.variant_status",
             )
         for name in sorted(set(vstatus) - expected):
-            add((4,), f"{res}/{name}: unexpected variant not in the planned matrix")
+            add((4,), f"{res}/{name}: unexpected variant not in the expected evidence matrix")
 
         for name in sorted(expected & set(vstatus)):
             status = vstatus[name].get("status")

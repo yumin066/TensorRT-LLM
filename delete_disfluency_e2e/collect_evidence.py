@@ -63,8 +63,8 @@ def variant_specs(res: str):
             "kind": "native",
             "quant": x,
         }
-    # The serve (HTTP Mode B) surface is characterized at 720p only, per the plan
-    # matrix; it is not part of the 1080p rows.
+    # The serve (HTTP Mode B) surface is characterized at 720p only in the serve
+    # coverage matrix; it is not part of the 1080p rows.
     if res == "720p":
         for x in q:
             specs[f"serve_{x}"] = {
@@ -259,6 +259,15 @@ def build_variant_rows(out: Path, specs: dict) -> dict:
             "spec": s,
         }
     return rows
+
+
+def reference_retake(rows: dict, name: str):
+    """A variant's retake clip as a ``Path``; the row already holds the out-dir-prefixed path.
+
+    Consume it directly (do NOT re-join with the out dir) so a relative out dir does not
+    double-prefix into ``out/out/...`` and lose the reference decode.
+    """
+    return Path(rows[name]["retake_mp4"]) if name in rows else None
 
 
 def build_phase_timing(out: Path, rows: dict) -> dict:
@@ -483,8 +492,8 @@ def main():
             return arr
         return arr[lb0:lb1]
 
-    bf16_retake = out / rows["native_bf16"]["retake_mp4"] if "native_bf16" in rows else None
-    up_retake = out / rows["upstream"]["retake_mp4"] if "upstream" in rows else None
+    bf16_retake = reference_retake(rows, "native_bf16")
+    up_retake = reference_retake(rows, "upstream")
     ref_bf16 = decode_rgb(bf16_retake) if bf16_retake and bf16_retake.exists() else None
     ref_up = decode_rgb(up_retake) if up_retake and up_retake.exists() else None
 
