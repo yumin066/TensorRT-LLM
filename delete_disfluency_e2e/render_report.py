@@ -70,7 +70,8 @@ def rows(art: Path, res: str):
         if name not in st:
             continue
         p, q = ph.get(name, {}), ql.get(name, {})
-        vb = q.get("window_vs_bf16") if isinstance(q.get("window_vs_bf16"), dict) else {}
+        # window quality is reported against the upstream retake as the common baseline
+        vb = q.get("window_vs_upstream") if isinstance(q.get("window_vs_upstream"), dict) else {}
         assr = asr.get(name, {})
         out.append(
             {
@@ -98,11 +99,14 @@ def rows(art: Path, res: str):
 
 def table(res_rows):
     L = [
-        "| variant | status | APPLY | LTX | POST | single-shot | warm p50 | peak GiB | win PSNR/SSIM vs bf16 | assert |",
+        "| variant | status | APPLY | LTX | POST | single-shot | warm p50 | peak GiB | win PSNR/SSIM vs upstream | assert |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in res_rows:
-        qual = f"{_n(r['psnr'])} / {_n(r['ssim'])}" if r["psnr"] != "—" else "—"
+        if r["name"] == "upstream":
+            qual = "基线"
+        else:
+            qual = f"{_n(r['psnr'])} / {_n(r['ssim'])}" if r["psnr"] != "—" else "—"
         L.append(
             f"| {r['name']} | {r['status']} | {_n(r['apply'])} | {_n(r['ltx'])} | {_n(r['post'])} | "
             f"{_n(r['single_shot'])} | {_n(r['warm'])} | {_n(r['mem'])} | {qual} | {r['passed']} |"
@@ -239,7 +243,9 @@ def main():
     L.append(
         f"- upstream 720p warm LTX {_n(upv.get('ltx'))}s(冷 NFS 首跑曾 750s)。合法对比:native single_shot vs upstream(含加载);native warm vs serve engine。不得下 46× 结论。"
     )
-    L.append("- FP8 近无损、NVFP4 明显改变(见质量列),速度不得脱离质量呈现。")
+    L.append(
+        "- 质量列以 upstream retake 为共同基线(vs upstream)。native bf16 与 FP8 与 upstream 的差距基本持平(~27.5 dB)——FP8 相对 bf16 无额外量化损失;NVFP4 窗口塌(~9 dB)。速度不得脱离质量呈现。"
+    )
     L.append("")
     # rstrip so the output is idempotent with the end-of-file-fixer pre-commit hook
     Path(args.out).write_text("\n".join(L).rstrip("\n") + "\n")
