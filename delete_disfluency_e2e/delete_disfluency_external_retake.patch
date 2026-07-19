@@ -1,0 +1,166 @@
+diff --git a/script_editing/delete_disfluency.py b/script_editing/delete_disfluency.py
+index 77bb6df..d8b6fef 100644
+--- a/script_editing/delete_disfluency.py
++++ b/script_editing/delete_disfluency.py
+@@ -33,6 +33,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import shutil
+ import subprocess
+ import time
+ from dataclasses import dataclass
+@@ -186,6 +187,34 @@ def composite_bridge(edited_path: str, retake_path: str, a: int, lb0: int, lb1:
+     Path(tmp).unlink(missing_ok=True)
+ 
+ 
++# FFmpeg/decoder error base, resolved defensively across PyAV versions.
++_AV_ERR = getattr(av, "FFmpegError", None) or getattr(getattr(av, "error", None), "FFmpegError", Exception)
++
++
++def preflight_external_retake(ext_path: str, meta_in, fps_rtol: float = 0.02) -> None:
++    """Validate a caller-supplied retake clip against the retake-input geometry
++    before it is spliced back in. The composite indexes frames [0, total) and
++    overwrites whole frame arrays, so an external clip must match the retake
++    input's frame count and pixel dimensions EXACTLY; mismatches are rejected
++    loudly (no silent scale/pad/resample). Also confirms the clip decodes."""
++    ext = get_videostream_metadata(ext_path)
++    problems = []
++    if ext.frames != meta_in.frames:
++        problems.append(f"frame_count {ext.frames} != retake_input {meta_in.frames}")
++    if ext.width != meta_in.width or ext.height != meta_in.height:
++        problems.append(f"resolution {ext.width}x{ext.height} != retake_input {meta_in.width}x{meta_in.height}")
++    if meta_in.fps > 0 and abs(ext.fps - meta_in.fps) > fps_rtol * meta_in.fps:
++        problems.append(f"fps {ext.fps:.4f} != retake_input {meta_in.fps:.4f}")
++    try:
++        with av.open(ext_path) as container:
++            vstream = next(s for s in container.streams if s.type == "video")
++            next(container.decode(vstream)).to_ndarray(format="rgb24")
++    except (StopIteration, ValueError, OSError, _AV_ERR) as e:
++        problems.append(f"pix_fmt/decode: {e}")
++    if problems:
++        raise SystemExit("[external-retake] rejected: " + "; ".join(problems))
++
++
+ def side_by_side(left: str, right: str, out_path: str, timeout_s: float = 180.0) -> None:
+     # Scale both to the SAME height (hstack requires equal heights); pad widths so
+     # portrait clips of slightly different aspect still stack cleanly.
+@@ -236,6 +265,11 @@ def main() -> None:
+     ap.add_argument("--height", type=int, default=1280, help="Retake height (multiple of 32). Default 1280.")
+     ap.add_argument("--prompt", default="a person talking to the camera, natural head motion, clear speech")
+     ap.add_argument("--seed", type=int, default=42)
++    ap.add_argument("--external-retake", default=None,
++                    help="Path to a pre-generated retake clip. When set, the in-process "
++                         "RetakePipeline model call is skipped entirely and this clip is used "
++                         "as the regenerated window for the composite. It must match the retake "
++                         "input's frame count and pixel dimensions exactly (validated before use).")
+     args = ap.parse_args()
+ 
+     outdir = Path(args.output_dir)
+@@ -290,42 +324,53 @@ def main() -> None:
+     meta_in = get_videostream_metadata(retake_in)
+     print(f"[window] retake input: {meta_in.width}x{meta_in.height} {meta_in.frames}f @ {fps:.0f}fps")
+ 
+-    # ---- 5. the ONE model call: upstream RetakePipeline ---------------------
+-    quant = None if args.quantization == "none" else QuantizationKind(args.quantization).to_policy(checkpoint_path=args.checkpoint)
+-    loras = []
+-    if args.lora:
+-        loras.append(LoraPathStrengthAndSDOps(args.lora, args.lora_strength, LTXV_LORA_COMFY_RENAMING_MAP))
+-
+-    pipeline = RetakePipeline(
+-        checkpoint_path=args.checkpoint,
+-        gemma_root=args.gemma_root,
+-        loras=loras,
+-        quantization=quant,
+-        distilled=True,
+-        offload_mode=OffloadMode(args.offload_mode),
+-    )
+-    params = detect_params(args.checkpoint)
+-    tiling = TilingConfig.default()
+-
+-    t_diff0 = time.time()
+-    video_iter, audio = pipeline(
+-        video_path=retake_in,
+-        prompt=args.prompt,
+-        start_time=bridge_start_s,
+-        end_time=bridge_end_s,
+-        seed=args.seed,
+-        video_guider_params=params.video_guider_params,
+-        audio_guider_params=params.audio_guider_params,
+-        regenerate_video=True,    # regenerate the bridge frames
+-        regenerate_audio=False,   # keep the spliced audio (the "delete" is in the audio)
+-        tiling_config=tiling,
+-    )
++    # ---- 5. the retake window: the ONE model call, or a supplied external clip
+     retake_out = str(outdir / "retake_output.mp4")
+-    chunks = get_video_chunks_number(meta_in.frames, tiling)
+-    encode_video(video=video_iter, fps=int(round(fps)), audio=audio, output_path=retake_out, video_chunks_number=chunks)
+-    torch.cuda.synchronize()
+-    diffusion_s = time.time() - t_diff0
+-    print(f"[retake] LTX retake done in {diffusion_s:.1f}s -> {retake_out}")
++    if args.external_retake:
++        # External seam: skip the model call entirely and splice in a clip that
++        # was regenerated elsewhere (validated against the retake-input geometry).
++        preflight_external_retake(args.external_retake, meta_in)
++        if Path(args.external_retake).resolve() != Path(retake_out).resolve():
++            shutil.copyfile(args.external_retake, retake_out)
++        diffusion_s = None
++        retake_source = "external"
++        print(f"[retake] external retake accepted -> {retake_out}")
++    else:
++        quant = None if args.quantization == "none" else QuantizationKind(args.quantization).to_policy(checkpoint_path=args.checkpoint)
++        loras = []
++        if args.lora:
++            loras.append(LoraPathStrengthAndSDOps(args.lora, args.lora_strength, LTXV_LORA_COMFY_RENAMING_MAP))
++
++        pipeline = RetakePipeline(
++            checkpoint_path=args.checkpoint,
++            gemma_root=args.gemma_root,
++            loras=loras,
++            quantization=quant,
++            distilled=True,
++            offload_mode=OffloadMode(args.offload_mode),
++        )
++        params = detect_params(args.checkpoint)
++        tiling = TilingConfig.default()
++
++        t_diff0 = time.time()
++        video_iter, audio = pipeline(
++            video_path=retake_in,
++            prompt=args.prompt,
++            start_time=bridge_start_s,
++            end_time=bridge_end_s,
++            seed=args.seed,
++            video_guider_params=params.video_guider_params,
++            audio_guider_params=params.audio_guider_params,
++            regenerate_video=True,    # regenerate the bridge frames
++            regenerate_audio=False,   # keep the spliced audio (the "delete" is in the audio)
++            tiling_config=tiling,
++        )
++        chunks = get_video_chunks_number(meta_in.frames, tiling)
++        encode_video(video=video_iter, fps=int(round(fps)), audio=audio, output_path=retake_out, video_chunks_number=chunks)
++        torch.cuda.synchronize()
++        diffusion_s = time.time() - t_diff0
++        retake_source = "upstream_retakepipeline"
++        print(f"[retake] LTX retake done in {diffusion_s:.1f}s -> {retake_out}")
+ 
+     # ---- 6. composite the WHOLE regenerated window back + compare -----------
+     # Replacing the entire window (not just the bridge) keeps the action region
+@@ -345,13 +390,15 @@ def main() -> None:
+                           "width": args.width, "height": args.height, "fps": fps},
+         "quantization": args.quantization,
+         "lora": args.lora,
+-        "diffusion_seconds": round(diffusion_s, 2),
++        "retake_source": retake_source,
++        "diffusion_seconds": round(diffusion_s, 2) if diffusion_s is not None else None,
+         "total_seconds": round(time.time() - t_run0, 2),
+         "outputs": {"edited_full": edited, "retake_input": retake_in, "retake_output": retake_out, "final": final},
+     }
+     (outdir / "timing.json").write_text(json.dumps(timing, indent=2))
+     print(f"[done] final cleaned clip -> {final}")
+-    print(f"[done] timing -> {outdir/'timing.json'}  (diffusion {diffusion_s:.1f}s, total {timing['total_seconds']}s)")
++    _diff_str = f"{diffusion_s:.1f}s" if diffusion_s is not None else "external"
++    print(f"[done] timing -> {outdir/'timing.json'}  (diffusion {_diff_str}, total {timing['total_seconds']}s)")
+ 
+     # Best-effort debug video; final.mp4 + timing.json above are the actual eval deliverable.
+     compare = str(outdir / "compare_original_vs_final.mp4")
