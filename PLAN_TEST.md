@@ -92,6 +92,13 @@ flag;所有测量/汇总脚手架放在独立的测试驱动脚本里。
   - 负测试:
     - 只在 host 上验证 flag 逻辑、无 GPU 运行,不满足 AC-8。
 
+- AC-9:每个变体产出的 `final_<variant>.mp4` 与 retake 输出 mp4(native/serve 的 `retake_<variant>.mp4`、upstream 的 `final_upstream.mp4` / `retake_output.mp4`)跑完后都从 GPU 节点拉回 host 机器,收进 host 的 `artifacts/<res>/` 目录;该 `artifacts/` 目录加入 `.gitignore`,产物不进版本管理。
+  - 正测试(应 PASS):
+    - 一次完整跑后,host 的 `artifacts/<res>/` 下列得出全部 final + retake 输出 mp4(每个成功变体各一份);`git check-ignore artifacts/` 返回该路径,且 `git status` 不显示 `artifacts/` 下任何文件。
+  - 负测试(应 FAIL):
+    - 某个 final/retake mp4 只留在 GPU 节点、未拉回 host `artifacts/` 的运行,被交付检查拒绝。
+    - `artifacts/` 或其下 mp4 出现在 `git status` 的待提交/已跟踪列表里(漏加 `.gitignore`),被拒绝。
+
 ## Path Boundaries(路径边界)
 
 ### Upper Bound(最大可接受范围)
@@ -99,14 +106,17 @@ flag;所有测量/汇总脚手架放在独立的测试驱动脚本里。
 `final_<variant>.mp4`;一个接缝一致性预检(精确帧数 / 分辨率 / fps / pix_fmt);
 一张 §2 对齐的计时表,含单发 + warm p50 + 峰值显存 + 状态;信息性 PSNR/SSIM +
 源/upstream/变体 frame grid;音频来源与窗外解码一致性断言;一份两仓库 provenance
-manifest(两个 git revision 都钉住)。评测 harness 上一个附加 `--external-retake`
-flag 是唯一的 upstream/产品代码改动;所有测量/汇总都在独立测试驱动脚本里。
+manifest(两个 git revision 都钉住)。所有 final 与 retake 输出 mp4 跑完后拉回 host
+`artifacts/<res>/`(该目录 gitignored,产物不进仓库)。评测 harness 上一个附加
+`--external-retake` flag 是唯一的 upstream/产品代码改动;所有测量/汇总都在独立测试
+驱动脚本里。
 
 ### Lower Bound(最小可接受范围)
 upstream 基线 + 至少 native bf16、native FP8 与一个 serve 变体,各经 `--external-retake`
 接缝在 720p 产出 `final.mp4`,带 APPLY/LTX/POST 单发计时以及音频来源 +
-窗外解码一致性断言。NVFP4、1080p、warm-p50 与 frame grid 可降级为
-`unsupported`/`skipped`,**但仅当**被记为显式 gap。
+窗外解码一致性断言,且 final/retake 输出 mp4 拉回 host `artifacts/`(`.gitignore`)。
+NVFP4、1080p、warm-p50 与 frame grid 可降级为 `unsupported`/`skipped`,**但仅当**被记为
+显式 gap。
 
 ### Allowed Choices(允许的选择)
 - 可用:现有 `examples/visual_gen/ltx2_retake_*.py` harness(oracle / timing /
@@ -186,6 +196,7 @@ upstream 基线 + 至少 native bf16、native FP8 与一个 serve 变体,各经 
 | task10 | 把所有行汇成一张报告(720p 全 + 1080p 放得下的);记录 gap;两仓库 provenance | AC-5 | coding | task4,task7,task8,task9 |
 | task11 | 在节点/容器上 GPU 验证 `--external-retake` 路径一次 | AC-8 | coding | task7 |
 | task12 | 交叉核查计时归因 + 公平性(upstream 与 TRT 之间锁定 prompt/seed/steps/LoRA/LoRA-strength;APPLY/POST 复用如实标注) | AC-5 | analyze | task4,task5,task6 |
+| task13 | 把每个变体的 `final_<variant>.mp4` + retake 输出 mp4(含 upstream)从 GPU 节点拉回 host `artifacts/<res>/`;把 `artifacts/` 加入 `.gitignore` | AC-9 | coding | task7 |
 
 ## Claude-Codex Deliberation(Claude-Codex 商讨)
 
@@ -194,6 +205,7 @@ upstream 基线 + 至少 native bf16、native FP8 与一个 serve 变体,各经 
 - 接缝一致性(精确 `total` 帧数 / 分辨率 / fps / pix_fmt)必须预检验证,不能假设。
 - 质量为信息性;正确性门挂在 结构 + 音频来源 + 窗外解码一致性 上。
 - 近容量 native 行子进程隔离,单次 OOM 不污染整个扫描。
+- 所有 final / retake 输出 mp4 跑完拉回 host `artifacts/<res>/`;`artifacts/` 加入 `.gitignore`,产物不进仓库。
 
 ### Resolved Disagreements(已解决的分歧)
 - "TRT 产出完整合成视频还是只有窗口?":由代码判定 —— native `infer()` 内部合成,返回完整同长视频,故可直接作为 step-5 替代物落入 `composite_bridge`。
@@ -229,6 +241,7 @@ upstream 基线 + 至少 native bf16、native FP8 与一个 serve 变体,各经 
 - 每处代码改动在节点/容器上 GPU 验证一次(项目硬规则)—— host 侧验证 flag 逻辑必要但不充分。
 - 始终显式传横版 `--width/--height`;评测默认是竖版(704×1280),会把宽高比转向。
 - manifest 钉住两个仓库的 git revision(TensorRT-LLM 与工作树版 `LTX2.3-eval`,其 `composite_bridge(… a, 0, total …)` 对 step 6 为权威)。
+- 所有变体的 `final_<variant>.mp4` 与 retake 输出 mp4(含 upstream)跑完后从 GPU 节点拉回 host 的 `artifacts/<res>/` 目录供审阅;`artifacts/` 加入 `.gitignore`,产物(mp4/timing/report)不进版本管理。
 
 ## Output File Convention(输出文件约定)
 
