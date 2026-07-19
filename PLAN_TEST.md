@@ -1,221 +1,273 @@
-# LTX-2.3 delete_disfluency E2E test — upstream vs TensorRT-LLM retake (one real case)
+# LTX-2.3 delete_disfluency 端到端测试 — upstream vs TensorRT-LLM retake(一个真实用例)
 
-## Goal Description
+## Goal Description(目标描述)
 
-Run ONE real `delete_disfluency` edit case end-to-end and produce a **complete, reviewable final video** for every retake engine, so we can compare the upstream LTX2.3-eval retake against the TensorRT-LLM native retake (bf16 / FP8 / NVFP4, in both in-process *native* and *trtllm-serve* HTTP forms) on both **latency** (aligned to the `latency_report.pdf` §2 APPLY/LTX/POST stage map) and **regenerated-window quality**.
+把一个真实的 `delete_disfluency` 编辑用例端到端跑一遍,为每个 retake 引擎产出一个
+**完整、可审阅的最终视频**,从而对比 upstream LTX2.3-eval retake 与 TensorRT-LLM
+native retake(bf16 / FP8 / NVFP4,含 in-process 的 *native* 与 *trtllm-serve* HTTP
+两种形态)在**延迟**(对齐 `latency_report.pdf` §2 的 APPLY/LTX/POST 阶段图)与
+**重生成窗口质量**两方面的表现。
 
-The case is `LTX2.3-eval/script_editing/eval_cases.json[0]` (`delete_disfluency`): clip `--Y9imYnfBw-f0-484.mp4` (talking-head "Bill Gates", 1920×1080, 29.97 fps, ~16.15 s, 484 frames), filler `[UH]` at span `[5.20, 5.54] s`.
+用例为 `LTX2.3-eval/script_editing/eval_cases.json[0]`(`delete_disfluency`):片段
+`--Y9imYnfBw-f0-484.mp4`(talking-head "Bill Gates",1920×1080,29.97 fps,~16.15 s,
+484 帧),filler `[UH]` 位于 span `[5.20, 5.54] s`。
 
-The upstream pipeline stays the single source of truth for everything except the model call. Its steps 1–4 (transcript → `splice_out` → `crop_window` → `retake_input.mp4` + the `a`/`total`/`bridge`/`lb0`/`lb1` geometry) and step 6 (`composite_bridge`) are reused unchanged; only step 5 (the `RetakePipeline` model call) is swapped for a TensorRT-LLM retake. **Exactly what upstream does:** the model regenerates only the middle bridge window `[bridge_start_s, bridge_end_s] = [lb0/fps, lb1/fps]` inside the `total`-frame `retake_input.mp4` and returns a full `total`-frame video (conditioning frames ≈ input, middle regenerated); step 6 then splices the **whole** `total`-frame window `[0, total)` back at offset `a` via `composite_bridge(edited, retake_out, a, 0, total, fps, final)`. The TensorRT-LLM native retake matches this exactly: its `infer()` composites internally and returns a full same-length video with `frame_rate = source fps`.
+upstream 流水线除模型调用外仍是唯一权威。它的 steps 1–4(transcript → `splice_out`
+→ `crop_window` → `retake_input.mp4` + `a`/`total`/`bridge`/`lb0`/`lb1` 几何)与
+step 6(`composite_bridge`)原样复用;只有 step 5(`RetakePipeline` 模型调用)换成
+TensorRT-LLM retake。**upstream 的确切行为:** 模型只重生成 `total` 帧
+`retake_input.mp4` 里中间的 bridge 窗口 `[bridge_start_s, bridge_end_s] = [lb0/fps,
+lb1/fps]`,返回一个完整的 `total` 帧视频(conditioning 帧 ≈ 输入,中间重生成);
+step 6 随后把**整个** `total` 帧窗口 `[0, total)` 在偏移 `a` 处拼回,即
+`composite_bridge(edited, retake_out, a, 0, total, fps, final)`。TensorRT-LLM native
+retake 与此完全一致:它的 `infer()` 内部就做合成,返回一个 `frame_rate = 源 fps`
+的完整同长视频。
 
-TensorRT-LLM code (`tensorrt_llm/`) and upstream packages (`../LTX2.3-eval/packages/`) are **not** modified. The only change to upstream/product code is an additive `--external-retake` flag on the eval harness `LTX2.3-eval/script_editing/delete_disfluency.py`; all measurement/aggregation scaffolding lives in separate test-driver scripts.
+TensorRT-LLM 代码(`tensorrt_llm/`)与 upstream packages(`../LTX2.3-eval/packages/`)
+**不**改动。对 upstream/产品代码唯一的改动,是在评测 harness
+`LTX2.3-eval/script_editing/delete_disfluency.py` 上加一个附加的 `--external-retake`
+flag;所有测量/汇总脚手架放在独立的测试驱动脚本里。
 
-All numbers are measured on one RTX PRO 6000 Blackwell (sm_120, 96 GB) — absolute latencies differ from the H100 reference report; only the §2 stage-map *structure* is inherited.
+所有数字都在一台 RTX PRO 6000 Blackwell(sm_120,96 GB)上测量 —— 绝对延迟与 H100
+参考报告不同;只继承 §2 阶段图的*结构*。
 
-## Acceptance Criteria
+## Acceptance Criteria(验收标准)
 
-Following TDD philosophy, each criterion includes positive and negative tests for deterministic verification.
+遵循 TDD 理念,每条标准都含正/负测试以便确定性验证。
 
-- AC-1: Upstream baseline runs the case end-to-end and emits a full `final.mp4` plus APPLY/LTX/POST stage-map timing and a manifest.
-  - Positive Tests (expected to PASS):
-    - `delete_disfluency.py` on the case with explicit landscape `--width 1280 --height 704` (~720p) and no `--external-retake` produces `final.mp4` whose frames outside `[a, a+total)` decode-match the spliced `edited_full.mp4` and whose disfluency window is regenerated.
-    - A `timing.json` splits measured wall into APPLY (transcript + splice + crop) + LTX (the one model call) + POST (composite/mux); a `manifest.json` records source sha256, span `[5.20, 5.54]`, `a`/`total`/`bridge`/`lb0`/`lb1`, resolution, fps, seed, model/LoRA/quant paths, and both repos' git revisions.
-    - The same case with `--width 1920 --height 1088` (~1080p) succeeds under upstream `--offload-mode cpu`.
-  - Negative Tests (expected to FAIL):
-    - A run that silently reuses a stale `final.mp4` (unchanged mtime / manifest sha256 mismatch) is rejected by the check driver.
-    - A `timing.json` whose APPLY+LTX+POST do not sum to within tolerance of measured wall is rejected.
+- AC-1:upstream 基线把用例端到端跑通,产出完整 `final.mp4` 加 APPLY/LTX/POST 阶段图计时和一份 manifest。
+  - 正测试(应 PASS):
+    - `delete_disfluency.py` 用显式横版 `--width 1280 --height 704`(~720p)、无 `--external-retake` 跑该用例,产出的 `final.mp4` 在 `[a, a+total)` 之外的帧与拼接后的 `edited_full.mp4` 解码一致,且 disfluency 窗口被重生成。
+    - 一份 `timing.json` 把实测 wall 拆成 APPLY(transcript + splice + crop)+ LTX(那唯一的模型调用)+ POST(composite/mux);一份 `manifest.json` 记录源 sha256、span `[5.20, 5.54]`、`a`/`total`/`bridge`/`lb0`/`lb1`、分辨率、fps、seed、model/LoRA/quant 路径,以及两个仓库的 git revision。
+    - 同用例用 `--width 1920 --height 1088`(~1080p)在 upstream `--offload-mode cpu` 下跑通。
+  - 负测试(应 FAIL):
+    - 一次静默复用了过期 `final.mp4`(mtime 未变 / manifest sha256 不匹配)的运行被检查驱动拒绝。
+    - 一份 APPLY+LTX+POST 之和与实测 wall 在容差外不相等的 `timing.json` 被拒绝。
 
-- AC-2: An additive `--external-retake <mp4>` flag on `delete_disfluency.py` (and nowhere else) makes step 5 use the provided video instead of calling `RetakePipeline`, while every other path stays identical to the unmodified script.
-  - Positive Tests:
-    - With `--external-retake X.mp4`, `RetakePipeline` is never constructed nor called; `X.mp4` is used as `retake_output` for step-6 `composite_bridge`; steps 1–4 and 6 run unchanged.
-    - Without the flag, the script's behavior and outputs are identical to the current committed script on a fixed seed (baseline diff shows no change).
-  - Negative Tests:
-    - A run with `--external-retake` set that still constructs/calls `RetakePipeline` (rather than short-circuiting step 5) is rejected.
-    - Any edit under `../LTX2.3-eval/packages/` or under `tensorrt_llm/` for this feature fails review (pristine-tree check).
+- AC-2:在 `delete_disfluency.py`(且仅此)上加的附加 `--external-retake <mp4>` flag 使 step 5 用提供的视频替代调用 `RetakePipeline`,而其余每条路径与未改脚本逐字节一致。
+  - 正测试:
+    - 带 `--external-retake X.mp4` 时,`RetakePipeline` 从不被构造或调用;`X.mp4` 被用作 step-6 `composite_bridge` 的 `retake_output`;steps 1–4 与 6 原样跑。
+    - 不带该 flag 时,脚本在固定 seed 上的行为与输出与当前签入脚本一致(基线 diff 无变化)。
+  - 负测试:
+    - 设了 `--external-retake` 却仍构造/调用 `RetakePipeline`(未短路 step 5)的运行被拒绝。
+    - 为此特性对 `../LTX2.3-eval/packages/` 或 `tensorrt_llm/` 的任何改动都在评审中失败(原封树检查)。
 
-- AC-3: A seam-parity preflight validates the external retake mp4 before `composite_bridge`, rejecting artifacts that would corrupt the splice.
-  - Positive Tests:
-    - An mp4 whose resolution == the processing size, whose frame count is **exactly** the `retake_input.mp4` frame count (`total`), whose fps/timebase matches `retake_input.mp4` within tolerance, and whose pixel format is decodable — passes and composites cleanly.
-  - Negative Tests:
-    - An mp4 with wrong resolution, wrong frame count (≠ `total`), or mismatched fps is rejected with a specific diagnostic naming the mismatched field. No silent scale/pad/resample.
+- AC-3:在 `composite_bridge` 之前有一个接缝一致性预检,拒绝会破坏拼接的产物。
+  - 正测试:
+    - 一个分辨率 == 处理尺寸、帧数**恰好** == `retake_input.mp4` 帧数(`total`)、fps/timebase 在容差内匹配 `retake_input.mp4`、像素格式可解码的 mp4 —— 通过并干净地合成。
+  - 负测试:
+    - 一个分辨率错、帧数错(≠ `total`)、或 fps 不匹配的 mp4 被拒绝,并给出点名不匹配字段的具体诊断。不做静默 scale/pad/resample。
 
-- AC-4: Every one of the 7 variants (upstream; native bf16/FP8/NVFP4; serve bf16/FP8/NVFP4) either produces a full composited `final_<variant>.mp4` through the same step-6 path, or is recorded as `oom` / `unsupported` / `timeout` with logs — never a silent gap.
-  - Positive Tests:
-    - Each TRT variant runs its retake on the dumped `retake_input.mp4` with model window `[lb0/fps, lb1/fps]`, returns a `total`-frame video, and yields `final_<variant>.mp4`.
-    - A variant that OOMs at 1080p is recorded as `oom` and does not abort the remaining variants (subprocess-per-item isolation).
-  - Negative Tests:
-    - A variant marked `ok` without a decodable `final_<variant>.mp4` of the expected duration/resolution is rejected.
+- AC-4:7 个变体(upstream;native bf16/FP8/NVFP4;serve bf16/FP8/NVFP4)中每一个,要么经同一条 step-6 路径产出完整合成的 `final_<variant>.mp4`,要么被记为 `oom` / `unsupported` / `timeout` 并带日志 —— 绝不静默缺失。
+  - 正测试:
+    - 每个 TRT 变体在转储的 `retake_input.mp4` 上以模型窗口 `[lb0/fps, lb1/fps]` 跑 retake,返回 `total` 帧视频,产出 `final_<variant>.mp4`。
+    - 一个在 1080p 下 OOM 的变体被记为 `oom`,且不中止其余变体(子进程隔离)。
+  - 负测试:
+    - 一个标为 `ok` 却没有预期时长/分辨率的可解码 `final_<variant>.mp4` 的变体被拒绝。
 
-- AC-5: Per-variant timing follows the §2 stage map and reports both single-shot and warm p50, plus peak memory and status.
-  - Positive Tests:
-    - Each row carries APPLY / LTX / POST, one cold single-shot latency, a warm p50 (resident native + serve), peak reserved memory, quant mode, native-vs-serve mode, and status; serve rows additionally split cold-start / first-served / warm and HTTP-wall vs engine time.
-    - APPLY and POST for TRT rows are the shared Phase-A/Phase-C costs, clearly labeled as reused; upstream carries its own per-run APPLY/POST.
-  - Negative Tests:
-    - Mixing a warm p50 sample into the single-shot number, or presenting reused APPLY/POST as if independently re-measured for a TRT row, is rejected by the aggregation schema.
+- AC-5:每变体计时遵循 §2 阶段图,同时报单发与 warm p50,外加峰值显存与状态。
+  - 正测试:
+    - 每行带 APPLY / LTX / POST、一个冷单发延迟、一个 warm p50(常驻 native + serve)、峰值 reserved 显存、量化模式、native-vs-serve 模式与状态;serve 行额外拆 cold-start / first-served / warm 以及 HTTP-wall vs engine 时间。
+    - TRT 行的 APPLY 与 POST 是共享的 Phase-A/Phase-C 成本,明确标为复用;upstream 带自己的每次运行 APPLY/POST。
+  - 负测试:
+    - 把 warm p50 样本混进单发数字,或把复用的 APPLY/POST 当作某 TRT 行独立重测来呈现,被汇总 schema 拒绝。
 
-- AC-6: Regenerated-window quality is reported as informational signal only and never gates pass/fail; a source-vs-upstream-vs-variant frame grid is produced for human review.
-  - Positive Tests:
-    - PSNR/SSIM of the regenerated **window** (edited region only, not the whole clip) vs the bf16/upstream reference is emitted per variant; a side-by-side frame grid at the cut seam is written for eyeball review of FP8/NVFP4 drift.
-    - Frames of each `final_<variant>.mp4` outside `[a, a+total)` are **decode-tolerant-equal** to `edited_full.mp4` (both are H.264 CRF-16 re-encodes, so this is a tolerant decoded comparison, not byte identity). Byte-level composite identity is asserted only at the TRT tensor/PT level via the existing `ltx2_retake_oracle.py` harness, not on the deliverable mp4.
-  - Negative Tests:
-    - A run that gates correctness on a PSNR/SSIM threshold is rejected (quality is informational by project rule).
-    - A `final_<variant>.mp4` whose outside-window frames diverge from `edited_full.mp4` beyond decode tolerance is rejected.
+- AC-6:重生成窗口质量仅作为信息性信号报告,绝不作为 pass/fail 门;为人工审阅产出一张 源-vs-upstream-vs-变体 的 frame grid。
+  - 正测试:
+    - 每变体输出重生成**窗口**(仅编辑区,而非整段)相对 bf16/upstream 参考的 PSNR/SSIM;在切点接缝处写一张并排 frame grid 供肉眼看 FP8/NVFP4 漂移。
+    - 每个 `final_<variant>.mp4` 在 `[a, a+total)` 之外的帧与 `edited_full.mp4` **解码容差相等**(两者都是 H.264 CRF-16 重编码,所以这是解码容差比对,不是字节一致)。字节级合成一致仅在 TRT tensor/PT 层经现有 `ltx2_retake_oracle.py` harness 断言,不在交付 mp4 上。
+  - 负测试:
+    - 把正确性门挂在 PSNR/SSIM 阈值上的运行被拒绝(按项目规则质量为信息性)。
+    - 一个 `final_<variant>.mp4` 窗外帧偏离 `edited_full.mp4` 超出解码容差,被拒绝。
 
-- AC-7: Audio in every TRT `final_<variant>.mp4` derives from the upstream spliced audio (the retake is video-only), asserted — not TRT-generated and not from the external retake mp4.
-  - Positive Tests:
-    - Step 6 muxes video from `retake_out` (`-map 0:v`) and audio from `edited_full.mp4` (`-map 1:a`, `-c:a aac`); the assertion confirms `final` audio matches the `edited` audio in duration/content (an AAC transcode, not stream byte-equality), and the external retake mp4's audio (if any) is ignored.
-  - Negative Tests:
-    - A final whose audio came from the external retake mp4, or is missing, is rejected.
+- AC-7:每个 TRT `final_<variant>.mp4` 里的音频源自 upstream 拼接后的音频(retake 是纯视频),需断言 —— 不是 TRT 生成的、也不来自外部 retake mp4。
+  - 正测试:
+    - step 6 从 `retake_out` 取视频(`-map 0:v`)、从 `edited_full.mp4` 取音频(`-map 1:a`, `-c:a aac`);断言确认 `final` 音频在时长/内容上匹配 `edited` 音频(一次 AAC 转码,不是流字节相等),外部 retake mp4 的音频(若有)被忽略。
+  - 负测试:
+    - 一个音频来自外部 retake mp4、或音频缺失的 final,被拒绝。
 
-- AC-8: The `--external-retake` code path is exercised once end-to-end on the GPU before the feature is considered done (project hard rule).
-  - Positive Tests:
-    - At least one real GPU run of `delete_disfluency.py --external-retake ...` on the case produces a `final.mp4`, logged with the node/container.
-  - Negative Tests:
-    - Host-only validation of the flag logic, with no GPU run, does not satisfy AC-8.
+- AC-8:在特性算 done 之前,`--external-retake` 代码路径在 GPU 上端到端跑一次(项目硬规则)。
+  - 正测试:
+    - 至少一次在该用例上真实的 GPU 运行 `delete_disfluency.py --external-retake ...` 产出一个 `final.mp4`,并记录节点/容器。
+  - 负测试:
+    - 只在 host 上验证 flag 逻辑、无 GPU 运行,不满足 AC-8。
 
-## Path Boundaries
+## Path Boundaries(路径边界)
 
-### Upper Bound (Maximum Acceptable Scope)
-The full 7-variant matrix at 720p plus 1080p for the variants that fit; each variant produces a reviewable `final_<variant>.mp4`; a seam-parity preflight (exact frame count / resolution / fps / pix_fmt); a §2-aligned timing table with single-shot + warm p50 + peak memory + status; informational PSNR/SSIM + a source/upstream/variant frame grid; audio-derivation and outside-window decode-identity assertions; a two-repo provenance manifest (both git revisions pinned). One additive `--external-retake` flag on the eval harness is the only upstream/product code change; all measurement/aggregation is in separate test-driver scripts.
+### Upper Bound(最大可接受范围)
+完整 7 变体矩阵在 720p,加上放得下的变体在 1080p;每个变体产出可审阅的
+`final_<variant>.mp4`;一个接缝一致性预检(精确帧数 / 分辨率 / fps / pix_fmt);
+一张 §2 对齐的计时表,含单发 + warm p50 + 峰值显存 + 状态;信息性 PSNR/SSIM +
+源/upstream/变体 frame grid;音频来源与窗外解码一致性断言;一份两仓库 provenance
+manifest(两个 git revision 都钉住)。评测 harness 上一个附加 `--external-retake`
+flag 是唯一的 upstream/产品代码改动;所有测量/汇总都在独立测试驱动脚本里。
 
-### Lower Bound (Minimum Acceptable Scope)
-Upstream baseline + at least native bf16, native FP8, and one serve variant, each producing a `final.mp4` at 720p through the `--external-retake` seam, with APPLY/LTX/POST single-shot timing and the audio-derivation + outside-window-decode-identity assertions. NVFP4, 1080p, warm-p50, and the frame grid may degrade to `unsupported`/`skipped` **only** if recorded as an explicit gap.
+### Lower Bound(最小可接受范围)
+upstream 基线 + 至少 native bf16、native FP8 与一个 serve 变体,各经 `--external-retake`
+接缝在 720p 产出 `final.mp4`,带 APPLY/LTX/POST 单发计时以及音频来源 +
+窗外解码一致性断言。NVFP4、1080p、warm-p50 与 frame grid 可降级为
+`unsupported`/`skipped`,**但仅当**被记为显式 gap。
 
-### Allowed Choices
-- Can use: the existing `examples/visual_gen/ltx2_retake_*.py` harnesses (oracle / timing / serve_timing / quant_mem) to drive the TRT retakes; a separate workstream test-driver for orchestration/timing/aggregation; `ffprobe`/PyAV/OpenCV for preflight + metrics; subprocess-per-item isolation for near-capacity rows; upstream `--offload-mode cpu` for the upstream 1080p baseline; explicit landscape `--width/--height` on every invocation (eval defaults are portrait 704×1280 and must be overridden).
-- Cannot use: any modification to `../LTX2.3-eval/packages/` or to `tensorrt_llm/`; any resample of a variant's output to a different resolution before compare (compare within-resolution only); any gating of correctness on PSNR/SSIM; any claim of mp4 byte-identity (the final is CRF-16 re-encoded).
+### Allowed Choices(允许的选择)
+- 可用:现有 `examples/visual_gen/ltx2_retake_*.py` harness(oracle / timing /
+  serve_timing / quant_mem)驱动 TRT retake;一个独立的 workstream 测试驱动做
+  编排/计时/汇总;`ffprobe`/PyAV/OpenCV 做预检 + 指标;近容量行用子进程逐项隔离;
+  upstream 的 1080p 基线用 `--offload-mode cpu`;每次调用都显式传横版 `--width/--height`
+  (评测默认是竖版 704×1280,必须覆盖)。
+- 不可用:对 `../LTX2.3-eval/packages/` 或 `tensorrt_llm/` 的任何改动;在比较前把变体
+  输出 resample 到别的分辨率(只做分辨率内比较);把正确性门挂在 PSNR/SSIM 上;
+  任何 mp4 字节一致的说法(final 是 CRF-16 重编码)。
 
-## Feasibility Hints and Suggestions
+## Feasibility Hints and Suggestions(可行性提示与建议)
 
-> **Note**: This section is for reference and understanding only. These are conceptual suggestions, not prescriptive requirements.
+> **注**:本节仅供参考理解,是概念性建议、非硬性要求。
 
-### Conceptual Approach
-Three phases:
-- **Phase A (dump, once):** run upstream steps 1–4 to materialize `retake_input.mp4` (a `total`-frame window, landscape processing size) + `geometry.json` (`a`, `total`, `bridge`, `lb0`, `lb1`, `fps`, `w×h`, `splice_frame`) and the APPLY-block timing. Shared input for all TRT variants.
-- **Phase B (per-engine retake):** feed `retake_input.mp4` to the TRT retake with model window `[lb0/fps, lb1/fps]` (the middle bridge — TRT's `_retake_pixel_window` uses `round(t*fps)`, so `lb0/fps, lb1/fps` recovers exactly `[lb0, lb1]`). Native via the oracle/timing harness in-process; serve via `POST /v1/videos/generations` with `retake_video_path/retake_start_time/retake_end_time`. TRT composites internally and returns a `total`-frame video → `retake_<variant>.mp4`. Serve needs a quantized (FP8/NVFP4) server config and an **artifact-producing** call (not the `format='pt'` pure-latency path) so a decodable mp4 is saved.
-- **Phase C (composite, per variant):** call `delete_disfluency.py --external-retake retake_<variant>.mp4` so upstream step-6 `composite_bridge(edited, retake_out, a, 0, total, fps, final)` splices the whole window back → `final_<variant>.mp4`, exercising the preflight.
+### 概念方法
+三阶段:
+- **Phase A(转储,一次):** 跑 upstream steps 1–4,产出 `retake_input.mp4`(一个
+  `total` 帧窗口,横版处理尺寸)+ `geometry.json`(`a`、`total`、`bridge`、`lb0`、
+  `lb1`、`fps`、`w×h`、`splice_frame`)与 APPLY-block 计时。所有 TRT 变体的共享输入。
+- **Phase B(每引擎 retake):** 把 `retake_input.mp4` 喂给 TRT retake,模型窗口
+  `[lb0/fps, lb1/fps]`(中间 bridge —— TRT 的 `_retake_pixel_window` 用 `round(t*fps)`,
+  故 `lb0/fps, lb1/fps` 精确还原 `[lb0, lb1]`)。native 经 oracle/timing harness
+  in-process;serve 经 `POST /v1/videos/generations`,带
+  `retake_video_path/retake_start_time/retake_end_time`。TRT 内部合成,返回 `total`
+  帧视频 → `retake_<variant>.mp4`。serve 需要量化(FP8/NVFP4)server 配置和一个
+  **产物**调用(非 `format='pt'` 纯测时路径),以便落一个可解码 mp4。
+- **Phase C(合成,每变体):** 调 `delete_disfluency.py --external-retake
+  retake_<variant>.mp4`,让 upstream step-6 `composite_bridge(edited, retake_out, a,
+  0, total, fps, final)` 把整窗拼回 → `final_<variant>.mp4`,并触发预检。
 
-### Relevant References
-- `LTX2.3-eval/script_editing/delete_disfluency.py` — `crop_window` (line 139, retake_input), `composite_bridge` (line 160, splice-back `[0,total)`), `main()` geometry (lines 262–336); add `--external-retake` here.
-- `tensorrt_llm/_torch/visual_gen/models/ltx2/pipeline_ltx2_retake.py` — `_retake_pixel_window`, `_composite_retake_window`, `infer()` (returns full same-length video, `frame_rate=fps`).
-- `examples/visual_gen/ltx2_retake_oracle.py` / `ltx2_retake_serve_timing.py` — native + serve drivers; `build_retake_payload` (serve payload; note `format='pt'` is pure-latency, needs a video-format variant for artifacts).
-- `examples/visual_gen/RETAKE_ACCELERATION_REPORT.md` §2/§3 — resolution/memory + quant fidelity anchors.
+### 相关参考
+- `LTX2.3-eval/script_editing/delete_disfluency.py` — `crop_window`(第 139 行,
+  retake_input)、`composite_bridge`(第 160 行,拼回 `[0,total)`)、`main()` 几何
+  (第 262–336 行);在此加 `--external-retake`。
+- `tensorrt_llm/_torch/visual_gen/models/ltx2/pipeline_ltx2_retake.py` —
+  `_retake_pixel_window`、`_composite_retake_window`、`infer()`(返回完整同长视频,
+  `frame_rate=fps`)。
+- `examples/visual_gen/ltx2_retake_oracle.py` / `ltx2_retake_serve_timing.py` —
+  native + serve 驱动;`build_retake_payload`(serve payload;注意 `format='pt'` 是
+  纯测时,产物需要一个视频格式的变体)。
+- `examples/visual_gen/RETAKE_ACCELERATION_REPORT.md` §2/§3 — 分辨率/显存 + 量化
+  保真锚点。
 
-## Dependencies and Sequence
+## Dependencies and Sequence(依赖与顺序)
 
-### Milestones
-1. Harness + seam: add `--external-retake` to `delete_disfluency.py`; add the frame-count/resolution/fps preflight; GPU-verify the flag path once.
-   - Phase A: dump `retake_input.mp4` + geometry.
-2. Upstream baseline (AC-1): full upstream run at 720p (and 1080p under cpu-offload) with §2 timing + manifest.
-3. TRT variant sweep (AC-4/5): native{bf16,fp8,nvfp4} + serve{bf16,fp8,nvfp4} retakes on the dumped window (subprocess-isolated), then Phase-C composite via the seam; per-row timing/memory/status.
-4. Quality + audio (AC-6/7): informational PSNR/SSIM (window-only), source/upstream/variant frame grid, audio-derivation + outside-window decode-identity assertions.
-5. Aggregate (AC-5): one report table over all variants (720p full + 1080p-that-fit); gaps recorded explicitly; two-repo provenance.
+### Milestones(里程碑)
+1. harness + 接缝:给 `delete_disfluency.py` 加 `--external-retake`;加帧数/分辨率/fps
+   预检;GPU 验证 flag 路径一次。
+   - Phase A:转储 `retake_input.mp4` + 几何。
+2. upstream 基线(AC-1):在 720p(以及 1080p 经 cpu-offload)完整跑 upstream,带
+   §2 计时 + manifest。
+3. TRT 变体扫描(AC-4/5):native{bf16,fp8,nvfp4} + serve{bf16,fp8,nvfp4} 在转储窗口
+   上 retake(子进程隔离),再经接缝做 Phase-C 合成;逐行计时/显存/状态。
+4. 质量 + 音频(AC-6/7):信息性 PSNR/SSIM(仅窗口)、源/upstream/变体 frame grid、
+   音频来源 + 窗外解码一致性断言。
+5. 汇总(AC-5):把所有行汇成一张报告表(720p 全 + 1080p 放得下的);gap 显式记录;
+   两仓库 provenance。
 
-<Dependencies are relative, not time-based: task3 (dump) gates the whole sweep; task1/task2 (flag+preflight) gate every composite.>
+<依赖是相对的、非时间线:task3(转储)门控整个扫描;task1/task2(flag+预检)门控每次合成。>
 
-## Task Breakdown
+## Task Breakdown(任务拆解)
 
-Each task must include exactly one routing tag: `coding` (Claude) or `analyze` (Codex).
+每个任务必须恰好带一个路由标签:`coding`(Claude)或 `analyze`(Codex)。
 
-| Task ID | Description | Target AC | Tag | Depends On |
+| Task ID | 描述 | 目标 AC | 标签 | 依赖 |
 |---------|-------------|-----------|-----|------------|
-| task1 | Add additive `--external-retake` flag to `delete_disfluency.py` (skip step-5 `RetakePipeline` construction+call, use mp4 for step-6); keep default path identical | AC-2 | coding | - |
-| task2 | Add seam-parity preflight before `composite_bridge`: exact `total` frame count, resolution == processing size, fps/timebase, decodable pix_fmt | AC-3 | coding | task1 |
-| task3 | Phase A: dump `retake_input.mp4` + `geometry.json` (a/total/bridge/lb0/lb1/fps/w×h/splice_frame) from upstream steps 1–4 | AC-1 | coding | - |
-| task4 | Upstream baseline full run at 720p + 1080p(cpu-offload) with §2 APPLY/LTX/POST timing + manifest (both repo revs) | AC-1,AC-5 | coding | task3 |
-| task5 | Phase B: drive native bf16/fp8/nvfp4 retakes on the dumped window (oracle/timing harness), subprocess-isolated, window `[lb0/fps,lb1/fps]` | AC-4,AC-5 | coding | task3 |
-| task6 | Phase B: drive serve bf16/fp8/nvfp4 retakes — quantized server config + artifact-producing (non-`pt`) call saving a decodable mp4; cold/first/warm split | AC-4,AC-5 | coding | task3 |
-| task7 | Phase C: composite every variant via `--external-retake` → `final_<variant>.mp4` (exercises preflight) | AC-4 | coding | task1,task2,task5,task6 |
-| task8 | Quality: informational PSNR/SSIM (window-only) + source/upstream/variant frame grid; record ffprobe metadata for retake_input / retake_<variant> / final_<variant> | AC-6 | coding | task7 |
-| task9 | Assertions: final audio derives from `edited` (AAC transcode, not external-retake audio); outside-window decode-tolerant identity vs `edited` | AC-7,AC-6 | coding | task7 |
-| task10 | Aggregate all rows into one report (720p full + 1080p-that-fit); record gaps; two-repo provenance | AC-5 | coding | task4,task7,task8,task9 |
-| task11 | GPU-verify the `--external-retake` path once on the node/container | AC-8 | coding | task7 |
-| task12 | Cross-check timing-attribution + fairness (locked prompt/seed/steps/LoRA/LoRA-strength across upstream and TRT; APPLY/POST reuse honesty) | AC-5 | analyze | task4,task5,task6 |
+| task1 | 给 `delete_disfluency.py` 加附加 `--external-retake` flag(跳过 step-5 `RetakePipeline` 构造+调用,用 mp4 做 step-6);保持默认路径不变 | AC-2 | coding | - |
+| task2 | 在 `composite_bridge` 前加接缝一致性预检:精确 `total` 帧数、分辨率 == 处理尺寸、fps/timebase、可解码 pix_fmt | AC-3 | coding | task1 |
+| task3 | Phase A:从 upstream steps 1–4 转储 `retake_input.mp4` + `geometry.json`(a/total/bridge/lb0/lb1/fps/w×h/splice_frame) | AC-1 | coding | - |
+| task4 | upstream 基线在 720p + 1080p(cpu-offload)完整跑,带 §2 APPLY/LTX/POST 计时 + manifest(两仓库 rev) | AC-1,AC-5 | coding | task3 |
+| task5 | Phase B:在转储窗口上驱动 native bf16/fp8/nvfp4 retake(oracle/timing harness),子进程隔离,窗口 `[lb0/fps,lb1/fps]` | AC-4,AC-5 | coding | task3 |
+| task6 | Phase B:驱动 serve bf16/fp8/nvfp4 retake —— 量化 server 配置 + 产物(非 `pt`)调用落可解码 mp4;cold/first/warm 拆分 | AC-4,AC-5 | coding | task3 |
+| task7 | Phase C:每变体经 `--external-retake` 合成 → `final_<variant>.mp4`(触发预检) | AC-4 | coding | task1,task2,task5,task6 |
+| task8 | 质量:信息性 PSNR/SSIM(仅窗口)+ 源/upstream/变体 frame grid;记录 retake_input / retake_<variant> / final_<variant> 的 ffprobe 元数据 | AC-6 | coding | task7 |
+| task9 | 断言:final 音频源自 `edited`(AAC 转码,非外部 retake 音频);窗外相对 `edited` 解码容差一致 | AC-7,AC-6 | coding | task7 |
+| task10 | 把所有行汇成一张报告(720p 全 + 1080p 放得下的);记录 gap;两仓库 provenance | AC-5 | coding | task4,task7,task8,task9 |
+| task11 | 在节点/容器上 GPU 验证 `--external-retake` 路径一次 | AC-8 | coding | task7 |
+| task12 | 交叉核查计时归因 + 公平性(upstream 与 TRT 之间锁定 prompt/seed/steps/LoRA/LoRA-strength;APPLY/POST 复用如实标注) | AC-5 | analyze | task4,task5,task6 |
 
-## Claude-Codex Deliberation
+## Claude-Codex Deliberation(Claude-Codex 商讨)
 
-### Agreements
-- Reuse upstream steps 1–4 + 6 unchanged; swap only step 5; single additive flag on the eval harness; measurement drivers are separate test scripts.
-- Seam parity (exact `total` frame count / resolution / fps / pix_fmt) must be preflight-validated, not assumed.
-- Quality is informational; correctness gates on structure + audio-derivation + outside-window decode-identity.
-- Near-capacity native rows run subprocess-isolated so one OOM never poisons the sweep.
+### Agreements(共识)
+- 原样复用 upstream steps 1–4 + 6;只换 step 5;评测 harness 上单个附加 flag;测量驱动是独立测试脚本。
+- 接缝一致性(精确 `total` 帧数 / 分辨率 / fps / pix_fmt)必须预检验证,不能假设。
+- 质量为信息性;正确性门挂在 结构 + 音频来源 + 窗外解码一致性 上。
+- 近容量 native 行子进程隔离,单次 OOM 不污染整个扫描。
 
-### Resolved Disagreements
-- "Does TRT emit a full composited video or just the window?": resolved by code — native `infer()` composites internally and returns a full same-length video, so it drops directly into `composite_bridge` as the step-5 replacement.
-- "Composite bounds": the working `delete_disfluency.py` calls `composite_bridge(edited, retake_out, a, 0, total, fps, final)` — the **whole** `total`-frame window is spliced (the model regenerates only the middle bridge). Preflight therefore requires **exactly `total`** frames, and the outside-window region is everything outside `[a, a+total)`.
-- "MP4 byte-identity": `composite_bridge` re-encodes all video H.264 CRF-16 and audio to AAC, so the deliverable mp4 is **not** byte-identical. Outside-window identity becomes a tolerant decoded comparison vs `edited`; byte-identity is asserted only at the TRT tensor/PT level (oracle harness).
-- "Audio validation": final audio is an AAC transcode mapped from `edited` (`-map 1:a`); assert it derives from `edited` (external-retake audio ignored), not stream byte-equality.
-- "Serve FP8/NVFP4 + artifacts": the existing serve-timing harness is bf16 and `format='pt'` only; task6 adds a quantized server config and an artifact-producing call that saves a decodable mp4.
-- "Resolution defaults": eval defaults are portrait 704×1280; pass explicit landscape `--width/--height` (1280×704 / 1920×1088) on every invocation.
+### Resolved Disagreements(已解决的分歧)
+- "TRT 产出完整合成视频还是只有窗口?":由代码判定 —— native `infer()` 内部合成,返回完整同长视频,故可直接作为 step-5 替代物落入 `composite_bridge`。
+- "合成范围":工作树里的 `delete_disfluency.py` 调用 `composite_bridge(edited, retake_out, a, 0, total, fps, final)` —— 拼接的是**整个** `total` 帧窗口(模型只重生成中间 bridge)。因此预检要求**恰好 `total`** 帧,窗外区域是 `[a, a+total)` 之外的一切。
+- "MP4 字节一致":`composite_bridge` 把全部视频 H.264 CRF-16、音频转 AAC 重编码,故交付 mp4 **非**字节一致。窗外一致性变为相对 `edited` 的解码容差比对;字节一致仅在 TRT tensor/PT 层(oracle harness)断言。
+- "音频验证":final 音频是从 `edited` 映射来的 AAC 转码(`-map 1:a`);断言它源自 `edited`(外部 retake 音频忽略),不是流字节相等。
+- "serve FP8/NVFP4 + 产物":现有 serve-timing harness 只有 bf16 且仅 `format='pt'`;task6 加量化 server 配置和一个落可解码 mp4 的产物调用。
+- "分辨率默认":评测默认竖版 704×1280;每次调用显式传横版 `--width/--height`(1280×704 / 1920×1088)。
 
-### Convergence Status
-- Final Status: `converged`
+### Convergence Status(收敛状态)
+- Final Status:`converged`
 
-## Pending User Decisions
+## Pending User Decisions(待用户决策)
 
-All five design decisions were resolved with the user before planning; recorded here as settled (Decision Status is the user's final decision, not `PENDING`).
+五项设计决策均在规划前与用户敲定;此处记为已定(Decision Status 是用户最终决定,而非 `PENDING`)。
 
-- DEC-1: Seam mechanism. Claude Position / Codex Position: additive `--external-retake` flag on the eval harness (not `packages/`, not trtllm). Tradeoff Summary: minimal, additive, keeps upstream glue byte-for-byte; alternative was an external orchestrator importing the pure helpers. Decision Status: **DECIDED — Option A (`--external-retake`).**
-- DEC-2: Resolution. Tradeoff Summary: 1080p offload=none likely OOMs at ~`total` frames; 720p is fully apples-to-apples. Decision Status: **DECIDED — full 7-variant matrix at 720p + 1080p only for variants that fit; compare within-resolution.**
-- DEC-3: Serve scope. Decision Status: **DECIDED — run all three serve variants (bf16/FP8/NVFP4).**
-- DEC-4: Warm vs single-shot. Tradeoff Summary: single-shot is directly comparable to upstream's inherent single-shot; warm p50 shows amortized/resident wins; must not imply a single cold edit is ~46× faster. Decision Status: **DECIDED — report both (single-shot primary, warm p50 supplementary).**
-- DEC-5: Final resolution / resample. Tradeoff Summary: `splice_out` scales the whole clip to `w×h` and the final stays there (no `match_source_dims` in the checked-in script). Decision Status: **DECIDED — no resample; compare within-resolution.**
-- DEC-6: Pass criterion for FP8/NVFP4. Claude Position: structural validity + audio-derivation + produces final video; PSNR/SSIM informational for human eyeball. Codex Position: agreed (aligns with established project methodology). Decision Status: **DECIDED — structure/audio gate; quality informational.**
+- DEC-1:接缝机制。Claude 立场 / Codex 立场:评测 harness 上的附加 `--external-retake` flag(不是 `packages/`,不是 trtllm)。取舍:最小、附加、保持 upstream 胶水逐字节一致;备选是一个 import 纯 helper 的外部编排器。Decision Status:**已定 —— 选项 A(`--external-retake`)。**
+- DEC-2:分辨率。取舍:1080p offload=none 在 ~`total` 帧下大概率 OOM;720p 完全 apples-to-apples。Decision Status:**已定 —— 完整 7 变体矩阵在 720p + 1080p 只跑放得下的变体;分辨率内比较。**
+- DEC-3:serve 范围。Decision Status:**已定 —— 三个 serve 变体全跑(bf16/FP8/NVFP4)。**
+- DEC-4:Warm vs 单发。取舍:单发直接可比 upstream 固有单发;warm p50 展示摊销/常驻优势;不得暗示单次冷编辑快 ~46×。Decision Status:**已定 —— 两者都报(单发为主,warm p50 为辅)。**
+- DEC-5:最终分辨率 / resample。取舍:`splice_out` 把整段片段缩放到 `w×h`,最终停在那儿(签入脚本无 `match_source_dims`)。Decision Status:**已定 —— 不 resample;分辨率内比较。**
+- DEC-6:FP8/NVFP4 的通过判据。Claude 立场:结构有效 + 音频来源 + 产出最终视频;PSNR/SSIM 供人工肉眼看的信息性。Codex 立场:同意(与既定项目方法一致)。Decision Status:**已定 —— 结构/音频门;质量信息性。**
 
-## Implementation Notes
+## Implementation Notes(实现注记)
 
-### Code Style Requirements
-- Implementation code and comments must NOT contain plan-specific terminology such as "AC-", "Milestone", "Step", "Phase", or similar workflow markers.
-- These terms are for plan documentation only, not for the resulting codebase.
-- Use descriptive, domain-appropriate naming in code instead.
+### Code Style Requirements(代码风格要求)
+- 实现代码与注释**不得**含计划专用术语,如 "AC-"、"Milestone"、"Step"、"Phase" 等工作流标记。
+- 这些术语仅用于计划文档,不进入产物代码。
+- 代码里用描述性、贴合领域的命名。
 
-### Scope & Verification
-- The only change to upstream/product code is the additive `--external-retake` flag (+ its preflight) on `LTX2.3-eval/script_editing/delete_disfluency.py`. No `tensorrt_llm/` or `../LTX2.3-eval/packages/` edits. All timing/manifest/stale-check/aggregation/serve-artifact-capture logic lives in separate workstream test-driver scripts.
-- Every code change is GPU-verified once on the node/container (project hard rule) — host validation of the flag logic is necessary but not sufficient.
-- Always pass explicit landscape `--width/--height`; the eval defaults are portrait (704×1280) and would rotate the aspect.
-- The manifest pins both repositories' git revisions (TensorRT-LLM and the working-tree `LTX2.3-eval`, whose `composite_bridge(… a, 0, total …)` is authoritative for step 6).
+### Scope & Verification(范围与验证)
+- 对 upstream/产品代码唯一的改动,是 `LTX2.3-eval/script_editing/delete_disfluency.py` 上的附加 `--external-retake` flag(+ 其预检)。不改 `tensorrt_llm/` 或 `../LTX2.3-eval/packages/`。所有计时/manifest/过期检查/汇总/serve 产物采集逻辑放在独立的 workstream 测试驱动脚本里。
+- 每处代码改动在节点/容器上 GPU 验证一次(项目硬规则)—— host 侧验证 flag 逻辑必要但不充分。
+- 始终显式传横版 `--width/--height`;评测默认是竖版(704×1280),会把宽高比转向。
+- manifest 钉住两个仓库的 git revision(TensorRT-LLM 与工作树版 `LTX2.3-eval`,其 `composite_bridge(… a, 0, total …)` 对 step 6 为权威)。
 
-## Output File Convention
+## Output File Convention(输出文件约定)
 
-This template is used to produce the main output file (e.g., `plan.md`).
+本模板用于产出主输出文件(如 `plan.md`)。
 
-### Translated Language Variant
+### 翻译语言变体
 
-When `alternative_plan_language` resolves to a supported language name through merged config loading, a translated variant of the output file is also written after the main file. Humanize loads config from merged layers in this order: default config, optional user config, then optional project config; `alternative_plan_language` may be set at any of those layers. The variant filename is constructed by inserting `_<code>` (the ISO 639-1 code from the built-in mapping table) immediately before the file extension:
+当 `alternative_plan_language` 经合并配置加载解析为某个受支持语言名时,主文件之后还会写一份翻译变体。Humanize 按如下顺序从合并层加载配置:默认配置、可选用户配置、可选项目配置;`alternative_plan_language` 可在任一层设置。变体文件名通过在扩展名前插入 `_<code>`(内置映射表里的 ISO 639-1 代码)构造:
 
-- `plan.md` becomes `plan_<code>.md` (e.g. `plan_zh.md` for Chinese, `plan_ko.md` for Korean)
-- `docs/my-plan.md` becomes `docs/my-plan_<code>.md`
-- `output` (no extension) becomes `output_<code>`
+- `plan.md` → `plan_<code>.md`(如中文 `plan_zh.md`、韩文 `plan_ko.md`)
+- `docs/my-plan.md` → `docs/my-plan_<code>.md`
+- `output`(无扩展名) → `output_<code>`
 
-The translated variant file contains a full translation of the main plan file's current content in the configured language. All identifiers (`AC-*`, task IDs, file paths, API names, command flags) remain unchanged, as they are language-neutral.
+翻译变体文件包含主计划文件当前内容在配置语言下的完整翻译。所有标识符(`AC-*`、task ID、文件路径、API 名、命令 flag)保持不变,因其与语言无关。
 
-When `alternative_plan_language` is empty, absent, set to `"English"`, or set to an unsupported language, no translated variant is written. Humanize does not auto-create `.humanize/config.json` when no project config file is present.
+当 `alternative_plan_language` 为空、缺失、设为 `"English"`、或设为不受支持的语言时,不写翻译变体。当无项目配置文件时,Humanize 不会自动创建 `.humanize/config.json`。
 
 --- Original Design Draft Start ---
 
-# draft_plan_test.md — end-to-end delete-disfluency: upstream vs TRT-LLM retake
+# draft_plan_test.md — 端到端 delete-disfluency:upstream vs TRT-LLM retake
 
-> Status: **DRAFT for review.** No GPU runs started yet. Open questions in §8 need
-> a decision before execution.
+> 状态:**待评审草稿。** 尚未启动任何 GPU 运行。§8 的开放问题需要先决策再执行。
 
-## 0. Goal
+## 0. 目标
 
-Run the **first `delete_disfluency` eval case** end-to-end and produce, for each
-engine variant, a **final composited video** (disfluency removed, bridge stitched
-back into the original) plus a **per-stage latency breakdown** aligned to the
-`latency_report.pdf` §2 pipeline stage map.
+把**第一个 `delete_disfluency` 评测用例**端到端跑一遍,为每个引擎变体产出一个
+**最终合成视频**(去掉 disfluency、把 bridge 拼回原视频),外加一份与
+`latency_report.pdf` §2 流水线阶段图对齐的**逐阶段延迟拆解**。
 
-Two things must come out of this:
-1. **Performance + quality comparison** of the *retake* step: upstream vs TRT-LLM
-   (bf16 / FP8 / NVFP4, each in **native** and **serve** form).
-2. **Proof the TRT-LLM retake really composites back** into the source to achieve
-   the delete-disfluency effect — i.e. a real, reviewable `final.mp4` per variant,
-   not a retake window in isolation.
+必须产出两样东西:
+1. retake 这一步的**性能 + 质量对比**:upstream vs TRT-LLM(bf16 / FP8 / NVFP4,
+   各含 **native** 与 **serve** 两种形态)。
+2. **证明 TRT-LLM 的 retake 真能拼回**源视频、达成 delete-disfluency 效果 ——
+   即每个变体都有一个真实、可审阅的 `final.mp4`,而不是孤立的 retake 窗口。
 
-The compositing/splice work stays in the **upstream** pipeline; TRT-LLM code and
-the LTX `packages/` are **not modified**.
+合成/拼接工作仍留在 **upstream** 流水线里;TRT-LLM 代码与 LTX `packages/`
+**不改动**。
 
-### The case (from `eval_cases.json[0]`)
+### 用例(来自 `eval_cases.json[0]`)
 ```
 clip_id        --Y9imYnfBw-f0-484   (Bill Gates "world's richest man")
 task           delete_disfluency
@@ -224,222 +276,212 @@ video          LTX2.3-eval/clips/--Y9imYnfBw-f0-484.mp4   (1920x1080, 29.97 fps,
 transcript     LTX2.3-eval/script_editing/eval/transcripts/--Y9imYnfBw-f0-484.json
 width=1920  height=1088  fps=29.97
 ```
-Retake geometry (upstream defaults): `cond-frames=90` each side + `retake-frames=25`
-bridge, snapped to `8k+1` → **retake window ≈ 205 frames** straddling the 5.2 s cut.
-(The full 484-frame video is only touched by CPU ffmpeg in APPLY/POST.)
+Retake 几何(upstream 默认):`cond-frames=90`(每侧) + `retake-frames=25` bridge,
+按 `8k+1` 向上取整 → **retake 窗口 ≈ 205 帧**,跨在 5.2 s 的切点上。
+(整段 484 帧的视频只在 APPLY/POST 阶段被 CPU ffmpeg 触碰。)
 
 ---
 
-## 1. Key facts & constraints
+## 1. 关键事实与约束
 
-- **Hardware differs from the PDF.** `latency_report.pdf` was measured on **H100
-  80GB ×8, torch 2.9.1**. Our runs are on **1× RTX PRO 6000 Blackwell 96GB (sm_120)**.
-  → Absolute seconds will NOT match the PDF; we align to the **stage-map structure**
-  and report our own device's numbers. State this on every table.
-- **The retake window is ~205 frames at 1080p.** Our measured 1080p retake at
-  **89 frames** already reserves **91.5 GiB** (offload=none). 205 frames ≈ 2.3× the
-  latent tokens → **bf16 native offload=none will very likely OOM at 1080p**. See §5
-  for the resolution/offload decision.
-- **Upstream fits 1080p via `--offload-mode cpu`** (its default; reference outputs
-  exist at 720p and 1080p). To compare apples-to-apples, our TRT-LLM retake must run
-  at the **same resolution** as upstream in each comparison.
-- **serve fine-stages are coarser.** Over HTTP the engine only reports `generation`
-  + `denoise` in `Server-Timing`; the fine LTX sub-stages (vae_encode, text_encode,
-  vae_decode) are only available on the **native/in-process** path. serve variants
-  therefore get a coarser LTX-block breakdown — expected, not a defect.
-- **TRT-LLM retake is video-only** (`regenerate_audio=False`); it preserves source
-  audio via PyAV and does **not** run audio_vae_encode/decode/vocoder. Those rows are
-  N/A for the TRT-LLM LTX block (upstream has small ~0.5 s + 0.3 s entries).
+- **硬件与 PDF 不同。** `latency_report.pdf` 是在 **H100 80GB ×8, torch 2.9.1**
+  上测的。我们跑在 **1× RTX PRO 6000 Blackwell 96GB (sm_120)**。
+  → 绝对秒数不会与 PDF 对得上;我们只对齐**阶段图结构**,报本机数字。
+  每张表都要标注这一点。
+- **retake 窗口在 1080p 下约 205 帧。** 我们实测 1080p retake 在 **89 帧**时
+  已经 reserve **91.5 GiB**(offload=none)。205 帧 ≈ 2.3× 的 latent tokens →
+  **bf16 native offload=none 在 1080p 下极可能 OOM**。见 §5 的分辨率/offload 决策。
+- **upstream 靠 `--offload-mode cpu` 能放下 1080p**(其默认;720p 与 1080p 参考
+  输出都存在)。为了做到 apples-to-apples,我们的 TRT-LLM retake 在每次对比里
+  必须跑在**与 upstream 相同的分辨率**。
+- **serve 的细粒度阶段更粗。** 通过 HTTP,引擎在 `Server-Timing` 里只报
+  `generation` + `denoise`;细的 LTX 子阶段(vae_encode、text_encode、
+  vae_decode)只在 **native/in-process** 路径上才有。因此 serve 变体拿到的
+  LTX-block 拆解更粗 —— 属预期,不是缺陷。
+- **TRT-LLM retake 是纯视频**(`regenerate_audio=False`);它通过 PyAV 保留源
+  音频,**不**跑 audio_vae_encode/decode/vocoder。这些行对 TRT-LLM 的 LTX block
+  为 N/A(upstream 有小的 ~0.5 s + 0.3 s 条目)。
 
 ---
 
-## 2. Test matrix (7 variants)
+## 2. 测试矩阵(7 个变体)
 
-Each variant produces one `final.mp4` + one `timing.json`.
+每个变体产出一个 `final.mp4` + 一个 `timing.json`。
 
-| # | Engine | Quant | Form | Retake produced by | Composite by |
+| # | 引擎 | 量化 | 形态 | Retake 由谁产出 | 合成由谁做 |
 |---|--------|-------|------|--------------------|--------------|
-| 1 | **upstream** (reference) | fp8-cast (its default) | in-process | upstream `RetakePipeline` (full `delete_disfluency.py`) | upstream |
-| 2 | TRT-LLM native | bf16 | in-process | our `ltx2_retake` native path | upstream step 6 |
-| 3 | TRT-LLM native | FP8 | in-process | our native path | upstream step 6 |
-| 4 | TRT-LLM native | NVFP4 | in-process | our native path | upstream step 6 |
+| 1 | **upstream**(参考) | fp8-cast(其默认) | in-process | upstream `RetakePipeline`(完整 `delete_disfluency.py`) | upstream |
+| 2 | TRT-LLM native | bf16 | in-process | 我们的 `ltx2_retake` native 路径 | upstream step 6 |
+| 3 | TRT-LLM native | FP8 | in-process | 我们的 native 路径 | upstream step 6 |
+| 4 | TRT-LLM native | NVFP4 | in-process | 我们的 native 路径 | upstream step 6 |
 | 5 | TRT-LLM serve | bf16 | HTTP | `trtllm-serve` retake | upstream step 6 |
 | 6 | TRT-LLM serve | FP8 | HTTP | `trtllm-serve` retake | upstream step 6 |
 | 7 | TRT-LLM serve | NVFP4 | HTTP | `trtllm-serve` retake | upstream step 6 |
 
-All 7 share the **identical** APPLY (①) and POST (③) blocks (same upstream ffmpeg
-glue, same conditioned input, same splice) so only block ② (the model retake)
-differs.
+全部 7 个共享**完全相同**的 APPLY(①)与 POST(③)块(同样的 upstream ffmpeg
+胶水、同样的 conditioned input、同样的 splice),因此只有 block ②(模型 retake)
+不同。
 
 ---
 
-## 3. Pipeline integration design (no trtllm / no packages changes)
+## 3. 流水线集成设计(不改 trtllm / 不改 packages)
 
-`delete_disfluency.py` cleanly separates the model call from the glue:
-- **steps 1–4** build the *edited clip* + the *retake input window* (`crop_window`),
-- **step 5** is the single `RetakePipeline` call (the only model inference),
-- **step 6** `composite_bridge(edited, retake_output, …)` splices the retake window
-  back and writes `final.mp4` + `timing.json`.
+`delete_disfluency.py` 干净地把模型调用与胶水分开:
+- **steps 1–4** 构建*已编辑片段* + *retake 输入窗口*(`crop_window`),
+- **step 5** 是单次 `RetakePipeline` 调用(唯一的模型推理),
+- **step 6** `composite_bridge(edited, retake_output, …)` 把 retake 窗口拼回,
+  写出 `final.mp4` + `timing.json`。
 
-**Injection point = between step 4 and step 6.** To swap in the TRT-LLM retake while
-reusing upstream's glue, add a thin **two-phase seam** to `script_editing/`
-(this is the eval harness — **not** `packages/`, and **not** the trtllm repo):
+**注入点 = step 4 与 step 6 之间。** 为了在复用 upstream 胶水的同时换入 TRT-LLM
+retake,在 `script_editing/` 里加一个薄的**两阶段接缝**(这是评测 harness ——
+**不是** `packages/`,也**不是** trtllm 仓库):
 
-- **Phase A (upstream, once):** run steps 1–4 and dump
-  (a) `retake_input.mp4` (the window the model must regenerate) and
-  (b) `geometry.json` (`a`, `lb0`, `lb1`, `fps`, `width`, `height`, `splice_frame`,
-  the `apply`+geometry timings).
-- **Phase B (per engine variant):** run the retake on `retake_input.mp4` →
-  `retake_output_<variant>.mp4`.
-  - upstream variant: just let `delete_disfluency.py` run step 5 normally.
-  - trtllm variants: our runner (native or serve) reads `retake_input.mp4`,
-    regenerates the window, writes `retake_output_<variant>.mp4`.
-- **Phase C (upstream, per variant):** run **step 6 only** (`composite_bridge`) with
-  the chosen `retake_output_<variant>.mp4` → `final_<variant>.mp4` + `timing.json`.
+- **Phase A(upstream,一次):** 跑 steps 1–4,转储
+  (a) `retake_input.mp4`(模型必须重生成的窗口)以及
+  (b) `geometry.json`(`a`、`lb0`、`lb1`、`fps`、`width`、`height`、`splice_frame`,
+  以及 `apply`+几何计时)。
+- **Phase B(每个引擎变体):** 在 `retake_input.mp4` 上跑 retake →
+  `retake_output_<variant>.mp4`。
+  - upstream 变体:直接让 `delete_disfluency.py` 正常跑 step 5。
+  - trtllm 变体:我们的 runner(native 或 serve)读 `retake_input.mp4`,
+    重生成窗口,写出 `retake_output_<variant>.mp4`。
+- **Phase C(upstream,每个变体):** 只跑 **step 6**(`composite_bridge`),用选定的
+  `retake_output_<variant>.mp4` → `final_<variant>.mp4` + `timing.json`。
 
-Implementation options for the seam (pick in §8):
-- **(pref) small additive flags** on `delete_disfluency.py`:
-  `--dump-retake-input <path>` (stop after step 4) and
-  `--external-retake <path>` (skip step 5, use this as the retake output for step 6).
-  ~30 lines, additive, keeps LTX `packages/` pristine.
-- **(alt) thin orchestrator** in the workstream that `import`s the pure helpers
-  (`find_disfluency`, `splice_out`, `crop_window`, `composite_bridge`, `read_frames`)
-  and drives A/B/C — zero edits to LTX2.3-eval.
+接缝的实现选项(在 §8 里选):
+- **(优先)在 `delete_disfluency.py` 上加小的附加 flag**:
+  `--dump-retake-input <path>`(step 4 后停)与
+  `--external-retake <path>`(跳过 step 5,把这个当作 step 6 的 retake 输出)。
+  ~30 行,附加式,保持 LTX `packages/` 原封不动。
+- **(备选)workstream 里一个薄编排器**,`import` 那些纯 helper
+  (`find_disfluency`、`splice_out`、`crop_window`、`composite_bridge`、`read_frames`)
+  并驱动 A/B/C —— 对 LTX2.3-eval 零改动。
 
-Either way: **trtllm code unchanged; LTX `packages/` unchanged.** The `--start 5.20
---end 5.54 --which 0` overrides use the eval case's exact span (skip re-detection).
+无论哪种:**trtllm 代码不动;LTX `packages/` 不动。** `--start 5.20 --end 5.54
+--which 0` override 使用评测用例的精确 span(跳过重新检测)。
 
 ---
 
-## 4. Stage map & metrics (aligned to `latency_report.pdf` §2)
+## 4. 阶段图与指标(对齐 `latency_report.pdf` §2)
 
-Report every variant against the same three-block map; only block ② is re-measured
-per engine, blocks ① and ③ are measured once (shared, from Phase A/C).
+每个变体都对着同一张三块图报;只有 block ② 是每引擎重测,block ① 和 ③ 测一次
+(共享,来自 Phase A/C)。
 
-| Block | Stage | Measured where | upstream | trtllm native | trtllm serve |
+| Block | 阶段 | 在哪测 | upstream | trtllm native | trtllm serve |
 |-------|-------|----------------|----------|---------------|--------------|
-| ① APPLY | whisper ASR / propose edits / prepare_base_video / make_conditioned_input | Phase A (shared) | ✅ | ✅ (reused) | ✅ (reused) |
-| ② LTX | subprocess_start / model_load | per variant | ✅ | ✅ (`model_build_load`) | resident (once) |
-| ② LTX | video_vae_encode | per variant | ✅ | ✅ (`vae_encode`) | — (HTTP) |
-| ② LTX | text_encode (Gemma) | per variant | ✅ | ✅ (`conditioning`) | — (HTTP) |
-| ② LTX | **diffusion (8 steps)** | per variant | ✅ | ✅ (`denoise_total` + `denoise_per_step`) | ✅ (`denoise`) |
-| ② LTX | video_vae_decode | per variant | ✅ | ✅ (`vae_decode`) | — (HTTP) |
-| ② LTX | audio_vae_encode/decode | per variant | ✅ (small) | N/A (video-only) | N/A |
-| ② LTX | mp4_encode (window) | per variant | ✅ | ✅ (encode_mp4) | ✅ |
-| ② LTX | (serve only) generation / wall | per variant | — | — | ✅ (`Server-Timing` + client wall) |
-| ③ POST | ffmpeg_splice_chunks / post_process_match_source_dims | Phase C (shared) | ✅ | ✅ (reused) | ✅ (reused) |
-| — | **end-to-end wall** | apply + LTX + post | ✅ | ✅ | ✅ |
+| ① APPLY | whisper ASR / propose edits / prepare_base_video / make_conditioned_input | Phase A(共享) | ✅ | ✅(复用) | ✅(复用) |
+| ② LTX | subprocess_start / model_load | 每变体 | ✅ | ✅(`model_build_load`) | 常驻(一次) |
+| ② LTX | video_vae_encode | 每变体 | ✅ | ✅(`vae_encode`) | —(HTTP) |
+| ② LTX | text_encode (Gemma) | 每变体 | ✅ | ✅(`conditioning`) | —(HTTP) |
+| ② LTX | **diffusion(8 steps)** | 每变体 | ✅ | ✅(`denoise_total` + `denoise_per_step`) | ✅(`denoise`) |
+| ② LTX | video_vae_decode | 每变体 | ✅ | ✅(`vae_decode`) | —(HTTP) |
+| ② LTX | audio_vae_encode/decode | 每变体 | ✅(小) | N/A(纯视频) | N/A |
+| ② LTX | mp4_encode(窗口) | 每变体 | ✅ | ✅(encode_mp4) | ✅ |
+| ② LTX | (仅 serve) generation / wall | 每变体 | — | — | ✅(`Server-Timing` + 客户端 wall) |
+| ③ POST | ffmpeg_splice_chunks / post_process_match_source_dims | Phase C(共享) | ✅ | ✅(复用) | ✅(复用) |
+| — | **端到端 wall** | apply + LTX + post | ✅ | ✅ | ✅ |
 
-Measurement rules (same as our AC-1 harness): CUDA events for GPU stages +
-`torch.cuda.synchronize()`-bracketed wall; **N warmup + M measured** for the retake
-(warm p50/p90/min); cold `model_load` reported once and NOT folded into per-call
-warm totals for the resident (serve) form; upstream/native every-call form DOES
-include `model_load` (it reloads per call).
-
----
-
-## 5. Resolution & memory plan
-
-Decision gate before the full matrix:
-
-1. **Capacity pre-check** (cheap, 1 build): run the TRT-LLM native retake once on the
-   real ~205-frame window at **1080p (1920×1088), offload=none, bf16**. Record
-   OK / OOM + peak reserved.
-2. **Branch:**
-   - **If 1080p bf16 native fits** → run the whole matrix at 1080p.
-   - **If it OOMs** (expected): choose ONE of, in order of preference —
-     - **(a) 720p (1280×704) for the whole matrix** — the report's other regime,
-       everything fits comfortably, fully apples-to-apples. *(recommended default)*
-     - (b) 1080p with `offload-mode cpu` for the native/serve retake too (matches
-       upstream's 1080p path) — fits but adds offload time; note it.
-     - (c) 1080p with a **reduced window** (e.g. `cond-frames 30`) so it fits
-       offload=none — changes geometry vs the eval default; note it.
-
-FP8 / NVFP4 free ~18 / ~25 GiB, so they may fit 1080p offload=none even when bf16
-does not — the matrix will record per-mode status (`ok` / `oom`) rather than assume.
-
-**Recommendation:** run the primary matrix at **720p** for a clean 7-way comparison,
-and additionally attempt **1080p** for whichever modes fit (at least upstream, and
-FP8/NVFP4 native) as a stretch, marking OOM where it happens.
+测量规则(与我们的 AC-1 harness 一致):GPU 阶段用 CUDA events +
+`torch.cuda.synchronize()`-括起的 wall;retake 做 **N warmup + M measured**
+(warm p50/p90/min);冷 `model_load` 报一次、且**不**折进常驻(serve)形态的每次
+调用 warm 合计;upstream/native 每调用形态**要**含 `model_load`(它每次重载)。
 
 ---
 
-## 6. Deliverables (for review)
+## 5. 分辨率与显存计划
 
-Under `Script_Editing_Workstream/test_outputs/<res>/`:
-- `final_upstream.mp4`, `final_native_bf16.mp4`, `final_native_fp8.mp4`,
-  `final_native_nvfp4.mp4`, `final_serve_bf16.mp4`, `final_serve_fp8.mp4`,
-  `final_serve_nvfp4.mp4` — **7 complete delete-disfluency videos**.
-- `retake_output_<variant>.mp4` — the raw regenerated window per variant.
-- `timing_<variant>.json` — per-stage breakdown (§4 schema).
-- `latency_comparison.md` + a stage-map table (our device, upstream vs 6 trtllm).
-- `quality_comparison`: (a) each `final_*` for eyeball; (b) informational PSNR/SSIM of
-  each trtllm `retake_output` vs the upstream `retake_output` (window only), and of
-  each `final_*` vs `final_upstream` (whole frame); (c) a frame-grid at the cut seam
-  showing the bridge is seamless.
-- Optional: fold results into an updated one-page report / the customer deck.
+进入完整矩阵前的决策门:
 
----
+1. **容量预检**(便宜,1 次 build):在真实 ~205 帧窗口上把 TRT-LLM native retake
+   在 **1080p (1920×1088), offload=none, bf16** 跑一次。记录 OK / OOM + peak reserved。
+2. **分支:**
+   - **如果 1080p bf16 native 放得下** → 整个矩阵在 1080p 跑。
+   - **如果 OOM**(预期):从下列里按优先级选**一个** ——
+     - **(a) 整个矩阵在 720p (1280×704)** —— 报告的另一个 regime,全部舒适放下,
+       完全 apples-to-apples。*(推荐默认)*
+     - (b) 1080p,native/serve retake 也用 `offload-mode cpu`(匹配 upstream 的
+       1080p 路径)—— 放得下但加了 offload 时间;标注。
+     - (c) 1080p 但**缩小窗口**(如 `cond-frames 30`)使其在 offload=none 下放下 ——
+       相对评测默认改了几何;标注。
 
-## 7. Execution steps (ordered)
+FP8 / NVFP4 各释放 ~18 / ~25 GiB,所以即便 bf16 放不下,它们也可能在 1080p
+offload=none 下放下 —— 矩阵会**逐模式记录状态**(`ok` / `oom`)而非假设。
 
-1. **Setup check (cluster):** confirm the upstream `delete_disfluency.py` runs
-   (LTX2.3-eval `.venv` or our container has `ltx_pipelines` + `ffmpeg` on PATH +
-   `models/` wired to our `ltx-retake-assets`), and CrisperWhisper transcript for
-   `--Y9imYnfBw-f0-484` is present (it is, in `eval/transcripts/`).
-2. **Add the two-phase seam** (§3) — flags or orchestrator; unit-smoke on CPU glue.
-3. **Capacity pre-check** (§5) → pick resolution(s).
-4. **Variant 1 (upstream):** full `delete_disfluency.py` → `final_upstream.mp4` +
-   timing (this also produces the shared `retake_input.mp4` + APPLY/POST timings).
-5. **Variants 2–4 (native bf16/fp8/nvfp4):** retake on `retake_input.mp4` → composite
-   (step 6) → `final_native_*` + retake timing (reuse APPLY/POST from step 4).
-6. **Variants 5–7 (serve bf16/fp8/nvfp4):** launch `trtllm-serve` per quant, HTTP
-   retake on the same window → composite → `final_serve_*` + serve timing.
-7. **Assemble** latency + quality comparison, pull all videos locally, review.
-8. Per the standing rule: every code path exercised once on GPU before it's "done".
+**推荐:** 主矩阵在 **720p** 跑,做干净的 7 路对比;并额外**尝试 1080p**、只跑
+放得下的模式(至少 upstream,以及 FP8/NVFP4 native)作为拉伸,OOM 处标注。
 
 ---
 
-## 8. Decisions
+## 6. 交付物(供评审)
 
-1. **Seam mechanism — DECIDED: Option A (A-lite).** Add one additive flag
-   `--external-retake <mp4>` (+ optional sidecar for `diffusion_seconds`) to
-   `LTX2.3-eval/script_editing/delete_disfluency.py` (not `packages/`, not trtllm):
-   when set, skip the step-5 `RetakePipeline` call, use the provided mp4 as the
-   retake output, and run step 6 `composite_bridge` + timing as normal. Steps 1–4
-   (cheap: read transcript json + 2 ffmpeg ops; whisper ASR is done separately in
-   `transcribe.py`) recompute the identical `a/total/bridge` geometry, so the glue
-   is byte-for-byte the upstream path. Diff kept isolated as a `.patch`.
-   - Upstream variant: run normally (no flag) → produces the shared
-     `retake_input.mp4` + `edited_full.mp4` + `final_upstream.mp4` + timing.
-   - trtllm variants: retake on upstream's `retake_input.mp4` → `my_out.mp4` →
-     `delete_disfluency.py --external-retake my_out.mp4` → `final_<variant>.mp4`.
+在 `Script_Editing_Workstream/test_outputs/<res>/` 下:
+- `final_upstream.mp4`、`final_native_bf16.mp4`、`final_native_fp8.mp4`、
+  `final_native_nvfp4.mp4`、`final_serve_bf16.mp4`、`final_serve_fp8.mp4`、
+  `final_serve_nvfp4.mp4` —— **7 个完整的 delete-disfluency 视频**。
+- `retake_output_<variant>.mp4` —— 每变体的原始重生成窗口。
+- `timing_<variant>.json` —— 逐阶段拆解(§4 schema)。
+- `latency_comparison.md` + 一张阶段图表(本机,upstream vs 6 个 trtllm)。
+- `quality_comparison`:(a) 每个 `final_*` 供肉眼看;(b) 每个 trtllm `retake_output`
+  vs upstream `retake_output` 的信息性 PSNR/SSIM(仅窗口),以及每个 `final_*`
+  vs `final_upstream`(整帧);(c) 切点接缝处的 frame-grid,显示 bridge 无缝。
+- 可选:把结果并入更新版的一页报告 / 客户 deck。
 
-2. **Resolution — DECIDED:** full **7-way matrix at 720p** (1280×704; all fit) +
-   **1080p (1920×1088) only for modes that fit** (upstream via offload cpu; trtllm
-   modes recorded `ok`/`oom` per the §5 pre-check — FP8/NVFP4 more likely than bf16).
-   Quality compared **within each resolution** (720p group; 1080p group).
-3. **serve scope — DECIDED:** run **all three** serve variants (bf16 / FP8 / NVFP4).
-4. **Warm vs single-shot — DECIDED: report both.** Single-shot (one real retake per
-   variant → the actual `final.mp4`, directly comparable to upstream's inherent
-   single-shot) as primary; warm p50 (trtllm native/serve, load-once amortized) as a
-   supplementary column. Analysis must separate **retake compute** (native ~8.5×
-   faster than upstream's retake) from **incl. model load** (a single cold edit is
-   ~comparable — trtllm's cold build is heavier; the ~46× win is amortized/resident
-   only). Do NOT imply single cold edits are 46× faster.
-5. **Final resolution — DECIDED (verified in code):** `delete_disfluency.py` does
-   **NOT** resample — `splice_out` scales the whole clip to `args.width×args.height`
-   and the final stays there (no `match_source_dims` in the checked-in script). Each
-   variant's `final.mp4` is at its processing resolution (720p → 1280×704, 1080p →
-   1920×1088); no artificial resample; compare within-resolution.
+---
 
-## 9. Risks
+## 7. 执行步骤(有序)
 
-- 1080p offload=none OOM (expected) — mitigated by §5 branch.
-- Upstream env / `models/` wiring on the cluster may need a one-time setup (§7.1).
-- serve fine-stage granularity is coarser (HTTP) — documented, not fixable without a
-  server-side change (out of scope).
-- Absolute latencies are device-specific (6000 PRO, not the PDF's H100) — always
-  labeled.
+1. **环境检查(集群):** 确认 upstream `delete_disfluency.py` 能跑
+   (LTX2.3-eval `.venv` 或我们容器里有 `ltx_pipelines` + `ffmpeg` 在 PATH +
+   `models/` 接到我们的 `ltx-retake-assets`),且 `--Y9imYnfBw-f0-484` 的
+   CrisperWhisper transcript 在场(在,`eval/transcripts/` 里)。
+2. **加两阶段接缝**(§3)—— flag 或编排器;CPU 胶水上做 unit-smoke。
+3. **容量预检**(§5)→ 选分辨率。
+4. **变体 1(upstream):** 完整 `delete_disfluency.py` → `final_upstream.mp4` +
+   计时(这一步也产出共享的 `retake_input.mp4` + APPLY/POST 计时)。
+5. **变体 2–4(native bf16/fp8/nvfp4):** 在 `retake_input.mp4` 上 retake → 合成
+   (step 6)→ `final_native_*` + retake 计时(复用 step 4 的 APPLY/POST)。
+6. **变体 5–7(serve bf16/fp8/nvfp4):** 每量化起一个 `trtllm-serve`,在同一窗口
+   上 HTTP retake → 合成 → `final_serve_*` + serve 计时。
+7. **组装** latency + quality 对比,把所有视频拉到本地,评审。
+8. 按既定规则:每条代码路径在 GPU 上跑一次才算 "done"。
+
+---
+
+## 8. 决策
+
+1. **接缝机制 —— 已定:选项 A(A-lite)。** 给
+   `LTX2.3-eval/script_editing/delete_disfluency.py`(不是 `packages/`,不是 trtllm)
+   加一个附加 flag `--external-retake <mp4>`(+ 可选的 `diffusion_seconds` sidecar):
+   设了它就跳过 step-5 的 `RetakePipeline` 调用,把提供的 mp4 当作 retake 输出,
+   正常跑 step 6 `composite_bridge` + 计时。Steps 1–4(便宜:读 transcript json +
+   2 个 ffmpeg 操作;whisper ASR 在 `transcribe.py` 里单独做)重算出完全相同的
+   `a/total/bridge` 几何,所以胶水与 upstream 路径逐字节一致。Diff 作为一个
+   `.patch` 隔离保存。
+   - upstream 变体:正常跑(无 flag)→ 产出共享的 `retake_input.mp4` +
+     `edited_full.mp4` + `final_upstream.mp4` + 计时。
+   - trtllm 变体:在 upstream 的 `retake_input.mp4` 上 retake → `my_out.mp4` →
+     `delete_disfluency.py --external-retake my_out.mp4` → `final_<variant>.mp4`。
+
+2. **分辨率 —— 已定:** 完整 **7 路矩阵在 720p**(1280×704;全放得下)+
+   **1080p (1920×1088) 只跑放得下的模式**(upstream 经 offload cpu;trtllm 模式按
+   §5 预检记 `ok`/`oom` —— FP8/NVFP4 比 bf16 更可能)。质量**在各分辨率内**比
+   (720p 组;1080p 组)。
+3. **serve 范围 —— 已定:** 三个 serve 变体**全跑**(bf16 / FP8 / NVFP4)。
+4. **Warm vs 单发 —— 已定:两者都报。** 单发(每变体一次真实 retake → 实际的
+   `final.mp4`,直接可比 upstream 固有的单发)为主;warm p50(trtllm native/serve,
+   load-once 摊销)为辅助列。分析必须区分**retake 计算**(native 比 upstream 的
+   retake ~8.5× 快)与**含模型加载**(单次冷编辑大致相当 —— trtllm 冷 build 更重;
+   ~46× 的优势只在摊销/常驻下成立)。**不要**暗示单次冷编辑快 46×。
+5. **最终分辨率 —— 已定(代码里已核实):** `delete_disfluency.py` **不**做 resample
+   —— `splice_out` 把整段片段缩放到 `args.width×args.height`,最终就停在那儿
+   (签入脚本里没有 `match_source_dims`)。每个变体的 `final.mp4` 处在其处理分辨率
+   (720p → 1280×704,1080p → 1920×1088);无人为 resample;分辨率内比较。
+
+## 9. 风险
+
+- 1080p offload=none OOM(预期)—— 由 §5 分支缓解。
+- 集群上 upstream 环境 / `models/` 接线可能需要一次性设置(§7.1)。
+- serve 细阶段粒度更粗(HTTP)—— 已记录,无服务端改动无法修(超范围)。
+- 绝对延迟是设备相关的(6000 PRO,不是 PDF 的 H100)—— 始终标注。
 
 --- Original Design Draft End ---
