@@ -44,6 +44,11 @@ def main():
     ap.add_argument(
         "--measured", type=int, default=2, help="resident (pure-compute) measured calls"
     )
+    ap.add_argument(
+        "--nsys",
+        action="store_true",
+        help="warm up then bracket ONE resident call with the CUDA profiler API for nsys capture",
+    )
     ap.add_argument("--code-commit", default=None)
     args = ap.parse_args()
 
@@ -155,6 +160,21 @@ def main():
         run = {k: stages.get(k) for k in STAGE_KEYS}
         run["mp4_encode"] = round(time.time() - t_enc, 4)
         return run
+
+    if args.nsys:
+        # resident-warm nsys capture: warm up, then record exactly one call's kernels
+        for _ in range(args.warmup):
+            one_call()
+            _sync(torch)
+        _sync(torch)
+        torch.cuda.nvtx.range_push("upstream_retake_warm")
+        torch.cuda.cudart().cudaProfilerStart()
+        one_call()
+        _sync(torch)
+        torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.nvtx.range_pop()
+        print("UPSTREAM_NSYS_DONE", flush=True)
+        return
 
     torch.cuda.reset_peak_memory_stats()
     runs = [one_call() for _ in range(args.warmup + args.measured)]

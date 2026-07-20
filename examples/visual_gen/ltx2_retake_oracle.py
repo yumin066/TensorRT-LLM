@@ -564,6 +564,7 @@ def build_pipeline(
     cuda_graph_enable=False,
     quant_algo=None,
     torch_compile_enable=False,
+    quant_attention=None,
 ):
     """Build and load an LTX-2 retake pipeline (native or upstream-stage).
 
@@ -619,22 +620,51 @@ def build_pipeline(
         pipeline_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
         pipeline_config_kwargs["force_dynamic_quantization"] = True
 
+    # Optional FP8 attention. Build a FRESH AttentionConfig (so the pydantic recipe
+    # validator runs) and inject it into model_config_kwargs BEFORE constructing the
+    # DiffusionModelConfig, because DiffusionModelConfig only allocates the TRTLLM
+    # ``attention_metadata_state`` at construction time when its attention backend is
+    # already TRTLLM. Presets:
+    #   "sage"    -> TRTLLM SageAttention, QK+V FP8 (self-attn; cross-attn stays bf16)
+    #   "cutedsl" -> CUTEDSL, V-only FP8 (self+cross; requires head_dim == 128)
+    _acfg = None
+    if quant_attention:
+        from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+
+        _presets = {
+            "sage": (
+                "TRTLLM",
+                QuantAttentionConfig(
+                    qk_dtype="fp8", v_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1
+                ),
+            ),
+            "cutedsl": ("CUTEDSL", QuantAttentionConfig()),
+        }
+        _bk, _qac = _presets[quant_attention]
+        _acfg = AttentionConfig(backend=_bk, quant_attention_config=_qac)
+        model_config_kwargs["attention"] = _acfg
+
     pipeline_config = DiffusionPipelineConfig(
         model_configs={"transformer": DiffusionModelConfig(**model_config_kwargs)},
         **pipeline_config_kwargs,
     )
-    pipeline_config.attention.backend = attention_backend
-    # The transformer's attention modules read ``model_config.attention.backend``
-    # (``build_ltx2_transformer`` builds the LTXModel from
-    # ``model_configs["transformer"]``); the pipeline-level attention config alone
-    # never reaches them, so an FA4 / CUTEDSL request would silently fall back to
-    # the default VANILLA (PyTorch SDPA) kernels. Set the model-level backend too
-    # so the attention backend is a REAL measured axis rather than a config flag.
-    _txf_mc = pipeline_config.model_configs["transformer"]
-    try:
-        _txf_mc.attention.backend = attention_backend
-    except (AttributeError, TypeError, ValueError):
-        _txf_mc.attention = _txf_mc.attention.model_copy(update={"backend": attention_backend})
+    if _acfg is not None:
+        # keep pipeline + transformer attention configs in sync (the transformer copy
+        # is the one the attention modules read via build_ltx2_transformer)
+        pipeline_config.attention = _acfg
+    else:
+        pipeline_config.attention.backend = attention_backend
+        # The transformer's attention modules read ``model_config.attention.backend``
+        # (``build_ltx2_transformer`` builds the LTXModel from
+        # ``model_configs["transformer"]``); the pipeline-level attention config alone
+        # never reaches them, so an FA4 / CUTEDSL request would silently fall back to
+        # the default VANILLA (PyTorch SDPA) kernels. Set the model-level backend too
+        # so the attention backend is a REAL measured axis rather than a config flag.
+        _txf_mc = pipeline_config.model_configs["transformer"]
+        try:
+            _txf_mc.attention.backend = attention_backend
+        except (AttributeError, TypeError, ValueError):
+            _txf_mc.attention = _txf_mc.attention.model_copy(update={"backend": attention_backend})
     pipeline_config.cuda_graph.enable = cuda_graph_enable
     if torch_compile_enable:
         pipeline_config.torch_compile.enable = True

@@ -153,6 +153,13 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--quant", choices=list(QUANT), required=True)
+    ap.add_argument("--attention-backend", default="VANILLA")
+    ap.add_argument(
+        "--attn-quant",
+        choices=["none", "sage", "cutedsl"],
+        default="none",
+        help="FP8 attention preset: sage=TRTLLM QK+V FP8 (self-attn), cutedsl=V-only FP8 (self+cross)",
+    )
     ap.add_argument("--measured", type=int, default=4)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--code-commit", default=None)
@@ -190,7 +197,13 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     tb = time.time()
     pipe = oracle.build_pipeline(
-        args.checkpoint, args.gemma, args.lora, device, "VANILLA", quant_algo=quant_algo
+        args.checkpoint,
+        args.gemma,
+        args.lora,
+        device,
+        args.attention_backend,
+        quant_algo=quant_algo,
+        quant_attention=(None if args.attn_quant == "none" else args.attn_quant),
     )
     build_s = time.time() - tb
     build_peak_resv = torch.cuda.max_memory_reserved() / 2**30
@@ -258,6 +271,8 @@ def main():
     result = {
         "quant": args.quant,
         "quant_algo": quant_algo,
+        "attention_backend": args.attention_backend,
+        "attn_quant": args.attn_quant,
         "source": args.source,
         "window_s": [args.start, args.end],
         "seed": args.seed,
