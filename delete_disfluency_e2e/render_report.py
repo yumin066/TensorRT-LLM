@@ -111,37 +111,35 @@ def substage_section(art: Path):
 
     spec = [
         ("subprocess_start", "python + torch/CUDA import(一次性)"),
-        ("model_load", "载 22B transformer + VAE + Gemma"),
-        ("video_vae_encode", "条件视频 → latent(upstream 含 VAE 加载¹)"),
+        ("model_load", "22B transformer + VAE + Gemma 载入显存(H2D)"),
+        ("video_vae_encode", "条件视频 → latent"),
         ("audio_vae_encode", "编辑音频 → latent(native 纯视频 → N/A)"),
-        ("text_encode", "Gemma(upstream 含 Gemma 加载¹)"),
-        ("diffusion", "**瓶颈**:8 步 Euler 去噪(upstream 含 22B 加载¹)"),
+        ("text_encode", "Gemma,近固定 prompt"),
+        ("diffusion", "**瓶颈**:8 步 Euler 去噪"),
         ("video_vae_decode", "latent → 像素(upstream 流式,折入 mp4)"),
         ("audio_vae_decode", "latent → 波形(native 纯视频 → N/A)"),
         ("mp4_encode", "libx264 编码"),
     ]
     L = [
-        "## LTX 阶段图细分(§2 对齐 · 720p · upstream 每次重建 vs 常驻 native FP8 warm)",
+        "## LTX 阶段图细分(§2 对齐 · 720p · 均为常驻/warm 纯计算,model_load 单列)",
         "",
-        "| LTX 子阶段 | upstream(fp8-cast,单发) | native FP8(常驻 warm) | 说明 |",
+        "| LTX 子阶段 | upstream(fp8-cast,常驻) | native FP8(常驻 warm) | 说明 |",
         "|---|---|---|---|",
     ]
     for k, desc in spec:
         uv, nv_v = c(up.get(k)), c(nv.get(k))
         if k == "model_load":
-            uv, nv_v = "0.03(惰性¹)", "≈88(一次性²)"
+            nv_v = "≈88(一次性¹)"  # native NFS-cold this run; represent page-cache-warm build
         L.append(f"| {k} | {uv} | {nv_v} | {desc} |")
     L.append(
-        f"| **LTX wall** | **{c(up.get('ltx_wall'))}** | **{c(nv.get('ltx_wall_p50'))}** | upstream 每次重建(含加载);native warm 常驻 |"
+        f"| **LTX wall(warm)** | **{c(up.get('ltx_wall_warm'))}** | **{c(nv.get('ltx_wall_p50'))}** | 常驻纯计算,不含 model_load |"
     )
     L.append("")
     L.append(
-        "*单位秒。**upstream 权重惰性加载**:构造阶段 model_load≈0,各计算阶段首次调用才把对应权重载入 —— "
-        "¹22B transformer 折入 `diffusion`(44.3s = 加载 + 8 步去噪)、Gemma 折入 `text_encode`、VAE 折入 `video_vae_encode`。"
-        "**native FP8 常驻 warm**:权重已在显存,各阶段为纯计算(`diffusion` 24.2s 为纯 8 步去噪),²model_load 仅 server 启动时一次"
-        "(此次 NFS 冷启容器测得 760s,页缓存热约 88s;不计入 warm wall)。"
-        "故 native warm 相对 upstream 的 67→31s(2.2×)提速,既来自免去每次重建的权重加载,也来自 FP8 计算更快。"
-        "upstream 的 video/audio VAE 解码流式化,真实开销折入 `mp4_encode`;native 纯视频路径无 audio VAE。设备 RTX PRO 6000(非 §2 的 H100)。*"
+        "*单位秒,均为常驻/warm 纯计算(通过 warmup 触发惰性权重加载后再测量,`model_load` 已单列、不计入 LTX wall)。"
+        "**diffusion(8 步去噪)是主瓶颈**:upstream fp8-cast 39.8s vs native **真 FP8** 24.2s —— 真 FP8 量化比 fp8-cast 约 1.6× 快(用硬件 FP8 张量核)。"
+        "¹native model_load 仅 server 启动时一次(此次 NFS 冷启容器测得 760s,页缓存热约 88s);upstream 若每次重建,则每次额外付 model_load 3.8s + subprocess。"
+        "upstream video/audio VAE 解码流式化,真实开销折入 `mp4_encode`;native 纯视频路径无 audio VAE。设备 RTX PRO 6000(非 §2 的 H100)。*"
     )
     L.append("")
     return L
