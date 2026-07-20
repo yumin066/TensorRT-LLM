@@ -622,8 +622,18 @@ def build_ltx2_transformer(pipeline_config) -> LTXModel:
     """
     attn_cfg = getattr(pipeline_config, "attention", None)
     if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
-        raise NotImplementedError(
-            "Quantized attention is not yet supported for the LTX-2 pipeline."
+        # The LTX2Attention modules DO propagate quant_attention_config to the
+        # backend (base Attention -> create_attention), but the FP8-attention path
+        # is unvalidated for this pipeline, so it is gated behind an opt-in env var
+        # (correctness must be checked on the regenerated window, e.g. PSNR).
+        if not os.environ.get("LTX_ALLOW_QUANT_ATTN"):
+            raise NotImplementedError(
+                "Quantized attention is not yet supported for the LTX-2 pipeline. "
+                "Set LTX_ALLOW_QUANT_ATTN=1 to try the experimental FP8-attention path."
+            )
+        logger.warning(
+            "LTX-2 quantized (FP8) attention is EXPERIMENTAL and unvalidated "
+            "(LTX_ALLOW_QUANT_ATTN set); verify the regenerated-window quality."
         )
 
     model_config = pipeline_config.model_configs["transformer"]
