@@ -20,16 +20,30 @@ import functools
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
+
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 
 from ..qwen_image.transformer_qwen_image import (
     QwenEmbedRope,
     QwenImageTransformer2DModel,
+    QwenJointAttention,
     QwenTimestepProjEmbeddings,
+    _remap_checkpoint_keys,
+    apply_rotary_emb_qwen,
 )
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
+
+_DYNAMIC_QUANT_PARAM_NAMES = (
+    "input_scale",
+    "weight_scale",
+    "weight_scale_2",
+)
 
 
 class QwenEmbedLayer3DRope(QwenEmbedRope):
@@ -115,6 +129,183 @@ class QwenEmbedLayer3DRope(QwenEmbedRope):
         return freqs.clone().contiguous()
 
 
+class QwenImageLayeredJointAttention(QwenJointAttention):
+    """Qwen-Image-Layered joint attention with masked SageAttention support."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        eps: float = 1e-6,
+        dtype: Optional[torch.dtype] = None,
+        config: Optional["DiffusionModelConfig"] = None,
+        layer_idx: int = 0,
+        module_name: Optional[str] = None,
+    ):
+        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
+        config = config or DiffusionModelConfig()
+        super().__init__(
+            dim=dim,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            eps=eps,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+            module_name=module_name,
+        )
+
+        attention_config = config.attention
+        if (
+            attention_config.backend == "TRTLLM"
+            and attention_config.quant_attention_config is not None
+        ):
+            self.attn_backend = "TRTLLM"
+            self.attn = create_attention(
+                backend=self.attn_backend,
+                layer_idx=self.layer_idx,
+                num_heads=self.local_num_attention_heads,
+                head_dim=self.head_dim,
+                num_kv_heads=self.local_num_key_value_heads,
+                quant_config=self.quant_config,
+                dtype=self.dtype,
+                attention_config=attention_config,
+                attention_metadata_state=getattr(config, "attention_metadata_state", None),
+                sparse_params=None,
+            )
+
+    def _trtllm_masked_attention(
+        self,
+        txt_q: torch.Tensor,
+        txt_k: torch.Tensor,
+        txt_v: torch.Tensor,
+        img_q: torch.Tensor,
+        img_k: torch.Tensor,
+        img_v: torch.Tensor,
+        attention_mask: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        seq_txt = txt_q.shape[1]
+        seq_img = img_q.shape[1]
+        mask_bool = attention_mask.to(torch.bool)
+        expected_mask_len = seq_txt + seq_img
+        if mask_bool.shape[1] != expected_mask_len:
+            raise ValueError(
+                "QwenImageLayeredJointAttention attention_mask length mismatch: "
+                f"expected {expected_mask_len}, got {mask_bool.shape[1]}."
+            )
+        if not torch.all(mask_bool[:, seq_txt:]):
+            raise ValueError(
+                "QwenImageLayeredJointAttention requires all image tokens to be unmasked."
+            )
+
+        outputs = []
+        for batch_idx in range(mask_bool.shape[0]):
+            txt_indices = torch.nonzero(mask_bool[batch_idx, :seq_txt], as_tuple=False).flatten()
+            batch_slice = slice(batch_idx, batch_idx + 1)
+            compact_q = torch.cat([txt_q[batch_slice, txt_indices], img_q[batch_slice]], dim=1)
+            compact_k = torch.cat([txt_k[batch_slice, txt_indices], img_k[batch_slice]], dim=1)
+            compact_v = torch.cat([txt_v[batch_slice, txt_indices], img_v[batch_slice]], dim=1)
+            compact_out = self._attn_impl(
+                compact_q.flatten(2),
+                compact_k.flatten(2),
+                compact_v.flatten(2),
+                timestep=timestep,
+            )
+
+            valid_txt = txt_indices.numel()
+            output = torch.zeros(
+                (1, expected_mask_len, compact_out.shape[-1]),
+                device=compact_out.device,
+                dtype=compact_out.dtype,
+            )
+            output[:, txt_indices] = compact_out[:, :valid_txt]
+            output[:, seq_txt:] = compact_out[:, valid_txt:]
+            outputs.append(output)
+
+        return torch.cat(outputs, dim=0)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_txt = encoder_hidden_states.shape[1]
+
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
+
+        img_q = img_q.unflatten(-1, (self.heads, -1))
+        img_k = img_k.unflatten(-1, (self.heads, -1))
+        img_v = img_v.unflatten(-1, (self.heads, -1))
+        txt_q = txt_q.unflatten(-1, (self.heads, -1))
+        txt_k = txt_k.unflatten(-1, (self.heads, -1))
+        txt_v = txt_v.unflatten(-1, (self.heads, -1))
+
+        img_q = self._apply_rms_norm(img_q, self.norm_q)
+        img_k = self._apply_rms_norm(img_k, self.norm_k)
+        txt_q = self._apply_rms_norm(txt_q, self.norm_added_q)
+        txt_k = self._apply_rms_norm(txt_k, self.norm_added_k)
+
+        if image_rotary_emb is not None:
+            img_freqs, txt_freqs = image_rotary_emb
+            img_q = apply_rotary_emb_qwen(img_q, img_freqs, use_real=False)
+            img_k = apply_rotary_emb_qwen(img_k, img_freqs, use_real=False)
+            txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs, use_real=False)
+            txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs, use_real=False)
+
+        joint_q = torch.cat([txt_q, img_q], dim=1)
+        joint_k = torch.cat([txt_k, img_k], dim=1)
+        joint_v = torch.cat([txt_v, img_v], dim=1)
+
+        joint_q = joint_q.transpose(1, 2)
+        joint_k = joint_k.transpose(1, 2)
+        joint_v = joint_v.transpose(1, 2)
+
+        attn_mask = None
+        if attention_mask is not None:
+            attn_mask = attention_mask[:, None, None, :]
+
+        if attn_mask is None:
+            out = self._attn_impl(
+                joint_q.transpose(1, 2).flatten(2),
+                joint_k.transpose(1, 2).flatten(2),
+                joint_v.transpose(1, 2).flatten(2),
+                timestep=timestep,
+            )
+        elif self.attn_backend == "TRTLLM":
+            out = self._trtllm_masked_attention(
+                txt_q,
+                txt_k,
+                txt_v,
+                img_q,
+                img_k,
+                img_v,
+                attention_mask,
+                timestep=timestep,
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+            )
+            out = out.transpose(1, 2).flatten(2, 3).to(joint_q.dtype)
+
+        txt_attn_output = out[:, :seq_txt, :]
+        img_attn_output = out[:, seq_txt:, :]
+
+        img_attn_output = self.to_out[0](img_attn_output.contiguous())
+        txt_attn_output = self.to_add_out(txt_attn_output.contiguous())
+
+        return img_attn_output, txt_attn_output
+
+
 class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
     """Qwen-Image transformer variant for RGBA layer decomposition."""
 
@@ -146,6 +337,18 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
             axes_dims_rope=axes_dims_rope,
             attn_backend=attn_backend,
         )
+        for layer_idx, block in enumerate(self.transformer_blocks):
+            block.attn = QwenImageLayeredJointAttention(
+                dim=self.inner_dim,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                dtype=self.model_config.torch_dtype,
+                config=self.model_config,
+                layer_idx=layer_idx,
+                module_name=f"transformer_blocks.{layer_idx}.attn",
+            )
+        self.apply_quant_config_exclude_modules()
+
         if use_layer3d_rope:
             self.pos_embed = QwenEmbedLayer3DRope(
                 theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
@@ -174,6 +377,46 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
     def register_cuda_graph_extra_key_fns(self, runner: "CUDAGraphRunner") -> None:
         super().register_cuda_graph_extra_key_fns(runner)
         runner.register_extra_key_fn("img_shapes", self._normalize_img_shapes_for_cuda_graph)
+
+    def _dynamic_quant_parameter_names(
+        self,
+        loader: DynamicLinearWeightLoader,
+        weights: Dict[str, torch.Tensor],
+    ) -> set[str]:
+        """Return scale parameters generated while dynamically quantizing weights."""
+        dynamic_quant_params = set()
+        for module_name, module in self.named_modules():
+            if not isinstance(module, Linear) or module.quant_config is None:
+                continue
+            quant_algo = loader._get_quant_algo_for_layer(module_name)
+            weight_dicts = loader.get_linear_weights(module, module_name, weights)
+            if not any(
+                loader._should_dynamic_quantize(weight_dict, quant_algo, module_name)
+                for weight_dict in weight_dicts
+            ):
+                continue
+            prefix = f"{module_name}." if module_name else ""
+            dynamic_quant_params.update(
+                f"{prefix}{param_name}"
+                for param_name in _DYNAMIC_QUANT_PARAM_NAMES
+                if module._parameters.get(param_name) is not None
+            )
+        return dynamic_quant_params
+
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load weights and strictly validate dynamic-quant runtime scales."""
+        remapped_weights = _remap_checkpoint_keys(weights)
+        super().load_weights(weights)
+
+        expected = {name for name, _ in self.named_parameters()}
+        loader = DynamicLinearWeightLoader(self.model_config)
+        missing = sorted(
+            (expected - set(remapped_weights))
+            - self._non_serialized_quant_parameter_names()
+            - self._dynamic_quant_parameter_names(loader, remapped_weights)
+        )
+        if missing:
+            raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
 
     @classmethod
     def from_config_dict(

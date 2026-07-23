@@ -15,6 +15,7 @@
 """Pipeline-level configuration tests for Qwen-Image-Layered."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -103,3 +104,27 @@ def test_qwen_layered_config_initializes_layered_transformer(tmp_path):
     assert isinstance(pipeline.transformer, QwenImageLayeredTransformer2DModel)
     assert pipeline.transformer.time_text_embed.use_additional_t_cond is True
     assert isinstance(pipeline.transformer.pos_embed, QwenEmbedLayer3DRope)
+
+
+def test_qwen_layered_fp8_sage_preset_parses():
+    repo_root = Path(__file__).parents[4]
+    preset_path = (
+        repo_root / "examples" / "visual_gen" / "configs" / "qwen-image-layered-fp8-1gpu.yaml"
+    )
+
+    args = VisualGenArgs.from_yaml(preset_path)
+
+    assert args.quant_config["quant_algo"] == "FP8_BLOCK_SCALES"
+    assert args.quant_config["dynamic"] is True
+    assert args.quant_config["ignore"][:4] == ["img_in", "txt_in", "norm_out", "proj_out"]
+    assert args.quant_config["ignore"][4:] == ["transformer_blocks.0", "transformer_blocks.59"]
+    assert args.attention_config.backend == "TRTLLM"
+    quant_attention = args.attention_config.quant_attention_config
+    assert quant_attention is not None
+    assert quant_attention.qk_dtype == "fp8"
+    assert quant_attention.v_dtype == "fp8"
+    assert (
+        quant_attention.q_block_size,
+        quant_attention.k_block_size,
+        quant_attention.v_block_size,
+    ) == (1, 1, 1)

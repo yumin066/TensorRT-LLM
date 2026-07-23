@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
 from tensorrt_llm._torch.visual_gen.models.qwen_image_layered import QwenImageLayeredPipeline
 from tensorrt_llm._torch.visual_gen.models.qwen_image_layered.transformer_qwen_image_layered import (
     QwenEmbedLayer3DRope,
+    QwenImageLayeredJointAttention,
     QwenImageLayeredTransformer2DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -42,6 +43,10 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import (
     AutoPipeline,
     PipelineComponent,
 )
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 
 def _pipeline_config(model_config=None):
@@ -186,6 +191,43 @@ def test_transformer_constructs_with_layered_config():
     assert isinstance(model.pos_embed, QwenEmbedLayer3DRope)
     assert model.time_text_embed.use_additional_t_cond is True
     assert hasattr(model.time_text_embed, "addition_t_embedding")
+    assert all(
+        isinstance(block.attn, QwenImageLayeredJointAttention) for block in model.transformer_blocks
+    )
+
+
+def test_layered_joint_attention_routes_sage_to_trtllm():
+    """Layered joint self-attention opts in to the quantized TRTLLM backend."""
+    quant_attention_config = QuantAttentionConfig(
+        qk_dtype="fp8",
+        v_dtype="fp8",
+        q_block_size=1,
+        k_block_size=1,
+        v_block_size=1,
+    )
+    model_config = DiffusionModelConfig(
+        attention=AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=quant_attention_config,
+        ),
+        skip_create_weights_in_init=True,
+    )
+    model = QwenImageLayeredTransformer2DModel(
+        model_config=model_config,
+        patch_size=1,
+        in_channels=16,
+        out_channels=16,
+        num_layers=1,
+        attention_head_dim=16,
+        num_attention_heads=1,
+        joint_attention_dim=16,
+        axes_dims_rope=(4, 6, 6),
+    )
+
+    attention = model.transformer_blocks[0].attn
+    assert isinstance(attention, QwenImageLayeredJointAttention)
+    assert attention.attn_backend == "TRTLLM"
+    assert attention.attn.quant_attention_config == quant_attention_config
 
 
 def test_transformer_from_config_dict_preserves_layered_fields():
@@ -199,6 +241,52 @@ def test_transformer_from_config_dict_preserves_layered_fields():
     )
     assert isinstance(model.pos_embed, QwenEmbedLayer3DRope)
     assert model.time_text_embed.use_additional_t_cond is True
+
+
+def test_dynamic_fp8_blockscale_load_allows_missing_runtime_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layered dynamic FP8 loading permits runtime scales but rejects missing weights."""
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    model = QwenImageLayeredTransformer2DModel(
+        model_config=model_config,
+        patch_size=1,
+        in_channels=16,
+        out_channels=16,
+        num_layers=1,
+        attention_head_dim=16,
+        num_attention_heads=1,
+        joint_attention_dim=16,
+        axes_dims_rope=(4, 6, 6),
+    )
+    expected = dict(model.named_parameters())
+    runtime_scale_suffixes = (".input_scale", ".weight_scale", ".weight_scale_2")
+    checkpoint = {
+        name: torch.zeros(param.shape, dtype=torch.bfloat16)
+        if name.endswith(".weight") and param.dtype == torch.float8_e4m3fn
+        else torch.zeros_like(param)
+        for name, param in expected.items()
+        if name not in model._non_serialized_quant_parameter_names()
+        and not name.endswith(runtime_scale_suffixes)
+    }
+
+    monkeypatch.setattr(
+        DynamicLinearWeightLoader,
+        "load_linear_weights",
+        lambda self, module, name, weight_dicts: None,
+    )
+
+    model.load_weights(checkpoint)
+
+    checkpoint_missing_weight = checkpoint.copy()
+    checkpoint_missing_weight.pop("img_in.weight")
+    with pytest.raises(RuntimeError, match="Missing keys") as exc_info:
+        model.load_weights(checkpoint_missing_weight)
+    assert "img_in.weight" in str(exc_info.value)
 
 
 def test_layered_transformer_cuda_graph_key_includes_img_shapes():
