@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import patch
 
 import pytest
@@ -87,6 +102,20 @@ def test_linear_nvfp4_awq_pre_quant_scale(has_scale):
         expected = x * scale
         assert torch.allclose(captured_input, expected, rtol=1e-5, atol=1e-5), (
             "Expected scaled input"
+        )
+
+        captured_input = None
+        with patch("torch.ops.trtllm.fp4_quantize",
+                   side_effect=mock_fp4_quantize,
+                   create=True):
+            with patch("torch.ops.trtllm.nvfp4_gemm",
+                       side_effect=mock_gemm,
+                       create=True):
+                linear.quant_method.apply_with_pre_quant_scale_applied(
+                    linear, expected, linear.bias)
+
+        assert torch.equal(captured_input, expected), (
+            "Expected the externally smoothed input to bypass duplicate pre-quant scaling"
         )
     else:
         # Should be original

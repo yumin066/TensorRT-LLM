@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import enum
@@ -1400,6 +1415,34 @@ class NVFP4LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
+    def _input_prepare_regular(self,
+                               module: Linear,
+                               input: torch.Tensor,
+                               apply_pre_quant_scale: bool = True):
+        """Dynamically quantize a BF16 activation, optionally after smoothing."""
+        if module.pre_quant_scale is not None and apply_pre_quant_scale:
+            assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
+            input = input * module.pre_quant_scale
+
+        # Dynamic vs static quantization
+        if module.input_scale is None or module.force_dynamic_quantization:
+            FP8_MAX, E2M1_MAX = 448.0, 6.0
+            amax_input = torch.amax(torch.abs(input)).float()
+            input_scale = FP8_MAX * E2M1_MAX / amax_input
+            alpha = (amax_input /
+                     (FP8_MAX * E2M1_MAX)) * module.weight_scale_2
+        else:
+            input_scale = module.input_scale
+            alpha = module.alpha
+
+        if NVFP4LinearMethod.use_tunable_quantize:
+            act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
+                input, input_scale, module.scaling_vector_size, False)
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input, input_scale, module.scaling_vector_size, False)
+        return act_fp4, act_sf, alpha
+
     def _input_prepare(self, module: Linear, input: torch.Tensor):
         """Quantize input tensor to FP4 format.
 
@@ -1429,34 +1472,13 @@ class NVFP4LinearMethod(LinearMethodBase):
                 )
             return input[0], input[1], module.alpha
         else:
-            # Input is a regular tensor - apply pre_quant_scale if it exists (for NVFP4_AWQ)
-            if module.pre_quant_scale is not None:
-                assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
-                input = input * module.pre_quant_scale
+            return self._input_prepare_regular(module, input)
 
-            # Dynamic vs static quantization
-            if module.input_scale is None or module.force_dynamic_quantization:
-                # Dynamic mode: compute input_scale and alpha from current input
-                FP8_MAX, E2M1_MAX = 448.0, 6.0
-                amax_input = torch.amax(torch.abs(input)).float()
-                input_scale = FP8_MAX * E2M1_MAX / amax_input
-                alpha = (amax_input /
-                         (FP8_MAX * E2M1_MAX)) * module.weight_scale_2
-            else:
-                # Static mode: use pre-computed values
-                input_scale = module.input_scale
-                alpha = module.alpha
-
-            if NVFP4LinearMethod.use_tunable_quantize:
-                act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
-                    input, input_scale, module.scaling_vector_size, False)
-            else:
-                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                    input, input_scale, module.scaling_vector_size, False)
-            return act_fp4, act_sf, alpha
-
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def _apply(self,
+               module: Linear,
+               input: torch.Tensor,
+               bias: Optional[torch.Tensor],
+               pre_quant_scale_applied: bool = False) -> torch.Tensor:
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # NVFP4 GEMM requires a 2D mat1; flatten here and unflatten the output below.
         original_shape = None
@@ -1474,7 +1496,19 @@ class NVFP4LinearMethod(LinearMethodBase):
                 is_sf_swizzled=input.is_sf_swizzled,
             )
 
-        act_fp4, act_sf, alpha = self._input_prepare(module, input)
+        if pre_quant_scale_applied:
+            if not isinstance(input, torch.Tensor):
+                raise TypeError("Pre-smoothed NVFP4 input must be a regular tensor")
+            if module.pre_quant_scale is None:
+                raise RuntimeError(
+                    "Pre-smoothed NVFP4 input requires module.pre_quant_scale")
+            if input.dtype != module.pre_quant_scale.dtype:
+                raise TypeError(
+                    "Pre-smoothed NVFP4 input dtype must match pre_quant_scale")
+            act_fp4, act_sf, alpha = self._input_prepare_regular(
+                module, input, apply_pre_quant_scale=False)
+        else:
+            act_fp4, act_sf, alpha = self._input_prepare(module, input)
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
@@ -1514,6 +1548,19 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None and not fuse_bias_in_gemm:
             output = output + bias
         return output
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
+        return self._apply(module, input, bias)
+
+    def apply_with_pre_quant_scale_applied(
+            self, module: Linear, input: torch.Tensor,
+            bias: Optional[torch.Tensor]) -> torch.Tensor:
+        """Apply NVFP4 Linear after the caller applies its smoothing scale."""
+        return self._apply(module,
+                           input,
+                           bias,
+                           pre_quant_scale_applied=True)
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
