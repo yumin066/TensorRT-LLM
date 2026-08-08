@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 
 
@@ -51,4 +52,21 @@ def test_backend_report_is_explicit() -> None:
     assert NVFP4LinearMethod.dynamic_absmax_report() == {
         "requested": "optimized",
         "resolved": "optimized",
+    }
+
+
+def test_auto_backend_is_architecture_aware(monkeypatch) -> None:
+    monkeypatch.setattr(linear_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: 120)
+    assert NVFP4LinearMethod.configure_dynamic_absmax_backend("auto") == "optimized"
+    assert NVFP4LinearMethod.dynamic_absmax_report() == {
+        "requested": "auto",
+        "resolved": "optimized",
+    }
+
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: 100)
+    assert NVFP4LinearMethod.configure_dynamic_absmax_backend("auto") == "reference"
+    assert NVFP4LinearMethod.dynamic_absmax_report() == {
+        "requested": "auto",
+        "resolved": "reference",
     }
