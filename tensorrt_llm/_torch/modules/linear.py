@@ -1357,6 +1357,58 @@ class NVFP4LinearMethod(LinearMethodBase):
     # construction; LLM paths leave it False to avoid host overhead.
     use_tunable_quantize: bool = False
 
+    # Keep the established two-kernel path as the default. Visual-generation
+    # callers may explicitly select the allocation-free reduction after they
+    # have validated their target architecture.
+    dynamic_absmax_backend: ClassVar[str] = "reference"
+    dynamic_absmax_backend_requested: ClassVar[str] = "reference"
+
+    @classmethod
+    def configure_dynamic_absmax_backend(cls, backend: str) -> str:
+        """Select the runtime-dynamic activation extrema implementation.
+
+        ``reference`` preserves ``amax(abs(input))``. ``optimized`` computes
+        the identical infinity norm without materializing ``abs(input)``.
+        ``auto`` enables the optimized path only on the validated SM120
+        architecture and otherwise reports an explicit reference fallback.
+        """
+
+        if backend not in {"reference", "optimized", "auto"}:
+            raise ValueError(
+                "NVFP4 dynamic absmax backend must be reference, optimized, or auto"
+            )
+        cls.dynamic_absmax_backend_requested = backend
+        resolved = backend
+        if backend == "auto":
+            resolved = (
+                "optimized"
+                if torch.cuda.is_available() and get_sm_version() == 120
+                else "reference"
+            )
+        cls.dynamic_absmax_backend = resolved
+        return resolved
+
+    @classmethod
+    def dynamic_absmax_report(cls) -> Dict[str, str]:
+        return {
+            "requested": cls.dynamic_absmax_backend_requested,
+            "resolved": cls.dynamic_absmax_backend,
+        }
+
+    @classmethod
+    def _dynamic_absmax(cls, input: torch.Tensor) -> torch.Tensor:
+        if cls.dynamic_absmax_backend == "reference":
+            return torch.amax(torch.abs(input)).float()
+        if cls.dynamic_absmax_backend == "optimized":
+            # vector_norm(..., inf) performs the absolute-value comparison in
+            # the reduction and therefore avoids a full-size temporary. It
+            # returns the same BF16 extrema before the FP32 cast used by the
+            # established scale and alpha formula.
+            return torch.linalg.vector_norm(input, ord=math.inf).float()
+        raise RuntimeError(
+            f"unresolved NVFP4 dynamic absmax backend: {cls.dynamic_absmax_backend}"
+        )
+
     def get_tp_alignment(self, tp_mode, quant_config=None):
         # 32-element alignment for both modes. ROW shards in_features which
         # is packed 2:1, so 32 → 16 packed, meeting GEMM col_alignment=16.
@@ -1427,7 +1479,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Dynamic vs static quantization
         if module.input_scale is None or module.force_dynamic_quantization:
             FP8_MAX, E2M1_MAX = 448.0, 6.0
-            amax_input = torch.amax(torch.abs(input)).float()
+            amax_input = self._dynamic_absmax(input)
             input_scale = FP8_MAX * E2M1_MAX / amax_input
             alpha = (amax_input /
                      (FP8_MAX * E2M1_MAX)) * module.weight_scale_2
