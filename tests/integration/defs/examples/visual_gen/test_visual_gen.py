@@ -70,6 +70,43 @@ LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_THRESHOLD = 0.05
 LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
 
+# LTX-2.3 retake (delete-disfluency bridge) LPIPS — external step_b_trtllm.py pipeline.
+# The retake candidate is NOT produced by the native VisualGen text-to-video path; its
+# parameters are step_b_trtllm.py CLI flags (fp8-linear-step, nvfp4-attention-centering,
+# nvfp4-pipeline-backend, ...) that have no VisualGenArgs equivalent. Generation therefore
+# shells out to the pinned LTX2.3-script-editing retake pipeline (step_b denoise + step_c
+# decode), gated on env-configured asset paths so the test skips cleanly when the (external)
+# repo / frozen inputs are absent. See ltx2_retake_lpips_golden_video.json for the full
+# frozen-environment contract (FlashInfer 0.6.17 from PR #4272, TRT-LLM rc22 overlay, ...).
+# LPIPS is scored ONLY on the regenerated bridge window (the frames the retake model
+# actually produces); the surrounding conditioning frames are near-identical to the
+# source and dilute a whole-clip score to the point where 33 dB and 25 dB configs are
+# indistinguishable (both ~0.020). The eval script slices this window from the originally
+# decoded frames of both videos (no re-encoding), so the score tracks quality directly:
+# NVFP4+FP8@{4,7} ~0.051 (this candidate), plain-NVFP4 with its visible ripple ~0.088.
+# The gate is the standard 0.05 LPIPS bar (matching the other VisualGen goldens). The
+# FP8@{4,7} fast path currently measures ~0.051 -- marginally over the bar -- so this gate
+# holds the retake path to the 0.05 quality target and fails a plain-NVFP4 ripple
+# regression (~0.088) by a wide margin. Window matches the retake PSNR contract: [90, 119).
+LTX2_RETAKE_LPIPS_THRESHOLD = 0.05
+LTX2_RETAKE_BRIDGE_START = 90
+LTX2_RETAKE_BRIDGE_STOP = 119
+LTX2_RETAKE_FP8_LINEAR_STEPS = (4, 7)
+LTX2_RETAKE_ATTENTION_BACKEND = "flashinfer-nvfp4-video-self"
+LTX2_RETAKE_ATTENTION_CENTERING = "per-128-query-block"
+LTX2_RETAKE_NVFP4_PIPELINE_BACKEND = "optimized"
+LTX2_RETAKE_CHECKPOINT_SUBPATH = ("LTX-2.3", "ltx-2.3-22b-distilled.safetensors")
+# External retake pipeline location + frozen inputs (env overridable; skip if missing).
+LTX2_RETAKE_REPO_ENV = "LTX2_RETAKE_REPO"  # LTX2.3-script-editing repo root
+LTX2_RETAKE_STEP_A_ENV = "LTX2_RETAKE_STEP_A"  # frozen Step-A output .pt
+LTX2_RETAKE_CHECKPOINT_ENV = "LTX2_RETAKE_CHECKPOINT"  # overrides the LLM_MODELS_ROOT default
+LTX2_RETAKE_STEP_B_PYTHON_ENV = (
+    "LTX2_RETAKE_STEP_B_PYTHON"  # system python w/ trtllm + flashinfer 0.6.17
+)
+LTX2_RETAKE_DECODE_PYTHON_ENV = (
+    "LTX2_RETAKE_DECODE_PYTHON"  # .venv python w/ torchaudio/av for step_c
+)
+
 WAN21_LPIPS_PROMPT = "A cat sitting on a windowsill"
 WAN21_LPIPS_NEGATIVE_PROMPT = None
 WAN21_LPIPS_HEIGHT = 256
@@ -466,27 +503,36 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
-def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, generated_path):
+def _run_lpips_eval(
+    tmp_path,
+    sample_id,
+    media_type,
+    prompt,
+    reference_path,
+    generated_path,
+    frame_start=None,
+    frame_stop=None,
+):
     reference_key = "reference_video_path" if media_type == "video" else "reference_image_path"
     generated_key = "generated_video_path" if media_type == "video" else "generated_image_path"
     dataset_path = tmp_path / f"{sample_id}_dataset.json"
     output_json = tmp_path / f"{sample_id}_lpips_results.json"
+    sample = {
+        "id": sample_id,
+        "media_type": media_type,
+        "prompt": prompt,
+        reference_key: str(reference_path),
+        generated_key: str(generated_path),
+    }
+    # Optionally gate LPIPS on a half-open frame window [frame_start, frame_stop).
+    # The eval script slices the originally decoded frames of both videos (no
+    # re-encoding), so per-frame pixels match a full-video decode exactly.
+    if frame_start is not None:
+        sample["frame_start"] = int(frame_start)
+    if frame_stop is not None:
+        sample["frame_stop"] = int(frame_stop)
     dataset_path.write_text(
-        json.dumps(
-            {
-                "samples": [
-                    {
-                        "id": sample_id,
-                        "media_type": media_type,
-                        "prompt": prompt,
-                        reference_key: str(reference_path),
-                        generated_key: str(generated_path),
-                    }
-                ]
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps({"samples": [sample]}, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -1005,6 +1051,147 @@ def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_
         "ltx2_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+def _generate_ltx2_retake_nvfp4_fp8step47_video(tmp_path, output_path):
+    """Generate the LTX-2.3 retake candidate and return its .mp4 path.
+
+    Config: corrected runtime-dynamic NVFP4 linear with FP8 linear fallback at the
+    quality-sensitive diffusion steps ``{4, 7}``, plus centered/corrected NVFP4
+    video-self attention (``flashinfer-nvfp4-video-self`` with per-128-query-block Q
+    centering, ``optimized`` AbsMax backend, activation reuse, one warmup forward).
+
+    Unlike the other LPIPS goldens, the retake workload is driven by the external
+    LTX2.3-script-editing pipeline (``script_editing/step_b_trtllm.py`` denoise +
+    ``step_c_postprocess.py`` VAE decode) because these flags have no native
+    VisualGenArgs equivalent. Every asset path is env-configured; the test skips when
+    the repo, frozen Step-A input, or checkpoint are absent (see the companion
+    ``ltx2_retake_lpips_golden_video.json`` for the full frozen-environment contract).
+    """
+    repo = os.environ.get(LTX2_RETAKE_REPO_ENV)
+    if not repo:
+        pytest.skip(f"set {LTX2_RETAKE_REPO_ENV} to the LTX2.3-script-editing repo root")
+    _skip_if_missing(repo, "LTX2.3-script-editing repo", is_dir=True)
+    step_b_script = os.path.join(repo, "script_editing", "step_b_trtllm.py")
+    step_c_script = os.path.join(repo, "script_editing", "step_c_postprocess.py")
+    _skip_if_missing(step_b_script, "retake step_b_trtllm.py")
+    _skip_if_missing(step_c_script, "retake step_c_postprocess.py")
+
+    step_a = os.environ.get(LTX2_RETAKE_STEP_A_ENV)
+    if not step_a:
+        pytest.skip(f"set {LTX2_RETAKE_STEP_A_ENV} to the frozen Step-A output .pt")
+    _skip_if_missing(step_a, "frozen Step-A input")
+
+    checkpoint = os.environ.get(LTX2_RETAKE_CHECKPOINT_ENV) or _lpips_model_path(
+        *LTX2_RETAKE_CHECKPOINT_SUBPATH
+    )
+    _skip_if_missing(checkpoint, "LTX-2.3 retake checkpoint")
+
+    # step_b needs the system python (tensorrt_llm + pinned FlashInfer 0.6.17); step_c
+    # (VAE decode) needs the .venv python (torchaudio/av). Both default to the test's
+    # interpreter and are env-overridable for the two-environment retake layout.
+    step_b_python = os.environ.get(LTX2_RETAKE_STEP_B_PYTHON_ENV, sys.executable)
+    decode_python = os.environ.get(LTX2_RETAKE_DECODE_PYTHON_ENV, sys.executable)
+
+    step_b_out = str(tmp_path / "retake_step_b.pt")
+    reuse_json = str(tmp_path / "retake_reuse.json")
+    timing_json = str(tmp_path / "retake_timing.json")
+    decode_dir = str(tmp_path / "retake_decode")
+
+    fp8_step_args = []
+    for step in LTX2_RETAKE_FP8_LINEAR_STEPS:
+        fp8_step_args += ["--fp8-linear-step", str(step)]
+
+    check_call(
+        [
+            step_b_python,
+            step_b_script,
+            "--input",
+            step_a,
+            "--output",
+            step_b_out,
+            "--checkpoint",
+            checkpoint,
+            "--quant-algo",
+            "NVFP4",
+            "--attention-backend",
+            LTX2_RETAKE_ATTENTION_BACKEND,
+            "--nvfp4-attention-centering",
+            LTX2_RETAKE_ATTENTION_CENTERING,
+            "--nvfp4-pipeline-backend",
+            LTX2_RETAKE_NVFP4_PIPELINE_BACKEND,
+            "--nvfp4-activation-reuse",
+            "--nvfp4-reuse-report",
+            reuse_json,
+            *fp8_step_args,
+            "--warmup-forwards",
+            "1",
+            "--timing-json",
+            timing_json,
+        ],
+        shell=False,
+    )
+    check_call(
+        [
+            decode_python,
+            step_c_script,
+            "--step-a",
+            step_a,
+            "--step-b",
+            step_b_out,
+            "--output-dir",
+            decode_dir,
+            "--checkpoint",
+            checkpoint,
+        ],
+        shell=False,
+    )
+
+    produced = os.path.join(decode_dir, "retake_output.mp4")
+    _skip_if_missing(produced, "retake decode output")
+    shutil.copy2(produced, str(output_path))
+    assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
+    return output_path
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_retake_nvfp4_fp8step47_lpips_against_golden(request, tmp_path):
+    """LPIPS gate for the LTX-2.3 retake fast path against the frozen BF16 retake golden.
+
+    Candidate = corrected dynamic NVFP4 linear + FP8 linear fallback at steps {4,7}
+    + centered/corrected NVFP4 video-self attention. This is the quality-vs-speed
+    sweet spot: the FP8 fallback at the two quality-sensitive steps suppresses the
+    NVFP4-linear ripple/mottling while keeping the NVFP4 attention fast path.
+    """
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_golden_video.mp4",
+        "LTX-2.3 retake LPIPS golden video",
+    )
+    generated_path = tmp_path / "ltx2_retake_generated.mp4"
+    _generate_ltx2_retake_nvfp4_fp8step47_video(tmp_path, generated_path)
+
+    # Score LPIPS only over the regenerated bridge window [START, STOP): the eval script
+    # slices the originally decoded frames of both videos (no re-encoding), so the
+    # unchanged conditioning frames do not dilute the score. See LTX2_RETAKE_BRIDGE_*.
+    score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_retake_nvfp4_fp8step47",
+        "video",
+        LTX2_T2V_PROMPT,
+        golden_path,
+        generated_path,
+        frame_start=LTX2_RETAKE_BRIDGE_START,
+        frame_stop=LTX2_RETAKE_BRIDGE_STOP,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_RETAKE_LPIPS_THRESHOLD,
+        generated_path,
+        "ltx2_retake_lpips_golden_video.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX2_RETAKE_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
