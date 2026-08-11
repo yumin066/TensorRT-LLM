@@ -105,6 +105,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--nvfp4-attn",
+        action="store_true",
+        help=(
+            "Use the SM120 FlashInfer NVFP4 video-self attention (fastest) instead "
+            "of BF16 SDPA. Lossier on its own; pair with --fp8-linear-step 4 "
+            "--fp8-linear-step 7 to recover quality (the M034 max-speed recipe)."
+        ),
+    )
+    parser.add_argument(
         "--lora",
         default=None,
         help="Optional identity/style LoRA fused into the base transformer weights.",
@@ -119,6 +128,7 @@ def _build_retake_pipeline(
     lora,
     quant_algo=None,
     fp8_linear_steps=None,
+    nvfp4_attn=False,
 ):
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
@@ -174,6 +184,17 @@ def _build_retake_pipeline(
     pipe.load_standard_components(checkpoint, device, text_encoder_path=text_encoder)
     pipe.load_weights(pipe.load_transformer_weights(checkpoint))
     pipe.post_load_weights()
+    if nvfp4_attn:
+        # Enable the SM120 FlashInfer NVFP4 video-self attention on every
+        # LTX2Attention module (both the primary and the FP8-step transformer) for
+        # the fastest recipe. The attention forward reads the kernel off these
+        # class flags; only the video-self-attn role actually takes the path.
+        import flashinfer
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTX2Attention
+
+        LTX2Attention._nvfp4_fi = flashinfer
+        LTX2Attention._nvfp4_attn = True
     return pipe
 
 
@@ -224,6 +245,8 @@ def main() -> None:
     recipe = args.quant_algo or "bf16"
     if args.fp8_linear_step:
         recipe += f"+fp8@{sorted(set(args.fp8_linear_step))}"
+    if args.nvfp4_attn:
+        recipe += "+nvfp4attn"
     print(f"[retake] building native retake pipeline ({recipe})...", flush=True)
     pipe = _build_retake_pipeline(
         args.checkpoint,
@@ -232,6 +255,7 @@ def main() -> None:
         args.lora,
         args.quant_algo,
         fp8_linear_steps=args.fp8_linear_step,
+        nvfp4_attn=args.nvfp4_attn,
     )
 
     print("[retake] loaded; running infer...", flush=True)
