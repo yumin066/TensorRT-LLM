@@ -82,6 +82,16 @@ def _parse_args() -> argparse.Namespace:
         help="Denoise steps (native retake runs the distilled 8-step schedule).",
     )
     parser.add_argument(
+        "--quant-algo",
+        default=None,
+        choices=("FP8", "NVFP4"),
+        help=(
+            "Optional runtime weight-quantization recipe for the transformer linears. "
+            "Omit for bf16; FP8/NVFP4 use the native dynamic-quant path. NVFP4 requires "
+            "an NVFP4-capable GPU (e.g. RTX PRO 6000 / Blackwell)."
+        ),
+    )
+    parser.add_argument(
         "--lora",
         default=None,
         help="Optional identity/style LoRA fused into the base transformer weights.",
@@ -89,7 +99,13 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _build_retake_pipeline(checkpoint: str, text_encoder: str, device: torch.device, lora):
+def _build_retake_pipeline(
+    checkpoint: str,
+    text_encoder: str,
+    device: torch.device,
+    lora,
+    quant_algo=None,
+):
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
         _find_safetensors_files,
@@ -106,13 +122,29 @@ def _build_retake_pipeline(checkpoint: str, text_encoder: str, device: torch.dev
         "retake_lora_path": lora,
         "retake_lora_strength": 1.0,
     }
-    pipeline_config = DiffusionPipelineConfig(
-        model_configs={
-            "transformer": DiffusionModelConfig(
-                pretrained_config=SimpleNamespace(**transformer_cfg)
+
+    model_config_kwargs = {"pretrained_config": SimpleNamespace(**transformer_cfg)}
+    pipeline_config_kwargs = {"extra_attrs": extra}
+    if quant_algo:
+        # Native runtime dynamic-quant path: the quant config is threaded onto
+        # both the transformer model config (where DynamicLinearWeightLoader keys
+        # on ``dynamic_weight_quant``) and the pipeline config, and
+        # ``force_dynamic_quantization`` computes the activation scale live per
+        # forward (the fix for the uninitialized static-scale NVFP4 collapse).
+        quant_config, _layer, dynamic_weight_quant, _dyn_act = (
+            DiffusionPipelineConfig.load_diffusion_quant_config(
+                {"quant_algo": quant_algo, "dynamic": True}
             )
-        },
-        extra_attrs=extra,
+        )
+        model_config_kwargs["quant_config"] = quant_config
+        model_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
+        pipeline_config_kwargs["quant_config"] = quant_config
+        pipeline_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
+        pipeline_config_kwargs["force_dynamic_quantization"] = True
+
+    pipeline_config = DiffusionPipelineConfig(
+        model_configs={"transformer": DiffusionModelConfig(**model_config_kwargs)},
+        **pipeline_config_kwargs,
     )
     pipeline_config.cuda_graph.enable = False
 
@@ -167,8 +199,11 @@ def main() -> None:
         raise ValueError(f"--start ({args.start}) must be < --end ({args.end}).")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("[retake] building native retake pipeline (bf16)...", flush=True)
-    pipe = _build_retake_pipeline(args.checkpoint, args.text_encoder, device, args.lora)
+    recipe = args.quant_algo or "bf16"
+    print(f"[retake] building native retake pipeline ({recipe})...", flush=True)
+    pipe = _build_retake_pipeline(
+        args.checkpoint, args.text_encoder, device, args.lora, args.quant_algo
+    )
 
     print("[retake] loaded; running infer...", flush=True)
     out = pipe.infer(_make_request(args))
