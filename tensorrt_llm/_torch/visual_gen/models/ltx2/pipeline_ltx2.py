@@ -1433,11 +1433,26 @@ class LTX2Pipeline(BasePipeline):
             else None
         )
 
-        vel_v, vel_a = self.transformer(
+        # Per-step precision fallback (M034 "fp8-linear-step"): at the configured
+        # diffusion steps, run the resident FP8 transformer instead of the primary
+        # (e.g. NVFP4) one to recover the quality NVFP4 linears lose at those
+        # sensitive steps. The FP8 transformer carries its own prepared text cache
+        # (prepare_text_cache runs the model's quantized cross-attention context),
+        # so swap both the transformer and its text cache together.
+        _tf = self.transformer
+        _tc = text_cache
+        _fp8_steps = getattr(self, "_fp8_step_indices", None)
+        if _fp8_steps and step_index in _fp8_steps:
+            _fp8_tf = getattr(self, "_fp8_step_transformer", None)
+            if _fp8_tf is not None:
+                _tf = _fp8_tf
+                _tc = getattr(self, "_fp8_step_text_cache", None) or text_cache
+
+        vel_v, vel_a = _tf(
             video=video_mod,
             audio=audio_mod,
             perturbations=perturbations,
-            text_cache=text_cache,
+            text_cache=_tc,
             timestep=timestep_val.new_tensor(float(step_index) / num_steps),
             step_index=step_index,
         )

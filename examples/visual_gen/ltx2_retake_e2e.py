@@ -92,6 +92,19 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fp8-linear-step",
+        type=int,
+        action="append",
+        default=None,
+        metavar="STEP",
+        help=(
+            "Run the transformer in FP8 at this diffusion step index instead of the "
+            "primary quant (M034 fp8-linear-step). Repeatable; e.g. --fp8-linear-step 4 "
+            "--fp8-linear-step 7. Requires --quant-algo NVFP4; a resident FP8 transformer "
+            "is built and Gemma is offloaded to CPU to fit both models."
+        ),
+    )
+    parser.add_argument(
         "--lora",
         default=None,
         help="Optional identity/style LoRA fused into the base transformer weights.",
@@ -105,6 +118,7 @@ def _build_retake_pipeline(
     device: torch.device,
     lora,
     quant_algo=None,
+    fp8_linear_steps=None,
 ):
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
@@ -122,6 +136,8 @@ def _build_retake_pipeline(
         "retake_lora_path": lora,
         "retake_lora_strength": 1.0,
     }
+    if fp8_linear_steps:
+        extra["retake_fp8_linear_steps"] = sorted(set(int(s) for s in fp8_linear_steps))
 
     model_config_kwargs = {"pretrained_config": SimpleNamespace(**transformer_cfg)}
     pipeline_config_kwargs = {"extra_attrs": extra}
@@ -206,9 +222,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     recipe = args.quant_algo or "bf16"
+    if args.fp8_linear_step:
+        recipe += f"+fp8@{sorted(set(args.fp8_linear_step))}"
     print(f"[retake] building native retake pipeline ({recipe})...", flush=True)
     pipe = _build_retake_pipeline(
-        args.checkpoint, args.text_encoder, device, args.lora, args.quant_algo
+        args.checkpoint,
+        args.text_encoder,
+        device,
+        args.lora,
+        args.quant_algo,
+        fp8_linear_steps=args.fp8_linear_step,
     )
 
     print("[retake] loaded; running infer...", flush=True)

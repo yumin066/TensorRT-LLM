@@ -441,6 +441,51 @@ class LTX2RetakePipeline(BasePipeline):
         # so the denoise forward matches the CUDA latents/context tensors.
         if self.transformer is not None:
             self.transformer.to(self._device)
+        self._build_fp8_step_transformer()
+
+    def _build_fp8_step_transformer(self) -> None:
+        """Build a resident FP8 transformer for the M034 fp8-linear-step recipe.
+
+        When ``retake_fp8_linear_steps`` is set, the masked denoise runs this FP8
+        transformer at those diffusion steps instead of the primary (NVFP4) one to
+        recover the quality NVFP4 linears lose at those sensitive steps. Both
+        transformers stay resident; the caller is expected to offload the Gemma
+        text encoder after prompt encoding to make room (see _run_native_retake).
+        """
+        import copy
+
+        steps = self.pipeline_config.extra_attrs.get("retake_fp8_linear_steps")
+        if not steps or self._native is None or self.transformer is None:
+            return
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+        fp8_qc, _lqc, fp8_dwq, _daq = DiffusionPipelineConfig.load_diffusion_quant_config(
+            {"quant_algo": "FP8", "dynamic": True}
+        )
+        base_mc = self.pipeline_config.model_configs["transformer"]
+        fp8_mc = copy.deepcopy(base_mc)
+        fp8_mc.quant_config = fp8_qc
+        fp8_mc.dynamic_weight_quant = fp8_dwq
+        fp8_mc.force_dynamic_quantization = True
+        fp8_cfg = copy.copy(self.pipeline_config)
+        fp8_cfg.model_configs = dict(self.pipeline_config.model_configs)
+        fp8_cfg.model_configs["transformer"] = fp8_mc
+
+        logger.info(f"retake: building resident FP8 step transformer for steps {sorted(steps)}")
+        fp8_tf = build_ltx2_transformer(fp8_cfg)
+        raw = self.load_transformer_weights(self._checkpoint_dir)
+        tw = raw.get("transformer", raw)
+        lora_path = self.pipeline_config.extra_attrs.get("retake_lora_path")
+        if lora_path:
+            strength = float(self.pipeline_config.extra_attrs.get("retake_lora_strength", 1.0))
+            tw = _fuse_lora_into_transformer_weights(tw, lora_path, strength)
+        fp8_tf.load_weights(tw)
+        if hasattr(fp8_tf, "post_load_weights"):
+            fp8_tf.post_load_weights()
+        fp8_tf.to(self._device)
+        # The companion runs _masked_transformer_step, so attach the swap state there.
+        self._native._fp8_step_transformer = fp8_tf
+        self._native._fp8_step_indices = frozenset(int(s) for s in steps)
 
     def _setup_cuda_graphs(self) -> None:
         # Retake now builds the native LTXModel, whose ``forward`` takes
@@ -470,6 +515,7 @@ class LTX2RetakePipeline(BasePipeline):
         **kwargs,
     ) -> None:
         self._device = device
+        self._checkpoint_dir = checkpoint_dir
         if not text_encoder_path:
             raise ValueError(
                 "LTX-2 retake workflow requires pipeline_config.text_encoder_path "
@@ -1076,6 +1122,28 @@ class LTX2RetakePipeline(BasePipeline):
             audio_positions=None,
             dtype=dtype,
         )
+
+        # M034 fp8-linear-step: prepare the resident FP8 transformer's own text
+        # cache (prepare_text_cache runs the model's quantized cross-attention
+        # context) while both transformers are resident, then offload the Gemma
+        # text encoder to CPU. Gemma is only used for the prompt encode above; the
+        # single-process retake must free its ~24GB so the NVFP4 + FP8 transformers
+        # fit alongside the denoise activations (the a/b/c split got this for free
+        # because Gemma lived in Step A's process, which exited before Step B).
+        fp8_step_tf = getattr(native, "_fp8_step_transformer", None)
+        if fp8_step_tf is not None:
+            native._fp8_step_text_cache = fp8_step_tf.prepare_text_cache(
+                video_context=video_embeds,
+                video_context_mask=connector_mask,
+                video_positions=video_positions,
+                audio_context=None,
+                audio_context_mask=None,
+                audio_positions=None,
+                dtype=dtype,
+            )
+            if getattr(native, "text_encoder", None) is not None:
+                native.text_encoder.to("cpu")
+                torch.cuda.empty_cache()
 
         # ---- 5. Native masked denoise (distilled, video-only, non-guided) --
         scheduler = NativeSchedulerAdapter()
