@@ -13,9 +13,10 @@ Major modifications:
 from .adaln import AdaLayerNormSingle
 from .attention import Attention, FeedForward, GELUApprox
 from .connector import (
+    AudioEmbeddings1DConnectorConfigurator,
     Embeddings1DConnector,
     Embeddings1DConnectorConfigurator,
-    GemmaFeaturesExtractorProjLinear,
+    GemmaFeaturesExtractorConfigurator,
 )
 from .diffusion_steps import EulerDiffusionStep
 from .modality import Modality
@@ -51,12 +52,13 @@ __all__ = [
     "AudioLatentShape",
     "AudioPatchifier",
     "DiffusionStepProtocol",
+    "AudioEmbeddings1DConnectorConfigurator",
     "Embeddings1DConnector",
     "Embeddings1DConnectorConfigurator",
     "EulerDiffusionStep",
     "FeedForward",
     "GELUApprox",
-    "GemmaFeaturesExtractorProjLinear",
+    "GemmaFeaturesExtractorConfigurator",
     "LTX2Scheduler",
     "LTXRopeType",
     "Modality",

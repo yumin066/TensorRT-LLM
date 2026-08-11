@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+r"""End-to-end example for the native LTX-2 retake workflow.
+
+Regenerates an internal time-window ``[start, end)`` of a source video and
+composites it back so the frames outside the window stay byte-identical to the
+source. Unlike the external step_a/step_b/step_c pipeline, this drives the
+native :class:`LTX2RetakePipeline` in a single process: source read -> VAE
+encode -> two-sided masked denoise -> VAE decode -> composite.
+
+The source-video read uses the optional Lightricks ``ltx-pipelines``
+``media_io`` helpers (the pipeline imports them lazily); install that package in
+the VisualGen runtime before running.
+
+Example::
+
+    python examples/visual_gen/ltx2_retake_e2e.py \\
+        --checkpoint /path/to/ltx-2.3-22b-distilled.safetensors \\
+        --text-encoder /path/to/gemma-3-12b-it \\
+        --source retake_input.mp4 --output retake_output.mp4 \\
+        --start 3.0 --end 3.9667 \\
+        --prompt "a person talking to the camera, natural head motion, clear speech"
+
+Note: the full-resolution 22B retake (source + Gemma text encoder + 22B
+transformer resident) needs a large-memory GPU (e.g. H200 141GB); an 80GB GPU
+can OOM at full resolution.
+"""
+
+from __future__ import annotations
+
+import argparse
+from types import SimpleNamespace
+
+import torch
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the native LTX-2 retake workflow end-to-end.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint", required=True, help="LTX-2 checkpoint (.safetensors or dir)."
+    )
+    parser.add_argument(
+        "--text-encoder",
+        required=True,
+        help="Gemma3 text encoder directory (config.json + model*.safetensors + tokenizer).",
+    )
+    parser.add_argument("--source", required=True, help="Source video to retake (.mp4).")
+    parser.add_argument("--output", required=True, help="Output composited retake video (.mp4).")
+    parser.add_argument(
+        "--start", type=float, required=True, help="Start time (seconds) of the regenerated window."
+    )
+    parser.add_argument(
+        "--end", type=float, required=True, help="End time (seconds) of the regenerated window."
+    )
+    parser.add_argument(
+        "--prompt",
+        default="a person talking to the camera, natural head motion, clear speech",
+        help="Text prompt for the regenerated window.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=8,
+        help="Denoise steps (native retake runs the distilled 8-step schedule).",
+    )
+    parser.add_argument(
+        "--lora",
+        default=None,
+        help="Optional identity/style LoRA fused into the base transformer weights.",
+    )
+    return parser.parse_args()
+
+
+def _build_retake_pipeline(checkpoint: str, text_encoder: str, device: torch.device, lora):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
+        _find_safetensors_files,
+        _read_safetensors_config,
+    )
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import LTX2RetakePipeline
+
+    cfg = _read_safetensors_config(_find_safetensors_files(checkpoint)[0])
+    transformer_cfg = cfg.get("transformer", cfg)
+    extra = {
+        "workflow": "retake",
+        "retake_distilled": True,
+        "retake_offload_mode": "none",
+        "retake_lora_path": lora,
+        "retake_lora_strength": 1.0,
+    }
+    pipeline_config = DiffusionPipelineConfig(
+        model_configs={
+            "transformer": DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(**transformer_cfg)
+            )
+        },
+        extra_attrs=extra,
+    )
+    pipeline_config.cuda_graph.enable = False
+
+    pipe = LTX2RetakePipeline(pipeline_config)
+    pipe.load_standard_components(checkpoint, device, text_encoder_path=text_encoder)
+    pipe.load_weights(pipe.load_transformer_weights(checkpoint))
+    pipe.post_load_weights()
+    return pipe
+
+
+def _make_request(args: argparse.Namespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt=args.prompt,
+        negative_prompt=None,
+        params=SimpleNamespace(
+            extra_params={
+                "retake_video_path": args.source,
+                "retake_start_time": args.start,
+                "retake_end_time": args.end,
+                "retake_regenerate_video": True,
+                "retake_regenerate_audio": False,
+                "retake_enhance_prompt": False,
+                "retake_max_batch_size": 1,
+            },
+            negative_prompt=None,
+            seed=args.seed,
+            num_inference_steps=args.num_inference_steps,
+        ),
+    )
+
+
+def _save_video(video: torch.Tensor, frame_rate: float, output_path: str) -> int:
+    """Encode a ``(1, T, H, W, C)`` uint8 RGB video to H.264 via PyAV."""
+    import av
+
+    frames = video[0].cpu().to(torch.uint8).numpy()  # (T, H, W, C)
+    container = av.open(output_path, mode="w")
+    stream = container.add_stream("libx264", rate=int(round(frame_rate)))
+    stream.width, stream.height, stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
+    for frame in frames:
+        for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return frames.shape[0]
+
+
+def main() -> None:
+    args = _parse_args()
+    if args.start >= args.end:
+        raise ValueError(f"--start ({args.start}) must be < --end ({args.end}).")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("[retake] building native retake pipeline (bf16)...", flush=True)
+    pipe = _build_retake_pipeline(args.checkpoint, args.text_encoder, device, args.lora)
+
+    print("[retake] loaded; running infer...", flush=True)
+    out = pipe.infer(_make_request(args))
+    video = out.video
+    if video is None or video.dim() != 5:
+        raise RuntimeError("retake pipeline did not produce a video tensor")
+    print(
+        f"[retake] video={tuple(video.shape)} fps={out.frame_rate} "
+        f"stage_timings={out.stage_timings}",
+        flush=True,
+    )
+
+    num_frames = _save_video(video, float(out.frame_rate), args.output)
+    print(f"[retake] saved {args.output} ({num_frames} frames)", flush=True)
+
+
+if __name__ == "__main__":
+    main()
