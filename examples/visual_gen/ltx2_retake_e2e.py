@@ -138,6 +138,12 @@ def _build_retake_pipeline(
         )
         model_config_kwargs["quant_config"] = quant_config
         model_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
+        # force_dynamic_quantization must be set on the MODEL config: the
+        # transformer's _make_linear reads model_config.force_dynamic_quantization
+        # to build each Linear with a live activation amax. Without it NVFP4 uses
+        # an uninitialized static activation scale and the AdaLN/timestep_embedder
+        # linears produce NaN (the whole regenerated window decodes to black).
+        model_config_kwargs["force_dynamic_quantization"] = True
         pipeline_config_kwargs["quant_config"] = quant_config
         pipeline_config_kwargs["dynamic_weight_quant"] = dynamic_weight_quant
         pipeline_config_kwargs["force_dynamic_quantization"] = True
