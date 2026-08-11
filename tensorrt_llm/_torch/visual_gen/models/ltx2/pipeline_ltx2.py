@@ -936,9 +936,13 @@ class LTX2Pipeline(BasePipeline):
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info(f"Loading text encoder (Gemma3) from {text_encoder_path}...")
+            # low_cpu_mem_usage=False loads the full model on CPU and then does a
+            # single bulk .to(device); the default meta-device path places params
+            # one-by-one and stalls indefinitely on SM120 (Blackwell) drivers.
             self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
                 text_encoder_path,
                 torch_dtype=dtype,
+                low_cpu_mem_usage=False,
             ).to(device)
 
         # --- Resolve native config ----------------------------------------

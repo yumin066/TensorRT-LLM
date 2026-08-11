@@ -76,35 +76,46 @@ echo "  overlaid: _torch/visual_gen/**.py + _torch/modules/linear.py"
 
 # ---- 2. FlashInfer 0.6.17 from PR #4272 (SM120 nvfp4 attention) --------------
 log "2/4 flashinfer-python 0.6.17 (PR #4272 @ ${FLASHINFER_PR_SHA})"
-FI_SRC="${DEPS_DIR}/flashinfer-pr4272"
 mkdir -p "${DEPS_DIR}/wheels"
-if [ ! -d "${FI_SRC}" ]; then
-  if [ -n "${FLASHINFER_SHARED_ARCHIVE}" ] && [ -f "${FLASHINFER_SHARED_ARCHIVE}" ]; then
-    echo "  internal override: extracting FLASHINFER_SHARED_ARCHIVE"
-    mkdir -p "${FI_SRC}"
-    tar -xzf "${FLASHINFER_SHARED_ARCHIVE}" -C "${FI_SRC}"
-  else
-    echo "  fetching FlashInfer PR #4272 commit from GitHub (by SHA)"
-    git init -q "${FI_SRC}"
-    git -C "${FI_SRC}" remote add origin "${FLASHINFER_REPO}"
-    # GitHub serves the exact commit even after the PR head advances.
-    git -C "${FI_SRC}" fetch --depth 1 origin "${FLASHINFER_PR_SHA}"
-    git -C "${FI_SRC}" checkout -q --detach FETCH_HEAD
-    git -C "${FI_SRC}" submodule update --init --recursive --depth 1
-    test "$(git -C "${FI_SRC}" rev-parse HEAD)" = "${FLASHINFER_PR_SHA}"
+# The build (~8 min) is the slow part; the wheel lives on scratch, so reuse it
+# across containers. This keeps a re-run fast enough to finish inside the ~4 min
+# container-reap window on shared "gen" nodes.
+FI_WHEEL="$(ls "${DEPS_DIR}"/wheels/flashinfer_python-0.6.17-*.whl 2>/dev/null | head -1 || true)"
+if [ -z "${FI_WHEEL}" ]; then
+  # Build in a LOCAL dir, not on NFS: compiling with build intermediates on NFS
+  # is several times slower. The resulting wheel still lands in DEPS_DIR/wheels
+  # (persistent, reused across containers).
+  FI_SRC="${FI_BUILD_DIR:-/tmp/flashinfer-pr4272-build}"
+  if [ ! -d "${FI_SRC}" ]; then
+    if [ -n "${FLASHINFER_SHARED_ARCHIVE}" ] && [ -f "${FLASHINFER_SHARED_ARCHIVE}" ]; then
+      echo "  internal override: extracting FLASHINFER_SHARED_ARCHIVE"
+      mkdir -p "${FI_SRC}"
+      tar -xzf "${FLASHINFER_SHARED_ARCHIVE}" -C "${FI_SRC}"
+    else
+      echo "  fetching FlashInfer PR #4272 commit from GitHub (by SHA)"
+      git init -q "${FI_SRC}"
+      git -C "${FI_SRC}" remote add origin "${FLASHINFER_REPO}"
+      # GitHub serves the exact commit even after the PR head advances.
+      git -C "${FI_SRC}" fetch --depth 1 origin "${FLASHINFER_PR_SHA}"
+      git -C "${FI_SRC}" checkout -q --detach FETCH_HEAD
+      git -C "${FI_SRC}" submodule update --init --recursive --depth 1
+      test "$(git -C "${FI_SRC}" rev-parse HEAD)" = "${FLASHINFER_PR_SHA}"
+    fi
   fi
+  export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+  export FLASHINFER_CUDA_ARCH_LIST=12.0a
+  export FLASHINFER_DISABLE_VERSION_CHECK=1
+  export BUILD_NIXL_EP=0
+  export BUILD_NCCL_EP=0
+  export MAX_JOBS="${MAX_JOBS:-8}"
+  python3 -m pip wheel --no-deps --no-build-isolation \
+    --wheel-dir "${DEPS_DIR}/wheels" "${FI_SRC}"
+  FI_WHEEL="$(ls "${DEPS_DIR}"/wheels/flashinfer_python-0.6.17-*.whl | head -1)"
+else
+  echo "  reusing cached wheel: ${FI_WHEEL}"
 fi
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-export PATH="${CUDA_HOME}/bin:${PATH}"
-export FLASHINFER_CUDA_ARCH_LIST=12.0a
-export FLASHINFER_DISABLE_VERSION_CHECK=1
-export BUILD_NIXL_EP=0
-export BUILD_NCCL_EP=0
-export MAX_JOBS="${MAX_JOBS:-8}"
-python3 -m pip wheel --no-deps --no-build-isolation \
-  --wheel-dir "${DEPS_DIR}/wheels" "${FI_SRC}"
-sudo -E python3 -m pip install --no-deps --force-reinstall \
-  "${DEPS_DIR}"/wheels/flashinfer_python-0.6.17-py3-none-any.whl
+sudo -E python3 -m pip install --no-deps --force-reinstall "${FI_WHEEL}"
 
 # ---- 3. Native-retake runtime deps (system python) --------------------------
 log "3/4 native-retake deps: PyAV + audio-lib import stubs"
@@ -127,6 +138,8 @@ PYSTUB
 
 # ---- 4. Environment preflight ----------------------------------------------
 log "4/4 environment preflight"
+cd /tmp  # neutral CWD so `import tensorrt_llm` hits the INSTALLED package, not
+         # the uncompiled source tree (docker exec starts in the repo root).
 python3 - <<'PY'
 import pathlib
 import torch
