@@ -88,6 +88,13 @@ if [ -n "${_TA_INIT}" ] && [ -f "${_TA_INIT}" ]; then
   sudo sed -i 's/^\(\s*\)_check_cuda_version()/\1pass  # patched: torchaudio\/torch CUDA mismatch; mel\/resample are pure-torch/' "${_TA_INIT}"
 fi
 mkdir -p "${STUB_DIR}"
+# Drop a stale torchaudio import-stub if an older workflow left one here. The stub
+# dir is prepended to PYTHONPATH at run time, so a leftover `torchaudio.py` shadows
+# the REAL torchaudio installed just above and makes the audio conditioning die with
+# "stub torchaudio.MelSpectrogram: audio ops unavailable" even though a working
+# torchaudio is present.
+rm -f "${STUB_DIR}/torchaudio.py"
+rm -rf "${STUB_DIR}/__pycache__"
 # OpenImageIO (EXR image writer) is still unused by the video+audio retake path.
 cat > "${STUB_DIR}/OpenImageIO.py" <<'PYSTUB'
 """Import-only stub: the retake path never touches the EXR image writer."""
