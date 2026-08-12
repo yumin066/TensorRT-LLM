@@ -80,14 +80,19 @@ def to_velocity(
     keeping it in float32 (and letting the Euler step re-quantize only the final
     stepped latent) matches the a/b/c oracle's ``_euler_step`` velocity math,
     which likewise keeps the velocity in float32.
+
+    A tensor ``sigma`` is reduced to a Python float via ``.item()`` so the
+    division ``x / sigma`` takes PyTorch's scalar path. Dividing by a 0-dim
+    tensor instead takes the tensor path, whose fp32 result differs from the
+    scalar path by ~1e-6; that discrepancy crosses bf16 rounding boundaries a
+    few steps into the distilled schedule and breaks byte-parity with the
+    oracle (whose ``_euler_step`` divides by a Python-float sigma). ``to_velocity``
+    is only invoked from the eager Euler step (outside the transformer CUDA
+    graph), so the single ``.item()`` D2H sync per step is safe here.
     """
-    # Tensor sigma: keep on device. `.item()` would force a D2H sync that
-    # deadlocks under nsys profiling combined with CUDA graph replay.
-    # The scheduler guarantees sigma > 0 inside the denoise loop, so we
-    # skip the zero check on the tensor path (re-checking would re-sync).
     if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype)
-    elif sigma == 0:
+        sigma = sigma.to(calc_dtype).item()
+    if sigma == 0:
         raise ValueError("Sigma can't be 0.0")
     return (sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma
 

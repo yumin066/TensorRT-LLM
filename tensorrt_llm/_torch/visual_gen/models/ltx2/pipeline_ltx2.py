@@ -1399,9 +1399,14 @@ class LTX2Pipeline(BasePipeline):
         a_latents_f32 = a_latents.float() if a_latents is not None else None
         a_latents_bf = a_latents.to(self.dtype) if a_latents is not None else None
 
-        # Per-token timesteps for masked conditioning
+        # Per-token timesteps for masked conditioning. Quantized to the model
+        # dtype (bf16) to match the a/b/c oracle, whose ``_build_modality`` forms
+        # ``timesteps = denoise_mask * sigma`` with a bf16 mask (so the product is
+        # bf16). Keeping this in fp32 feeds the per-token AdaLN a slightly
+        # different sigma at every step where ``sigma`` is not bf16-exact, which
+        # diverges the regenerated (bridge) tokens from the oracle.
         if denoise_mask is not None and v_latents_bf is not None:
-            v_timestep = denoise_mask * timestep_val.unsqueeze(-1)  # (B, T)
+            v_timestep = (denoise_mask * timestep_val.unsqueeze(-1)).to(self.dtype)  # (B, T)
         else:
             v_timestep = timestep_val
 
@@ -1415,7 +1420,7 @@ class LTX2Pipeline(BasePipeline):
                 # Per-batch noise level; the prompt AdaLN (cross_attention_adaln,
                 # e.g. the LTX-2.3 22b) derives its text-context timestep from this.
                 # It is the unmasked scalar sigma, not the per-token ``v_timestep``.
-                sigma=timestep_val,
+                sigma=timestep_val.to(self.dtype),
             )
             if v_latents_bf is not None
             else None
@@ -1436,7 +1441,7 @@ class LTX2Pipeline(BasePipeline):
                 positions=audio_positions,
                 context=a_context,
                 context_mask=mask,
-                sigma=timestep_val,
+                sigma=timestep_val.to(self.dtype),
             )
             if a_latents_bf is not None
             else None
@@ -1468,7 +1473,11 @@ class LTX2Pipeline(BasePipeline):
 
         dn_v = None
         if vel_v is not None and v_latents_f32 is not None:
-            sigma = timestep_val.float()
+            # bf16-quantized sigma: the oracle's ``_to_denoised`` forms
+            # ``velocity * (mask * sigma)`` with a bf16 mask, so the effective
+            # per-token sigma is bf16. Using the raw fp32 sigma here diverges the
+            # bridge x0 whenever sigma is not bf16-exact.
+            sigma = timestep_val.to(self.dtype).float()
             while sigma.dim() < vel_v.dim():
                 sigma = sigma.unsqueeze(-1)
             # Re-quantize x0 to the model dtype after each stage, matching the
@@ -1484,7 +1493,7 @@ class LTX2Pipeline(BasePipeline):
 
         dn_a = None
         if vel_a is not None and a_latents_f32 is not None:
-            sigma = timestep_val.float()
+            sigma = timestep_val.to(self.dtype).float()
             while sigma.dim() < vel_a.dim():
                 sigma = sigma.unsqueeze(-1)
             dn_a = a_latents_f32 - vel_a.float() * sigma

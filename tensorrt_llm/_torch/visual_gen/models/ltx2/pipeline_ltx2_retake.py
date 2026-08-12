@@ -1102,7 +1102,12 @@ class LTX2RetakePipeline(BasePipeline):
         initial_latents = _init_retake_latents(
             noise_latents, source_window_latents, conditioned_latent_ranges
         )
-        latents = native.video_patchifier.patchify(initial_latents)
+        # Carry the denoise latent in the model dtype (bf16), matching the a/b/c
+        # oracle whose ``_euler_step`` re-quantizes to bf16 every step. The VAE
+        # encode above produces an fp32 latent; keeping it fp32 through the loop
+        # would leave each Euler-stepped latent at fp32 precision while the oracle
+        # rounds to bf16, a ~1e-3/step divergence that compounds over the schedule.
+        latents = native.video_patchifier.patchify(initial_latents).to(dtype)
 
         clean_5d = torch.zeros_like(noise_latents)
         total_latent = video_shape.frames
@@ -1232,8 +1237,14 @@ class LTX2RetakePipeline(BasePipeline):
                 a_cur = audio_init_latents.to(dtype)
             _traj = [a_cur]
             for _i in range(num_steps):
-                _s = _sigs[_i]
-                _sn = _sigs[_i + 1]
+                # Python-float sigma so the ``/ _s`` division matches the oracle's
+                # ``_euler_step`` (which divides by ``sigmas[i].item()``). Dividing
+                # by the 0-dim tensor ``_sigs[_i]`` instead takes PyTorch's tensor
+                # path, whose ~1e-6 fp32 discrepancy accumulates over the frozen
+                # audio trajectory and, a few steps in, perturbs the video via the
+                # audio cross-attention.
+                _s = float(_sigs[_i])
+                _sn = float(_sigs[_i + 1])
                 _vel = (a_cur.float() - a_clean.float()) / _s
                 a_cur = (a_cur.float() + _vel * (_sn - _s)).to(dtype)
                 _traj.append(a_cur)
