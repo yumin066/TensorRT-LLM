@@ -22,8 +22,9 @@ this checkout + FlashInfer 0.6.17 (PR #4272, SM120 nvfp4 attention).
 
 | File | Role |
 |------|------|
-| `start_sm120_container.sh` | Build the delivery image on the pinned digest + start a detached container (as the host user, via gosu). |
-| `setup_sm120_env.sh` | Inside the container: overlay LTX python, build+install flashinfer 0.6.17, add PyAV + import stubs, preflight self-check. |
+| `start_sm120_container.sh` | Build the delivery image on the pinned digest + start a detached container (as the host user, via gosu). Same base image on Blackwell and Hopper. |
+| `setup_sm120_env.sh` | **Blackwell / SM120.** Inside the container: overlay LTX python, build+install flashinfer 0.6.17 (SM120 nvfp4 attention), add PyAV + import stubs, preflight self-check. |
+| `setup_hopper_env.sh` | **Hopper / SM90 (H100/H200).** Same overlay + deps as the SM120 script, but skips the SM120-only FlashInfer PR #4272 build (arch `12.0a`, neither builds nor loads on Hopper) and preflights SM90. bf16 uses the base image's TRTLLM/SDPA attention. |
 | `run_recipes.sh` | Run the retake e2e for bf16 / fp8 / nvfp4, outputs to `/tmp`. |
 | `lpips_eval.sh` | LPIPS-score the outputs on the bridge window [90,119). |
 | `Dockerfile`, `entrypoint.sh` | Thin delivery layer (ffmpeg + drop-to-user entrypoint). |
@@ -49,6 +50,26 @@ docker exec -u "$(id -un)" ltx_sm120 bash \
 for r in bf16 fp8 nvfp4; do docker cp ltx_sm120:/tmp/retake_$r.mp4 ./rtx_retake_$r.mp4; done
 docker exec -u "$(id -un)" ltx_sm120 bash \
   examples/visual_gen/ltx2_retake_sm120/lpips_eval.sh
+```
+
+## Hopper (H100 / H200, SM90)
+
+The retake bf16 path runs on Hopper too — the diffusion output is byte-identical
+to the a/b/c oracle regardless of GPU. Use the same container start, but the
+Hopper env setup instead of the SM120 one (it skips the SM120-only FlashInfer
+build and preflights SM90):
+
+```bash
+# 1. Same container start (the rc22 base image is shared across archs).
+bash examples/visual_gen/ltx2_retake_sm120/start_sm120_container.sh
+
+# 2. Hopper env: overlay + PyAV/torchaudio + SM90 preflight (no SM120 FlashInfer).
+docker exec -u "$(id -un)" ltx_sm120 bash \
+  examples/visual_gen/ltx2_retake_sm120/setup_hopper_env.sh
+
+# 3. Run bf16 (fp8/nvfp4 fast paths are SM120-tuned; bf16 is the Hopper target).
+docker exec -u "$(id -un)" ltx_sm120 bash \
+  examples/visual_gen/ltx2_retake_sm120/run_recipes.sh "$SRC" bf16
 ```
 
 ## Cluster-specific defaults

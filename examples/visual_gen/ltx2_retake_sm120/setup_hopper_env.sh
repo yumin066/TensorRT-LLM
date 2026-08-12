@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# =============================================================================
+# Build the LTX-2.3 retake environment inside the pinned rc22 container on a
+# HOPPER host (H100 / H200, SM90). This is the Hopper counterpart of
+# ./setup_sm120_env.sh -- same overlay + native-retake runtime deps, but WITHOUT
+# the SM120-only FlashInfer PR #4272 build (its nvfp4 attention kernels are
+# compiled for arch 12.0a and neither build nor load on Hopper). The bf16 retake
+# path uses the base image's attention backend (TRTLLM / SDPA), so no extra
+# FlashInfer is needed for the byte-parity (bf16) recipe.
+#
+# RUN THIS INSIDE the container started by ./start_sm120_container.sh (the same
+# pinned rc22 base image is used on Hopper and Blackwell).
+#
+# Idempotent, all against the SYSTEM python:
+#   1. overlay the LTX python from THIS TensorRT-LLM checkout onto the rc22
+#      pre-compiled install: the whole _torch/visual_gen subtree plus
+#      _torch/modules/linear.py. Only these LTX files are overlaid -- the rest of
+#      the repo python is newer than rc22 and would fail against rc22's .so. No
+#      recompile.
+#   2. native-retake runtime deps: PyAV + torchaudio, plus an OpenImageIO import
+#      stub (the audio/image libs that ltx_pipelines.media_io imports at module
+#      load but the video-only retake never calls)
+#   3. environment preflight self-check (Hopper / SM90)
+#
+# NOTE on non-bf16 recipes: the fp8 / nvfp4 attention fast paths are SM120-tuned
+# (see setup_sm120_env.sh). On Hopper the byte-parity target is bf16; fp8/nvfp4
+# would need a Hopper-tuned FlashInfer and are out of scope for this script.
+# =============================================================================
+set -euo pipefail
+
+# ---- Frozen versions (do not bump without re-freezing the whole contract) ----
+# Anchor SHA of jaywan's SM120 base (this checkout carries it plus the retake
+# changes); used only for the preflight sanity note.
+TRTLLM_OVERLAY_BASE_SHA="c6e90fbc23db35ec41cf7bd3757d124004137412"
+
+# ---- Paths (self-rooted at this checkout) ----
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# examples/visual_gen/ltx2_retake_sm120 -> repo root is three levels up.
+TRTLLM_REPO="${TRTLLM_REPO:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+DEPS_DIR="${TRTLLM_REPO}/.deps"
+STUB_DIR="${DEPS_DIR}/native_import_stubs"
+
+log() { printf '\n== %s ==\n' "$*"; }
+
+# ---- 1. LTX python overlay (this checkout -> rc22 pre-compiled install) ------
+log "1/3 LTX overlay from ${TRTLLM_REPO}"
+VG_SRC="${TRTLLM_REPO}/tensorrt_llm/_torch/visual_gen"
+LINEAR_SRC="${TRTLLM_REPO}/tensorrt_llm/_torch/modules/linear.py"
+[ -f "${LINEAR_SRC}" ] || {
+  echo "ERROR: TensorRT-LLM checkout not found at ${TRTLLM_REPO} (is it mounted into the container? set TRTLLM_REPO=...)" >&2
+  exit 1
+}
+grep -q apply_with_pre_quant_scale_applied "${LINEAR_SRC}" || {
+  echo "ERROR: linear.py lacks the pre-smoothed NVFP4 API (wrong/old checkout)" >&2
+  exit 1
+}
+# Locate the pre-compiled tensorrt_llm inside the container (do not hardcode the
+# python version / dist-packages path). Importing tensorrt_llm prints a version
+# banner to stdout, so tag the real answer with a marker and extract only that.
+# Run from a neutral CWD so it does not import the (uncompiled) source tree.
+TRTLLM_PKG="$(cd /tmp && python3 -c 'import os,tensorrt_llm; print("TRTLLM_PKG="+os.path.dirname(tensorrt_llm.__file__))' 2>/dev/null | sed -n 's/^TRTLLM_PKG=//p')"
+echo "  installed tensorrt_llm: ${TRTLLM_PKG}"
+# Overlay the whole VisualGen subtree, python only, preserving dir structure and
+# leaving rc22's compiled extensions in place.
+( cd "${VG_SRC}" && find . -name '*.py' -print0 | tar --null -T - -cf - ) \
+  | sudo tar -xf - -C "${TRTLLM_PKG}/_torch/visual_gen"
+sudo cp "${LINEAR_SRC}" "${TRTLLM_PKG}/_torch/modules/linear.py"
+test -f "${TRTLLM_PKG}/_torch/visual_gen/models/ltx2/pipeline_ltx2_retake.py"
+test -f "${TRTLLM_PKG}/_torch/visual_gen/models/ltx2/retake_adapter.py"
+grep -q apply_with_pre_quant_scale_applied "${TRTLLM_PKG}/_torch/modules/linear.py"
+echo "  overlaid: _torch/visual_gen/**.py + _torch/modules/linear.py"
+
+# ---- 2. Native-retake runtime deps (system python) --------------------------
+log "2/3 native-retake deps: PyAV + torchaudio + OpenImageIO stub"
+python3 -m pip install --no-input av
+# Real torchaudio: the retake audio conditioning encodes the source audio via
+# torchaudio.transforms.MelSpectrogram + functional.resample (pure-torch ops).
+# There is no torchaudio wheel matching this torch+CUDA build, so install the
+# closest one (--no-deps, does not touch torch) and neuter its import-time CUDA
+# version check -- the C++ codec extension it guards is unused by the mel/resample
+# transforms, which are pure PyTorch.
+python3 -m pip install --no-deps --no-input "torchaudio==2.11.0"
+_TA_INIT="$(python3 -c 'import importlib.util,os; s=importlib.util.find_spec("torchaudio"); print(os.path.join(os.path.dirname(s.origin),"_extension","__init__.py"))' 2>/dev/null || true)"
+if [ -n "${_TA_INIT}" ] && [ -f "${_TA_INIT}" ]; then
+  sudo sed -i 's/^\(\s*\)_check_cuda_version()/\1pass  # patched: torchaudio\/torch CUDA mismatch; mel\/resample are pure-torch/' "${_TA_INIT}"
+fi
+mkdir -p "${STUB_DIR}"
+# OpenImageIO (EXR image writer) is still unused by the video+audio retake path.
+cat > "${STUB_DIR}/OpenImageIO.py" <<'PYSTUB'
+"""Import-only stub: the retake path never touches the EXR image writer."""
+def __getattr__(name):
+    raise NotImplementedError(f"stub OpenImageIO.{name}: image I/O unavailable")
+PYSTUB
+
+# ---- 3. Environment preflight (Hopper / SM90) -------------------------------
+log "3/3 environment preflight (Hopper)"
+cd /tmp  # neutral CWD so `import tensorrt_llm` hits the INSTALLED package, not
+         # the uncompiled source tree (docker exec starts in the repo root).
+python3 - <<'PY'
+import pathlib
+import torch
+import tensorrt_llm
+from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+
+cc = torch.cuda.get_device_capability()
+# Hopper is SM90 (H100 / H200). Reject a Blackwell/SM120 host: that needs the
+# SM120 FlashInfer build from setup_sm120_env.sh, not this script.
+assert cc == (9, 0), f"expected Hopper SM90 (9, 0), got {cc}"
+# The overlaid linear.py must carry the pre-smoothed NVFP4 API (overlay sanity).
+assert hasattr(NVFP4LinearMethod, "apply_with_pre_quant_scale_applied")
+assert hasattr(NVFP4LinearMethod, "configure_dynamic_absmax_backend")
+assert hasattr(NVFP4LinearMethod, "dynamic_absmax_report")
+import av  # noqa: F401  native source/output video I/O
+import torchaudio  # noqa: F401  retake audio conditioning (mel/resample)
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+print("tensorrt_llm:", tensorrt_llm.__version__)
+print("gpu:", torch.cuda.get_device_name(), cc)
+print("environment preflight: PASS")
+PY
+
+log "Hopper native-retake environment ready (bf16)"
+cat <<EOF
+
+Import stubs live at: ${STUB_DIR}
+At RUN time the retake runner (run_recipes.sh) prepends the stubs and the
+customer ltx-pipelines/ltx-core src to PYTHONPATH (media_io source reader).
+EOF
