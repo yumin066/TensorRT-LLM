@@ -121,3 +121,6 @@ tests/integration/defs/stress_test/artifacts/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
+DRAFT_PLAN.md
+PLAN_PARITY.md
+tests/integration/defs/examples/visual_gen/golden/visual_gen_lpips/visual_gen_lpips_golden_media/
