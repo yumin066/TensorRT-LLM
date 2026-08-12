@@ -22,15 +22,13 @@ OUT_DIR="${OUT_DIR:-/tmp}"
 SRC="${1:?usage: run_recipes.sh <source.mp4> [recipe ...]}"; shift || true
 RECIPES=("$@"); [ ${#RECIPES[@]} -eq 0 ] && RECIPES=(bf16 fp8 nvfp4)
 
-# Import-only stubs for audio/image libs that ltx_core imports at module load
-# but the video-only retake never calls (no torchaudio wheel for this torch).
+# Import-only stub for OpenImageIO (EXR image writer) which ltx_core imports at
+# module load but the retake never calls. torchaudio is REAL (setup installs it):
+# the retake audio conditioning encodes the source audio via MelSpectrogram, so
+# it must NOT be shadowed by a stub.
 STUB=/tmp/native_import_stubs
 mkdir -p "$STUB"
-cat > "$STUB/torchaudio.py" <<'PY'
-class _R:
-    def __getattr__(self, n): raise NotImplementedError("stub torchaudio."+n)
-transforms = _R(); functional = _R(); __version__ = "0.0.0+stub"
-PY
+rm -f "$STUB/torchaudio.py"
 cat > "$STUB/OpenImageIO.py" <<'PY'
 def __getattr__(n): raise NotImplementedError("stub OpenImageIO."+n)
 PY

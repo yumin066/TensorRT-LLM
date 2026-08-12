@@ -114,6 +114,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--upstream-stage",
+        action="store_true",
+        help=(
+            "Use the preserved upstream DiffusionStage oracle path (step_a-identical "
+            "video+audio latents via ltx_pipelines helpers, native transformer via the "
+            "adapter, frozen source audio conditioning the video denoise) instead of the "
+            "native masked-denoise path. For bf16 parity verification against step_a/b/c."
+        ),
+    )
+    parser.add_argument(
         "--lora",
         default=None,
         help="Optional identity/style LoRA fused into the base transformer weights.",
@@ -129,6 +139,7 @@ def _build_retake_pipeline(
     quant_algo=None,
     fp8_linear_steps=None,
     nvfp4_attn=False,
+    upstream_stage=False,
 ):
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import (
@@ -148,6 +159,8 @@ def _build_retake_pipeline(
     }
     if fp8_linear_steps:
         extra["retake_fp8_linear_steps"] = sorted(set(int(s) for s in fp8_linear_steps))
+    if upstream_stage:
+        extra["retake_use_upstream_stage"] = True
 
     model_config_kwargs = {"pretrained_config": SimpleNamespace(**transformer_cfg)}
     pipeline_config_kwargs = {"extra_attrs": extra}
@@ -256,6 +269,7 @@ def main() -> None:
         args.quant_algo,
         fp8_linear_steps=args.fp8_linear_step,
         nvfp4_attn=args.nvfp4_attn,
+        upstream_stage=args.upstream_stage,
     )
 
     print("[retake] loaded; running infer...", flush=True)

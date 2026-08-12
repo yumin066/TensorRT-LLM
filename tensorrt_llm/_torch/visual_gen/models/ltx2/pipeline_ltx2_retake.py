@@ -40,7 +40,12 @@ from tensorrt_llm.logger import logger
 
 from .ltx2_core.patchifier import get_pixel_coords
 from .ltx2_core.scheduler_adapter import NativeSchedulerAdapter
-from .ltx2_core.types import VIDEO_SCALE_FACTORS, VideoLatentShape, VideoPixelShape
+from .ltx2_core.types import (
+    VIDEO_SCALE_FACTORS,
+    AudioLatentShape,
+    VideoLatentShape,
+    VideoPixelShape,
+)
 from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import (
     LTX2Pipeline,
@@ -578,7 +583,26 @@ class LTX2RetakePipeline(BasePipeline):
         native.transformer_in_channels = native.transformer._transformer_config.get(
             "in_channels", 128
         )
+        # Load the audio VAE ENCODER. The native port only loads the audio decoder
+        # (generation makes audio from noise and never encodes it), but retake must
+        # encode the source audio to condition the joint AV denoise on the frozen
+        # (edited) audio -- without it the regenerated video ignores the audio and
+        # drifts from the step_a/b/c oracle. The audio connector (a_context) and
+        # audio patchifier are already loaded by load_standard_components.
+        self._load_retake_audio_encoder(native, checkpoint_dir, device)
         self._native = native
+
+    def _load_retake_audio_encoder(self, native, checkpoint_dir: str, device) -> None:
+        """Load the ltx_core audio VAE encoder for retake audio conditioning."""
+        from ltx_core.model.audio_vae.model_configurator import AudioEncoderConfigurator
+
+        from .pipeline_ltx2 import _find_safetensors_files, _load_component_weights
+
+        config = native._native_config
+        sft_paths = _find_safetensors_files(checkpoint_dir)
+        encoder = AudioEncoderConfigurator.from_config(config)
+        _load_component_weights(sft_paths, encoder, ["audio_vae.encoder.", "audio_vae."])
+        native._audio_encoder = encoder.to(device=device, dtype=native.dtype)
 
     def _load_upstream_stage_components(
         self, checkpoint_dir: str, device: torch.device, text_encoder_path: str
@@ -1102,7 +1126,7 @@ class LTX2RetakePipeline(BasePipeline):
             num_videos_per_prompt=1,
             max_sequence_length=max_sequence_length,
         )
-        video_embeds, _audio_embeds, connector_mask = native._process_connectors(
+        video_embeds, audio_embeds, connector_mask = native._process_connectors(
             prompt_embeds, prompt_attention_mask
         )
 
@@ -1111,15 +1135,48 @@ class LTX2RetakePipeline(BasePipeline):
             video_positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True
         )
         video_positions[:, 0, ...] = video_positions[:, 0, ...] / fps
-        video_positions = video_positions.to(dtype)
+        # Keep RoPE positions in float32 (matching the a/b/c oracle). Down-casting
+        # to the model bf16 dtype loses ~6.7e-6 of positional precision; through the
+        # distilled schedule's large final Euler steps this compounds into a ~13x
+        # larger denoise divergence at the regenerated window.
+
+        # ---- Frozen audio conditioning ----------------------------------
+        # Encode the (edited) source audio and build a FROZEN audio modality so the
+        # joint AV transformer cross-attends the video denoise to the audio,
+        # matching the step_a/b/c oracle. Video-only retake never regenerates the
+        # audio: its latent stays the clean encoding and its timesteps are 0 at
+        # every step (frozen). audio_latent_from_file mirrors step_a's encode.
+        from ltx_pipelines.utils.helpers import audio_latent_from_file
+
+        audio_latent = audio_latent_from_file(
+            native._audio_encoder, video_path, pixel_shape, device, dtype
+        )
+        audio_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
+        # ``audio_clean_latents`` is the frozen audio's x0 target (the clean encode);
+        # ``audio_init_latents`` is its noised init at sigma[0]. The oracle euler-
+        # integrates the audio latent noise->clean on the sigma schedule (built
+        # below once the scheduler is known) rather than holding it clean.
+        if audio_latent is not None:
+            audio_clean_latents = native.audio_patchifier.patchify(audio_latent.float())
+            audio_positions = native.audio_patchifier.get_patch_grid_bounds(
+                audio_shape, device=device
+            )
+            audio_init_latents = None  # noised below from the clean encode
+            audio_frozen_latents = audio_clean_latents  # placeholder for text-cache/embeds gating
+        else:
+            audio_clean_latents = None
+            audio_init_latents = None
+            audio_frozen_latents = None
+            audio_embeds = None
+            audio_positions = None
 
         text_cache = native.transformer.prepare_text_cache(
             video_context=video_embeds,
             video_context_mask=connector_mask,
             video_positions=video_positions,
-            audio_context=None,
-            audio_context_mask=None,
-            audio_positions=None,
+            audio_context=audio_embeds,
+            audio_context_mask=connector_mask if audio_embeds is not None else None,
+            audio_positions=audio_positions,
             dtype=dtype,
         )
 
@@ -1136,9 +1193,9 @@ class LTX2RetakePipeline(BasePipeline):
                 video_context=video_embeds,
                 video_context_mask=connector_mask,
                 video_positions=video_positions,
-                audio_context=None,
-                audio_context_mask=None,
-                audio_positions=None,
+                audio_context=audio_embeds,
+                audio_context_mask=connector_mask if audio_embeds is not None else None,
+                audio_positions=audio_positions,
                 dtype=dtype,
             )
             if getattr(native, "text_encoder", None) is not None:
@@ -1152,6 +1209,36 @@ class LTX2RetakePipeline(BasePipeline):
         timesteps = scheduler.timesteps
         num_steps = len(timesteps)
 
+        # Oracle frozen-audio trajectory: euler-integrate the audio latent
+        # noise->clean on the SAME sigma schedule as the video, so the video
+        # cross-attends to a noise-matched audio at every step. The a/b/c oracle
+        # does this; the retake path previously held the audio clean+constant,
+        # which corrupted the regenerated video bridge. The frozen audio's x0
+        # target is always the clean audio (audio mask=0), so the trajectory is
+        # closed-form (no transformer needed for the audio prediction).
+        audio_traj = None
+        if audio_clean_latents is not None:
+            _sigs = scheduler.sigmas.float()
+            # Match the jaywan step_b audio Euler exactly: a_clean is the bf16 x0
+            # target (audio mask=0), and a_cur is re-quantized to the model dtype
+            # after each Euler step (``_euler_step`` ends with ``.to(latent.dtype)``).
+            a_clean = audio_clean_latents.to(dtype)
+            if audio_init_latents is None:
+                _an = torch.randn(
+                    a_clean.shape, generator=generator, device=device, dtype=torch.float32
+                )
+                a_cur = (_an * _sigs[0] + a_clean.float() * (1.0 - _sigs[0])).to(dtype)
+            else:
+                a_cur = audio_init_latents.to(dtype)
+            _traj = [a_cur]
+            for _i in range(num_steps):
+                _s = _sigs[_i]
+                _sn = _sigs[_i + 1]
+                _vel = (a_cur.float() - a_clean.float()) / _s
+                a_cur = (a_cur.float() + _vel * (_sn - _s)).to(dtype)
+                _traj.append(a_cur)
+            audio_traj = _traj
+
         def retake_forward_fn(
             video_latents,
             extra_stream_latents,
@@ -1160,20 +1247,22 @@ class LTX2RetakePipeline(BasePipeline):
             encoder_hidden_states,
             extra_tensors,
         ):
+            a_lat = audio_traj[step_index] if audio_traj is not None else audio_frozen_latents
             denoised_video, _ = native._masked_transformer_step(
                 video_latents,
-                None,
+                a_lat,
                 step_index,
                 timestep,
                 video_embeds,
-                None,
+                audio_embeds,
                 connector_mask,
                 video_positions=video_positions,
-                audio_positions=None,
+                audio_positions=audio_positions,
                 denoise_mask=denoise_mask,
                 clean_latent=clean_latent,
                 num_steps=num_steps,
                 text_cache=text_cache,
+                a_frozen=True,
             )
             return denoised_video, {}
 

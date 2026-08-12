@@ -1376,6 +1376,7 @@ class LTX2Pipeline(BasePipeline):
         num_steps,
         text_cache,
         perturbations=None,
+        a_frozen=False,
     ):
         """Single masked transformer pass -> (denoised_video, denoised_audio).
 
@@ -1420,10 +1421,18 @@ class LTX2Pipeline(BasePipeline):
             else None
         )
 
+        # Frozen audio modality (retake video-only path). Matching the jaywan
+        # step_b oracle: the frozen audio's per-token time embedding is 0
+        # (``timesteps`` = denoise_mask * sigma with an all-zero audio mask), BUT
+        # its prompt-AdaLN noise level (``sigma``) is the REAL current sigma, and
+        # its latent is euler-integrated on the sigma schedule (noise->clean) by
+        # the caller -- it is NOT held clean/constant. Non-frozen audio (joint AV
+        # generation) is denoised at timestep_val for both.
+        a_timestep = torch.zeros_like(timestep_val) if a_frozen else timestep_val
         audio_mod = (
             Modality(
                 latent=a_latents_bf,
-                timesteps=timestep_val,
+                timesteps=a_timestep,
                 positions=audio_positions,
                 context=a_context,
                 context_mask=mask,
@@ -1462,11 +1471,16 @@ class LTX2Pipeline(BasePipeline):
             sigma = timestep_val.float()
             while sigma.dim() < vel_v.dim():
                 sigma = sigma.unsqueeze(-1)
-            dn_v = v_latents_f32 - vel_v.float() * sigma
+            # Re-quantize x0 to the model dtype after each stage, matching the
+            # jaywan step_b oracle (_to_denoised / _post_process both end with
+            # ``.to(latent.dtype)``). Keeping x0 in float32 makes the Euler step
+            # diverge from the oracle by ~1.6e-3/step, which compounds over the
+            # distilled schedule into the residual output-video gap.
+            dn_v = (v_latents_f32 - vel_v.float() * sigma).to(self.dtype)
 
             if denoise_mask is not None and clean_latent is not None:
-                dm = denoise_mask.unsqueeze(-1)  # (B, T, 1)
-                dn_v = dn_v * dm + clean_latent.float() * (1.0 - dm)
+                dm = denoise_mask.unsqueeze(-1).float()  # (B, T, 1)
+                dn_v = (dn_v.float() * dm + clean_latent.float() * (1.0 - dm)).to(self.dtype)
 
         dn_a = None
         if vel_a is not None and a_latents_f32 is not None:

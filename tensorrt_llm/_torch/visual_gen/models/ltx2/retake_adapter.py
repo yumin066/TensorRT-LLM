@@ -86,6 +86,15 @@ class LTX2RetakeNativeAdapter(torch.nn.Module):
                 "Upstream attention_mask is not supported by the native LTX-2 Modality; "
                 "retake attention is expected to be unmasked."
             )
+        # The prompt AdaLN (cross_attention_adaln=True, e.g. the LTX-2.3 22b
+        # distilled checkpoint) needs a per-batch scalar noise level. The upstream
+        # Modality carries only per-token ``timesteps`` (denoise_mask * sigma), so
+        # recover the scalar sigma as the max over tokens (the unmasked value) when
+        # the upstream object does not carry it directly.
+        sigma = getattr(upstream, "sigma", None)
+        if sigma is None and upstream.timesteps is not None:
+            _ts = upstream.timesteps
+            sigma = _ts.reshape(_ts.shape[0], -1).amax(dim=1)
         return NativeModality(
             latent=upstream.latent.to(dtype=self._dtype),
             timesteps=upstream.timesteps,
@@ -95,9 +104,7 @@ class LTX2RetakeNativeAdapter(torch.nn.Module):
             context=upstream.context.to(dtype=self._dtype),
             enabled=getattr(upstream, "enabled", True),
             context_mask=getattr(upstream, "context_mask", None),
-            # Consumed only by prompt AdaLN (cross_attention_adaln=True, e.g. the
-            # LTX-2.3 22b distilled checkpoint); carries the current noise level.
-            sigma=getattr(upstream, "sigma", None),
+            sigma=sigma,
         )
 
     @staticmethod

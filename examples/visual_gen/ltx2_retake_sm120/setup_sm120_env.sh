@@ -118,20 +118,23 @@ fi
 sudo -E python3 -m pip install --no-deps --force-reinstall "${FI_WHEEL}"
 
 # ---- 3. Native-retake runtime deps (system python) --------------------------
-log "3/4 native-retake deps: PyAV + audio-lib import stubs"
+log "3/4 native-retake deps: PyAV + torchaudio + OpenImageIO stub"
 python3 -m pip install --no-input av
+# Real torchaudio: the retake audio conditioning encodes the source audio via
+# torchaudio.transforms.MelSpectrogram + functional.resample (pure-torch ops).
+# There is no torchaudio wheel matching this torch+CUDA build, so install the
+# closest one (--no-deps, does not touch torch) and neuter its import-time CUDA
+# version check -- the C++ codec extension it guards is unused by the mel/resample
+# transforms, which are pure PyTorch.
+python3 -m pip install --no-deps --no-input "torchaudio==2.11.0"
+_TA_INIT="$(python3 -c 'import importlib.util,os; s=importlib.util.find_spec("torchaudio"); print(os.path.join(os.path.dirname(s.origin),"_extension","__init__.py"))' 2>/dev/null || true)"
+if [ -n "${_TA_INIT}" ] && [ -f "${_TA_INIT}" ]; then
+  sudo sed -i 's/^\(\s*\)_check_cuda_version()/\1pass  # patched: torchaudio\/torch CUDA mismatch; mel\/resample are pure-torch/' "${_TA_INIT}"
+fi
 mkdir -p "${STUB_DIR}"
-cat > "${STUB_DIR}/torchaudio.py" <<'PYSTUB'
-"""Import-only stub: video-only retake never calls torchaudio ops."""
-class _Raiser:
-    def __getattr__(self, name):
-        raise NotImplementedError(f"stub torchaudio.{name}: audio ops unavailable")
-transforms = _Raiser()
-functional = _Raiser()
-__version__ = "0.0.0+stub"
-PYSTUB
+# OpenImageIO (EXR image writer) is still unused by the video+audio retake path.
 cat > "${STUB_DIR}/OpenImageIO.py" <<'PYSTUB'
-"""Import-only stub: video-only retake never touches the EXR image writer."""
+"""Import-only stub: the retake path never touches the EXR image writer."""
 def __getattr__(name):
     raise NotImplementedError(f"stub OpenImageIO.{name}: image I/O unavailable")
 PYSTUB
