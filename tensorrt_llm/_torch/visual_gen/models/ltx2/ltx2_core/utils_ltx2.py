@@ -73,6 +73,13 @@ def to_velocity(
     """Convert denoised prediction to flow velocity (flow-matching parameterization).
 
     velocity = (sample - denoised) / sigma
+
+    The velocity is returned in ``calc_dtype`` (float32) and is NOT rounded back
+    to ``sample.dtype``. Rounding the velocity to bf16 before the Euler update
+    discards its low-order bits and perturbs the denoise trajectory each step;
+    keeping it in float32 (and letting the Euler step re-quantize only the final
+    stepped latent) matches the a/b/c oracle's ``_euler_step`` velocity math,
+    which likewise keeps the velocity in float32.
     """
     # Tensor sigma: keep on device. `.item()` would force a D2H sync that
     # deadlocks under nsys profiling combined with CUDA graph replay.
@@ -82,7 +89,7 @@ def to_velocity(
         sigma = sigma.to(calc_dtype)
     elif sigma == 0:
         raise ValueError("Sigma can't be 0.0")
-    return ((sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma).to(sample.dtype)
+    return (sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma
 
 
 def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
