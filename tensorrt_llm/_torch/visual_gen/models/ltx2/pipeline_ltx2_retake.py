@@ -116,6 +116,13 @@ def _composite_retake_window(
 ) -> torch.Tensor:
     """Splice regenerated ``window`` frames into ``source`` over ``[start, end)``.
 
+    NOT CURRENTLY CALLED. The pipeline now emits the whole decoded clip, matching
+    the reference, rather than splicing a 29-frame window into the source. Kept
+    while that change is being evaluated: the trade it makes -- two VAE/source
+    joins removed, at the cost of every non-window frame becoming a VAE round-trip
+    instead of the source's own pixels -- is being measured, and this is the other
+    side of the A/B. Delete it once the measurement settles the question.
+
     ``source`` and ``window`` are ``(..., T, H, W, C)`` video tensors that share
     every dimension except the frame count (dim ``-4``). Frames outside
     ``[start_frame, end_frame)`` are copied byte-for-byte from ``source``; frames
@@ -1127,7 +1134,10 @@ class LTX2RetakePipeline(BasePipeline):
         fps = float(output_shape.fps)
         self._validate_retake_source(num_frames, height, width)
 
-        source_uint8, source_norm_5d = self._read_source_video(
+        # The raw uint8 frames are no longer spliced into the output (step 7 emits the
+        # whole decode), but the read still validates that the source decodes to the
+        # frame count and resolution the metadata promised, so it stays.
+        _source_uint8, source_norm_5d = self._read_source_video(
             video_path, num_frames, height, width, device, dtype
         )
 
@@ -1400,13 +1410,20 @@ class LTX2RetakePipeline(BasePipeline):
         decoded = torch.cat(chunks, dim=2)  # (B, C, T, H, W)
         decoded = postprocess_video_tensor(decoded)  # (B, T, H, W, C) uint8
 
-        # ---- 7. Composite regenerated window back into the source -------
-        regenerated_pixel_window = decoded[:, pixel_start:pixel_end]
+        # ---- 7. Emit the whole decoded clip -----------------------------
+        # The reference pipeline delivers the entire decoded clip; this path used to
+        # keep only ``decoded[:, pixel_start:pixel_end]`` and splice it back into the
+        # source uint8 frames. Both are available for the same cost -- ``tiled_decode``
+        # already decodes every frame, and the crop discarded ~180 of the 209.
+        #
+        # Splicing put a VAE/source boundary immediately beside the regenerated
+        # window, so the frames outside it were byte-identical to the source but the
+        # two joins were hard cuts between VAE-reconstructed and original pixels.
+        # Emitting the full decode removes both joins; the cost is that non-window
+        # frames are now VAE round-trips rather than the source's own pixels.
         if timer is not None:
             timer.mark("composite")
-        composited_video = _composite_retake_window(
-            source_uint8, regenerated_pixel_window, pixel_start, pixel_end
-        ).contiguous()
+        composited_video = decoded.contiguous()
         # End of the GPU stage timeline (decode + composite). Source-audio read
         # below is host-side I/O and stays out of the CUDA phase measurement.
         if timer is not None:
