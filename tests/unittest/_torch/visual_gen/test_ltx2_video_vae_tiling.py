@@ -223,3 +223,100 @@ def test_encode_video_window_forwards_an_explicit_config():
     stub, spy = _stub_with_spy()
     stub._encode_video_window(torch.zeros(1, 3, 9, 64, 64), ORACLE_TILING)
     assert spy.calls[0]["tiling_config"] is ORACLE_TILING
+
+
+def test_two_stage_pipeline_inherits_the_untiled_encode_path():
+    """`LTX2TwoStagesPipeline` must not override the encode entry points.
+
+    Its image-conditioning branch calls `self._encode_image(image_5d)`, so the
+    no-tiling guarantee proven above only transfers if the subclass uses the same
+    methods. An override would silently reintroduce tiling for two-stage.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+        LTX2TwoStagesPipeline,
+    )
+
+    assert issubclass(LTX2TwoStagesPipeline, LTX2Pipeline)
+    for name in ("_encode_image", "_encode_video_window"):
+        assert name not in vars(LTX2TwoStagesPipeline), (
+            f"{name} is overridden by LTX2TwoStagesPipeline; the tiling guarantee "
+            "verified against LTX2Pipeline no longer covers the two-stage path"
+        )
+        assert getattr(LTX2TwoStagesPipeline, name) is getattr(LTX2Pipeline, name)
+
+
+def test_two_stage_call_site_passes_no_tiling_config():
+    """The two-stage image-conditioning call site must not request tiling.
+
+    WHAT THIS IS: a structural check of the call node, parsed with `ast` rather
+    than matched with a regex, so a reformatting cannot fool it and a new keyword
+    cannot slip past.
+
+    WHAT THIS IS NOT: an execution of `LTX2TwoStagesPipeline`'s generation method.
+    That branch sits inside a long method needing a full pipeline, weights and a
+    device. The coverage is closed as a chain instead: this test pins the call
+    site to a single positional argument, and
+    `test_encode_image_requests_no_tiling` executes the callee and proves it
+    reaches the encoder with `tiling_config=None`.
+    """
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages
+
+    tree = ast.parse(inspect.getsource(pipeline_ltx2_two_stages))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_encode_image"
+    ]
+
+    assert calls, "expected the two-stage path to encode a conditioning image"
+    for call in calls:
+        assert len(call.args) == 1, (
+            f"_encode_image at line {call.lineno} takes extra positional arguments; "
+            "the second parameter of _encode_video_window is the tiling config"
+        )
+        assert not call.keywords, (
+            f"_encode_image at line {call.lineno} passes keywords "
+            f"{[k.arg for k in call.keywords]}; two-stage must not request tiling"
+        )
+
+
+def test_i2v_encode_matches_a_plain_forward():
+    """i2v zero-regression: the default path equals the pre-tiling behaviour.
+
+    Before the tiled encode existed, `_encode_video_window` was a bare
+    `self.video_encoder(video_5d)`. This asserts the default path still returns
+    exactly that -- the same object a single `forward` produced -- so introducing
+    tiling changed nothing for callers that do not opt in.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.video_vae.video_vae import (
+        VideoEncoder,
+    )
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+    forwarded = []
+    plain_result = torch.randn(1, LATENT_CHANNELS, 1, 4, 4)
+
+    class _Encoder(VideoEncoder):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.out_channels = LATENT_CHANNELS
+
+        def forward(self, sample):  # type: ignore[override]
+            forwarded.append(tuple(sample.shape))
+            return plain_result
+
+    stub = _PipelineStub(_Encoder())
+    stub._encode_video_window = LTX2Pipeline._encode_video_window.__get__(stub)
+    stub._encode_image = LTX2Pipeline._encode_image.__get__(stub)
+
+    image_5d = torch.zeros(1, 3, 1, 128, 128)
+    out = stub._encode_image(image_5d)
+
+    assert forwarded == [tuple(image_5d.shape)], "i2v must run one whole-tensor forward"
+    assert out is plain_result, "i2v output must be the plain forward result, unblended"
