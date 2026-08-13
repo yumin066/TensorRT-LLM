@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 
@@ -63,6 +64,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--source", required=True, help="Source video to retake (.mp4).")
     parser.add_argument("--output", required=True, help="Output composited retake video (.mp4).")
+    parser.add_argument(
+        "--dump-frames",
+        default=None,
+        help=(
+            "Optional path to save the composited uint8 frames (1, T, H, W, C) as a "
+            ".pt tensor, before H.264 encoding. Quality evaluation should score "
+            "these rather than a decoded mp4, since the codec's own re-encode loss "
+            "is larger than the differences being measured."
+        ),
+    )
     parser.add_argument(
         "--start", type=float, required=True, help="Start time (seconds) of the regenerated window."
     )
@@ -232,8 +243,56 @@ def _make_request(args: argparse.Namespace) -> SimpleNamespace:
     )
 
 
-def _save_video(video: torch.Tensor, frame_rate: float, output_path: str) -> int:
+def _to_stereo_int16(audio: torch.Tensor, max_samples: int | None = None) -> "np.ndarray":
+    """Convert a float waveform to interleaved stereo int16 for AAC.
+
+    Accepts ``(B, C, S)`` (single batch only) or ``(C, S)``. Mono is duplicated
+    to both channels; more than two channels is an error rather than a silent
+    channel drop, because losing a channel is invisible in the output file.
+
+    *max_samples* trims the waveform to the encoded video's duration. The source
+    clip is longer than the 209-frame retake product, so without the trim the
+    file's audio runs past its last video frame.
+    """
+    if audio.dim() == 3:
+        if audio.shape[0] != 1:
+            raise ValueError(f"retake writeout supports one audio batch; got {audio.shape[0]}")
+        audio = audio[0]
+    if audio.dim() != 2:
+        raise ValueError(f"audio must be (B, C, S) or (C, S); got {tuple(audio.shape)}")
+
+    channels = audio.shape[0]
+    if channels == 1:
+        audio = audio.expand(2, -1)
+    elif channels != 2:
+        raise ValueError(f"retake writeout supports mono or stereo audio; got {channels} channels")
+
+    # Scale by 32767 and clamp: the waveform is nominally [-1, 1] but decoded
+    # float samples can exceed it slightly, and wrapping would be an audible click.
+    if max_samples is not None:
+        audio = audio[:, :max_samples]
+
+    samples = audio.detach().to(torch.float32).clamp(-1.0, 1.0).cpu().numpy()
+    quantized = (samples * 32767.0).round().astype(np.int16)
+
+    interleaved = np.empty((1, quantized.shape[1] * 2), dtype=np.int16)
+    interleaved[0, 0::2] = quantized[0]
+    interleaved[0, 1::2] = quantized[1]
+    return interleaved
+
+
+def _save_video(
+    video: torch.Tensor,
+    frame_rate: float,
+    output_path: str,
+    audio: torch.Tensor | None = None,
+    audio_sample_rate: int | None = None,
+) -> int:
     """Encode a ``(1, T, H, W, C)`` uint8 RGB video to H.264 via PyAV.
+
+    When *audio* is supplied it is muxed as AAC alongside the video. The retake
+    workflow is video-only: it regenerates a time window and passes the source
+    audio through unchanged, so dropping it here silently shipped a mute clip.
 
     Three things this has to get right, all of which it previously did not:
 
@@ -266,6 +325,8 @@ def _save_video(video: torch.Tensor, frame_rate: float, output_path: str) -> int
     # representing 29.97 as 30000/1001 rather than as a float.
     rate = Fraction(frame_rate).limit_denominator(1000000)
 
+    num_frames = int(rgb.shape[0])
+
     container = av.open(output_path, mode="w")
     try:
         stream = container.add_stream(
@@ -274,14 +335,57 @@ def _save_video(video: torch.Tensor, frame_rate: float, output_path: str) -> int
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
         stream.codec_context.colorspace = AVCOL_SPC_BT709
         stream.codec_context.color_range = AVCOL_RANGE_MPEG
+
+        audio_stream = None
+        if audio is not None and audio_sample_rate:
+            audio_stream = container.add_stream("aac", rate=int(audio_sample_rate))
+            audio_stream.codec_context.time_base = Fraction(1, int(audio_sample_rate))
+
         for frame in i420:
             for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="yuv420p")):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
+
+        if audio_stream is not None:
+            _mux_audio(container, audio_stream, audio, int(audio_sample_rate), num_frames, rate)
     finally:
         container.close()
-    return int(rgb.shape[0])
+    return num_frames
+
+
+def _mux_audio(container, audio_stream, audio, sample_rate: int, num_frames: int, rate) -> None:
+    """Encode *audio* into *audio_stream*, trimmed to the encoded video duration.
+
+    Trimming matters: the source clip is longer than the 209-frame retake
+    product, so muxing the full waveform would leave the file's audio running
+    past its last video frame.
+    """
+    from fractions import Fraction
+
+    import av
+
+    max_samples = int(round(num_frames / float(rate) * sample_rate))
+    interleaved = _to_stereo_int16(audio, max_samples=max_samples)
+    if interleaved.shape[1] == 0:
+        return
+
+    frame = av.AudioFrame.from_ndarray(interleaved, format="s16", layout="stereo")
+    frame.sample_rate = sample_rate
+    frame.time_base = Fraction(1, sample_rate)
+    frame.pts = 0
+
+    # AAC does not accept packed s16 directly, and it has a fixed frame size, so
+    # the resampler both converts the sample format and splits the waveform into
+    # encoder-sized frames with correct timestamps.
+    resampler = av.audio.resampler.AudioResampler(
+        format=audio_stream.format, layout=audio_stream.layout, rate=sample_rate
+    )
+    for resampled in resampler.resample(frame):
+        for packet in audio_stream.encode(resampled):
+            container.mux(packet)
+    for packet in audio_stream.encode():
+        container.mux(packet)
 
 
 def main() -> None:
@@ -318,8 +422,23 @@ def main() -> None:
         flush=True,
     )
 
-    num_frames = _save_video(video, float(out.frame_rate), args.output)
-    print(f"[retake] saved {args.output} ({num_frames} frames)", flush=True)
+    if args.dump_frames:
+        torch.save({"video": video.cpu(), "frame_rate": float(out.frame_rate)}, args.dump_frames)
+        print(f"[retake] dumped pre-encode frames to {args.dump_frames}", flush=True)
+
+    num_frames = _save_video(
+        video,
+        float(out.frame_rate),
+        args.output,
+        audio=out.audio,
+        audio_sample_rate=out.audio_sample_rate,
+    )
+    has_audio = out.audio is not None and out.audio_sample_rate
+    print(
+        f"[retake] saved {args.output} ({num_frames} frames, "
+        f"audio={'yes @ ' + str(out.audio_sample_rate) + ' Hz' if has_audio else 'none'})",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

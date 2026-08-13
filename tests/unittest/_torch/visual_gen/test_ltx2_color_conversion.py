@@ -136,6 +136,180 @@ def test_input_is_not_mutated():
     assert torch.equal(frames, before)
 
 
+def _retake_example():
+    """Import the example script by path, or skip.
+
+    Its module-level imports are only `argparse`, `SimpleNamespace` and `torch`,
+    so loading it is cheap and side-effect free (`main()` is guarded). That lets
+    the pure writeout helpers be tested by EXECUTION rather than by parsing.
+    """
+    import importlib.util
+    import pathlib
+
+    rel = pathlib.Path("examples/visual_gen/ltx2_retake_e2e.py")
+    script = next(
+        (p / rel for p in pathlib.Path(__file__).resolve().parents if (p / rel).is_file()),
+        None,
+    )
+    if script is None:
+        pytest.skip(f"{rel} not found above {__file__}; run from a repo checkout")
+    spec = importlib.util.spec_from_file_location("ltx2_retake_e2e_under_test", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# --------------------------------------------------------------------------------------
+# task15 — the preserved source audio must reach the file.
+#
+# The retake workflow is video-only: it regenerates a window and passes the source
+# audio through untouched. `_save_video` used to take no audio parameters at all, so
+# every delivered clip was mute.
+# --------------------------------------------------------------------------------------
+
+
+def test_mono_audio_is_duplicated_to_both_channels():
+    """Mono must be duplicated, not left as a silent right channel."""
+    mod = _retake_example()
+    out = mod._to_stereo_int16(torch.full((1, 4), 0.5))
+    assert out.shape == (1, 8)
+    assert (out[0, 0::2] == out[0, 1::2]).all(), "right channel must mirror mono input"
+
+
+def test_stereo_channels_are_interleaved_in_order():
+    """L/R interleaving is invisible in shape but audible if swapped."""
+    mod = _retake_example()
+    left = torch.tensor([0.1, 0.2, 0.3])
+    right = torch.tensor([-0.1, -0.2, -0.3])
+    out = mod._to_stereo_int16(torch.stack([left, right]))
+    assert out.shape == (1, 6)
+    assert (out[0, 0::2] > 0).all(), "even samples must be the left channel"
+    assert (out[0, 1::2] < 0).all(), "odd samples must be the right channel"
+
+
+def test_full_scale_and_overshoot_are_clamped_not_wrapped():
+    """int16 wrap turns a peak into a full-scale click of the opposite sign.
+
+    Decoded float samples can exceed [-1, 1] slightly, so the overshoot path is
+    real. `+1.5 * 32767` overflows int16 and wraps to a large negative value if
+    the clamp is missing — the assertion is on the exact values, because
+    `max()`/`min()` alone would still pass with one wrapped sample present.
+    """
+    import numpy as np
+
+    mod = _retake_example()
+    # Mono input, so every value appears twice (once per duplicated channel).
+    out = mod._to_stereo_int16(torch.tensor([[1.0, -1.0, 1.5, -1.5]]))
+    expected = np.array([[32767, 32767, -32767, -32767, 32767, 32767, -32767, -32767]])
+    assert np.array_equal(out, expected)
+    assert out.dtype == np.int16
+
+
+def test_batched_audio_is_accepted_and_unwrapped():
+    mod = _retake_example()
+    assert mod._to_stereo_int16(torch.zeros(1, 2, 5)).shape == (1, 10)
+
+
+def test_multi_batch_audio_is_rejected():
+    """Silently taking batch 0 would ship the wrong clip's audio."""
+    mod = _retake_example()
+    with pytest.raises(ValueError, match="one audio batch"):
+        mod._to_stereo_int16(torch.zeros(2, 2, 5))
+
+
+def test_more_than_two_channels_is_rejected():
+    """Dropping a channel is invisible in the output file, so it must raise."""
+    mod = _retake_example()
+    with pytest.raises(ValueError, match="mono or stereo"):
+        mod._to_stereo_int16(torch.zeros(6, 5))
+
+
+def test_audio_is_trimmed_to_the_video_duration():
+    """The source clip outlives the 209-frame product; the file must not.
+
+    209 frames at 30 fps is 6.9667 s; at 48 kHz that is 334400 samples, i.e. far
+    fewer than the source's full waveform.
+    """
+    mod = _retake_example()
+    max_samples = int(round(209 / 30.0 * 48000))
+    out = mod._to_stereo_int16(torch.zeros(2, 48000 * 10), max_samples=max_samples)
+    assert out.shape == (1, max_samples * 2)
+
+
+def test_untrimmed_audio_keeps_every_sample():
+    mod = _retake_example()
+    assert mod._to_stereo_int16(torch.zeros(2, 1234)).shape == (1, 1234 * 2)
+
+
+def test_save_video_accepts_and_muxes_audio():
+    """The signature and the mux path must both exist.
+
+    Checked structurally because `_save_video` needs PyAV and a real encoder;
+    the pure conversion half above is executed.
+    """
+    import inspect
+
+    mod = _retake_example()
+    params = inspect.signature(mod._save_video).parameters
+    assert "audio" in params, "_save_video must accept the preserved source audio"
+    assert "audio_sample_rate" in params
+    assert params["audio"].default is None, "silent clips must still be writable"
+
+    body = inspect.getsource(mod._save_video)
+    assert "add_stream" in body and "aac" in body, "an AAC stream must be created"
+    assert "_mux_audio" in body
+
+
+def test_main_passes_the_pipeline_audio_to_the_writer():
+    """The regression was at the CALL SITE: audio existed and was never passed.
+
+    `_save_video` growing the parameters is not enough — `main()` has to hand it
+    `out.audio`, which is exactly what it failed to do before.
+    """
+    import ast
+    import inspect
+
+    mod = _retake_example()
+    tree = ast.parse(inspect.getsource(mod.main))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_save_video"
+    ]
+    assert len(calls) == 1, "expected exactly one writeout call in main()"
+    passed = ast.unparse(calls[0])
+    assert "out.audio" in passed, "main() must pass the pipeline's preserved audio"
+    assert "out.audio_sample_rate" in passed
+
+
+def test_the_audio_mux_check_can_fail():
+    """Prove the call-site check rejects the shape the regression actually had."""
+    import ast
+
+    def audio_args(src):
+        tree = ast.parse(src)
+        call = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_save_video"
+        )
+        return ast.unparse(call)
+
+    # The exact pre-fix call site.
+    regressed = audio_args(
+        "def main():\n    _save_video(video, float(out.frame_rate), args.output)\n"
+    )
+    assert "out.audio" not in regressed, "checker must catch a writeout that drops audio"
+
+    # A half-fix that passes the waveform but not its rate would mux at the wrong
+    # speed, so the rate assertion has to bite independently.
+    half = audio_args("def main():\n    _save_video(v, r, o, audio=out.audio)\n")
+    assert "out.audio" in half
+    assert "out.audio_sample_rate" not in half, "checker must catch a missing sample rate"
+
+
 def test_save_video_tags_the_stream_and_keeps_fractional_fps():
     """The writeout must set both tags and must not round the frame rate.
 
