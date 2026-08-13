@@ -1273,7 +1273,11 @@ class LTX2Pipeline(BasePipeline):
         )
 
     @torch.inference_mode()
-    def _encode_video_window(self, video_5d: torch.Tensor) -> torch.Tensor:
+    def _encode_video_window(
+        self,
+        video_5d: torch.Tensor,
+        tiling_config: TilingConfig | None = None,
+    ) -> torch.Tensor:
         """Encode an arbitrary source-video window through the VAE encoder.
 
         Generalizes :meth:`_encode_image` (single frame) to a multi-frame window
@@ -1284,6 +1288,10 @@ class LTX2Pipeline(BasePipeline):
 
         Args:
             video_5d: ``(B, 3, T, H, W)`` tensor in ``[-1, 1]``.
+            tiling_config: Optional tiling configuration. ``None`` (the default)
+                encodes the whole window in one pass, which is what the
+                image-to-video and two-stage paths rely on; tiling is opt-in so
+                those callers keep their existing numerics.
 
         Returns:
             Latent tensor ``(B, C, T_lat, H_lat, W_lat)``.
@@ -1298,7 +1306,7 @@ class LTX2Pipeline(BasePipeline):
             raise ValueError(
                 f"expected a (B, 3, T, H, W) video window; got {tuple(video_5d.shape)}"
             )
-        return self.video_encoder(video_5d)
+        return self.video_encoder.tiled_encode(video_5d, tiling_config)
 
     def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
         """Encode a single preprocessed image (``(B, 3, 1, H, W)`` in ``[-1, 1]``).

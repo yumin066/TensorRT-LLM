@@ -46,7 +46,7 @@ from .ltx2_core.types import (
     VideoLatentShape,
     VideoPixelShape,
 )
-from .ltx2_core.video_vae import TilingConfig
+from .ltx2_core.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from .pipeline_ltx2 import (
     LTX2Pipeline,
     _find_safetensors_files,
@@ -1082,7 +1082,36 @@ class LTX2RetakePipeline(BasePipeline):
         )
         if timer is not None:
             timer.mark("vae_encode")
-        source_window_latents = native._encode_video_window(source_norm_5d).float()
+        # Encode the source window the way the a/b/c oracle does: tiled, with the
+        # oracle's tiling geometry, and left in the model dtype.
+        #
+        # The oracle encodes through ``video_latent_from_file``, which defaults to
+        # its own ``TilingConfig.default()`` -- 768 px / 64 px spatial and 80 / 24
+        # temporal. Native's ``TilingConfig.default()`` is 512/64 and 64/24, which
+        # is used by the decoder and is deliberately left alone here; passing the
+        # geometry explicitly keeps the two defaults independent.
+        #
+        # For this window (209 frames, 1280x704) both axes exceed their tile size,
+        # so the oracle tiles in space *and* time while native used to encode the
+        # whole window in a single pass -- a different computation, not a different
+        # rounding, which is why the encoded latents diverged (relL2 5.8e-2).
+        #
+        # No ``.float()``: the encoder already returns the model dtype (bf16), so
+        # the old upcast only changed the container, not the values. Dropping it
+        # makes the tensor directly comparable to the oracle's bf16
+        # ``video_clean_latent``; the fp32 blend below is unaffected because
+        # widening bf16 to fp32 is exact.
+        source_window_latents = native._encode_video_window(
+            source_norm_5d,
+            TilingConfig(
+                spatial_config=SpatialTilingConfig(
+                    tile_size_in_pixels=768, tile_overlap_in_pixels=64
+                ),
+                temporal_config=TemporalTilingConfig(
+                    tile_size_in_frames=80, tile_overlap_in_frames=24
+                ),
+            ),
+        )
         if timer is not None:
             timer.mark("conditioning")
         expected_latent_shape = tuple(video_shape.to_torch_shape())

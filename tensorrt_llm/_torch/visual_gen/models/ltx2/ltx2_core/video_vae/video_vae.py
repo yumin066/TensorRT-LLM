@@ -26,11 +26,20 @@ from .tiling import (
     SplitOperation,
     Tile,
     TilingConfig,
+    compute_rectangular_mask_1d,
     compute_trapezoidal_mask_1d,
     create_tiles,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Tiled encoding discards one latent per overlapped edge, because the encoder pads
+# symmetrically (pad=1 per conv in H/W) and a tile boundary makes those convolutions
+# see padding instead of real neighbouring pixels. An overlap smaller than these
+# minima cannot absorb the corrupted edge, so the request is raised to the minimum
+# rather than honoured.
+_MIN_SPATIAL_OVERLAP_PIXELS = 64
+_MIN_TEMPORAL_OVERLAP_FRAMES = 16
 
 
 def _make_encoder_block(
@@ -244,6 +253,74 @@ class VideoEncoder(nn.Module):
 
         mean = sample[:, : self.out_channels, ...]
         return self.per_channel_statistics.normalize(mean)
+
+    def tiled_encode(
+        self,
+        video: torch.Tensor,
+        tiling_config: TilingConfig | None = None,
+    ) -> torch.Tensor:
+        """Encode a video into latents using tiled processing.
+
+        The encoder is spatially padded (``pad=1`` per conv in H/W), so a tile
+        boundary makes the convolutions see padding instead of real neighbour
+        pixels. Tiles therefore overlap and are blended with rectangular masks
+        that drop one latent per overlapped edge, which is what makes a tiled
+        encode agree with the reference implementation rather than merely
+        approximate it.
+
+        Passing ``tiling_config=None`` keeps the previous behaviour (a single
+        whole-tensor encode), so callers that do not opt in are unaffected.
+
+        Args:
+            video: ``(B, 3, F, H, W)`` in ``[-1, 1]``.
+            tiling_config: Tiling configuration; ``None`` disables tiling.
+
+        Returns:
+            Latent tensor ``(B, C_latent, F', H', W')``.
+        """
+        if tiling_config is None:
+            return self.forward(video)
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        scales = SpatioTemporalScaleFactors(time=8, width=32, height=32)
+
+        batch, _, frames, height, width = video.shape
+        # The causal encoder maps F pixel frames to (F-1)/8 + 1 latent frames, so a
+        # frame count that is not 8k+1 has no exact latent length; the reference
+        # implementation crops the tail rather than padding it.
+        remainder = (frames - 1) % scales.time
+        if remainder != 0:
+            logger.warning(
+                "Number of frames %d is not (%d * k + 1); cropping the last %d frame(s)",
+                frames,
+                scales.time,
+                remainder,
+            )
+            video = video[:, :, :-remainder, ...]
+            frames = video.shape[2]
+
+        latent_shape = VideoLatentShape(
+            batch=batch,
+            channels=self.out_channels,
+            frames=(frames - 1) // scales.time + 1,
+            height=height // scales.height,
+            width=width // scales.width,
+        )
+        latent_buffer = torch.zeros(latent_shape.to_torch_shape(), device=device, dtype=dtype)
+        weights_buffer = torch.zeros_like(latent_buffer)
+
+        for tile in prepare_tiles_for_encoding(video, tiling_config, scales):
+            video_tile = video[tile.in_coords]
+            if video_tile.device != device or video_tile.dtype != dtype:
+                video_tile = video_tile.to(device=device, dtype=dtype)
+            latent_tile = self.forward(video_tile)
+            mask = tile.blend_mask(device, dtype)
+            latent_buffer[tile.out_coords] += latent_tile * mask
+            weights_buffer[tile.out_coords] += mask
+            del latent_tile, mask, video_tile
+
+        return latent_buffer / weights_buffer.clamp(min=1e-8)
 
 
 def _make_decoder_block(
@@ -674,6 +751,106 @@ def split_temporal_latents(size: int, overlap: int) -> SplitOperation:
         return replace(intervals, starts=starts, left_ramps=left_ramps)
 
     return split
+
+
+def split_temporal_frames(tile_size_frames: int, overlap_frames: int) -> SplitOperation:
+    """Split a temporal axis in PIXEL-frame space for encoding.
+
+    Differs from :func:`split_temporal_latents` (which splits latent frames for
+    decoding): the causal encoder consumes ``8k + 1`` frames per tile, so every
+    tile but the last is extended by one frame and no tile carries a right ramp.
+    """
+    non_causal_split = split_with_symmetric_overlaps(tile_size_frames, overlap_frames)
+
+    def split(dimension_size: int) -> DimensionIntervals:
+        if dimension_size <= tile_size_frames:
+            return DEFAULT_SPLIT_OPERATION(dimension_size)
+        intervals = non_causal_split(dimension_size)
+        ends = list(intervals.ends)
+        ends[:-1] = [e + 1 for e in ends[:-1]]
+        return replace(intervals, ends=ends, right_ramps=[0] * len(ends))
+
+    return split
+
+
+def map_temporal_interval_to_latent(
+    begin: int,
+    end: int,
+    left_ramp: int,
+    right_ramp: int,
+    scale: int,
+) -> Tuple[slice, torch.Tensor]:
+    """Map a temporal interval from pixel-frame space into latent space."""
+    start = begin // scale
+    stop = (end - 1) // scale + 1
+    left_ramp_latents = 0 if left_ramp == 0 else 1 + (left_ramp - 1) // scale
+    right_ramp_latents = right_ramp // scale
+    if right_ramp_latents != 0:
+        raise ValueError(
+            f"tiled encoding expects temporal tiles with a right ramp of 0, got {right_ramp}"
+        )
+    return slice(start, stop), compute_rectangular_mask_1d(
+        stop - start, left_ramp_latents, right_ramp_latents
+    )
+
+
+def map_spatial_interval_to_latent(
+    begin: int,
+    end: int,
+    left_ramp: int,
+    right_ramp: int,
+    scale: int,
+) -> Tuple[slice, torch.Tensor]:
+    """Map a spatial interval from pixel space into latent space.
+
+    One latent is dropped per overlapped edge, which is where the boundary
+    convolutions saw padding rather than real neighbouring pixels.
+    """
+    start = begin // scale
+    stop = end // scale
+    return slice(start, stop), compute_rectangular_mask_1d(
+        stop - start, max(0, left_ramp // scale - 1), 0 if right_ramp == 0 else 1
+    )
+
+
+def prepare_tiles_for_encoding(
+    video: torch.Tensor,
+    tiling_config: TilingConfig | None = None,
+    scales: SpatioTemporalScaleFactors | None = None,
+) -> List[Tile]:
+    """Build the encode-direction tiles (pixel space in, latent space out)."""
+    scales = scales or SpatioTemporalScaleFactors(time=8, width=32, height=32)
+    splitters = [DEFAULT_SPLIT_OPERATION] * len(video.shape)
+    mappers = [DEFAULT_MAPPING_OPERATION] * len(video.shape)
+
+    if tiling_config is not None and tiling_config.spatial_config is not None:
+        cfg = tiling_config.spatial_config
+        # A spatial overlap below 64px cannot absorb the per-edge latent that the
+        # boundary convolutions corrupt, so it is raised rather than honoured.
+        overlap_px = max(cfg.tile_overlap_in_pixels, _MIN_SPATIAL_OVERLAP_PIXELS)
+        if overlap_px != cfg.tile_overlap_in_pixels:
+            logger.warning(
+                "spatial tile overlap %d px is below the %d px minimum; using the minimum",
+                cfg.tile_overlap_in_pixels,
+                _MIN_SPATIAL_OVERLAP_PIXELS,
+            )
+        for axis, scale in ((3, scales.height), (4, scales.width)):
+            splitters[axis] = split_with_symmetric_overlaps(cfg.tile_size_in_pixels, overlap_px)
+            mappers[axis] = make_mapping_operation(map_spatial_interval_to_latent, scale=scale)
+
+    if tiling_config is not None and tiling_config.temporal_config is not None:
+        cfg = tiling_config.temporal_config
+        overlap_frames = max(cfg.tile_overlap_in_frames, _MIN_TEMPORAL_OVERLAP_FRAMES)
+        if overlap_frames != cfg.tile_overlap_in_frames:
+            logger.warning(
+                "temporal tile overlap %d frames is below the %d frame minimum; using the minimum",
+                cfg.tile_overlap_in_frames,
+                _MIN_TEMPORAL_OVERLAP_FRAMES,
+            )
+        splitters[2] = split_temporal_frames(cfg.tile_size_in_frames, overlap_frames)
+        mappers[2] = make_mapping_operation(map_temporal_interval_to_latent, scale=scales.time)
+
+    return create_tiles(video.shape, splitters, mappers)
 
 
 def make_mapping_operation(
