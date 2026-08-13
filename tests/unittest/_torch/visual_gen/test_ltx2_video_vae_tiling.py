@@ -10,6 +10,21 @@ tiles are blended -- is pure index arithmetic, so it is covered here without a
 GPU or checkpoint. An error in that arithmetic would otherwise only surface as an
 opaque end-to-end numeric difference.
 
+AC-5 coverage is deliberately a **two-part proof**, and the parts are named so
+neither is mistaken for the other:
+
+  * the CALLERS are checked structurally, by parsing their call nodes with `ast`
+    (`*_call_site_*` tests). These do NOT execute `LTX2Pipeline.forward` or
+    `LTX2TwoStagesPipeline` -- those branches sit inside long generation methods
+    needing a full pipeline, weights and a device.
+  * the shared CALLEE is executed (`test_encode_image_requests_no_tiling`,
+    `test_i2v_encode_matches_a_plain_forward`), proving it reaches the encoder
+    with `tiling_config=None` and returns the plain forward result.
+
+Together they close the path: the call sites cannot introduce a tiling argument,
+and the callee provably does not add one. `test_the_call_site_check_can_fail`
+shows the structural half discriminates.
+
 Everything below runs on CPU in well under a second.
 """
 
@@ -246,44 +261,101 @@ def test_two_stage_pipeline_inherits_the_untiled_encode_path():
         assert getattr(LTX2TwoStagesPipeline, name) is getattr(LTX2Pipeline, name)
 
 
-def test_two_stage_call_site_passes_no_tiling_config():
-    """The two-stage image-conditioning call site must not request tiling.
+def _encode_call_sites(module, exclude_within=()):
+    """Every `self._encode_image(...)` / `self._encode_video_window(...)` call node.
 
-    WHAT THIS IS: a structural check of the call node, parsed with `ast` rather
-    than matched with a regex, so a reformatting cannot fool it and a new keyword
-    cannot slip past.
-
-    WHAT THIS IS NOT: an execution of `LTX2TwoStagesPipeline`'s generation method.
-    That branch sits inside a long method needing a full pipeline, weights and a
-    device. The coverage is closed as a chain instead: this test pins the call
-    site to a single positional argument, and
-    `test_encode_image_requests_no_tiling` executes the callee and proves it
-    reaches the encoder with `tiling_config=None`.
+    `exclude_within` drops calls whose enclosing function has one of those names,
+    keyed by the function they sit in rather than by line number: `_encode_image`
+    delegating to `_encode_video_window` is the definition, not a caller, and a
+    line-range filter would silently start excluding the wrong calls the moment
+    the file shifts.
     """
     import ast
     import inspect
 
-    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages
+    tree = ast.parse(inspect.getsource(module))
+    found = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name in exclude_within:
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("_encode_image", "_encode_video_window")
+            ):
+                found.append(node)
+    return found
 
-    tree = ast.parse(inspect.getsource(pipeline_ltx2_two_stages))
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_encode_image"
-    ]
 
-    assert calls, "expected the two-stage path to encode a conditioning image"
+def _assert_no_tiling_argument(calls, where):
+    """A conditioning call site must pass the tensor and nothing else.
+
+    `_encode_video_window`'s second parameter is the tiling config, so an extra
+    positional argument is as dangerous as an explicit keyword.
+    """
+    assert calls, f"expected {where} to encode a conditioning image"
     for call in calls:
         assert len(call.args) == 1, (
-            f"_encode_image at line {call.lineno} takes extra positional arguments; "
-            "the second parameter of _encode_video_window is the tiling config"
+            f"{where}: {call.func.attr} at line {call.lineno} passes "
+            f"{len(call.args)} positional arguments; the second parameter of "
+            "_encode_video_window is the tiling config"
         )
         assert not call.keywords, (
-            f"_encode_image at line {call.lineno} passes keywords "
-            f"{[k.arg for k in call.keywords]}; two-stage must not request tiling"
+            f"{where}: {call.func.attr} at line {call.lineno} passes keywords "
+            f"{[k.arg for k in call.keywords]}; conditioning must not request tiling"
         )
+
+
+def test_base_i2v_call_site_passes_no_tiling_config():
+    """The base image-to-video call site must not request tiling.
+
+    `LTX2Pipeline.forward`'s image branch calls `self._encode_image(image_5d)`.
+    Pinning it here is what stops a future change from bypassing `_encode_image`
+    and calling `_encode_video_window(image_5d, SOME_TILING)` directly, which the
+    callee-level tests could not detect.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2
+
+    # `_encode_image` delegating to `_encode_video_window` is the definition
+    # itself, not a caller; the execution tests above cover it.
+    calls = _encode_call_sites(pipeline_ltx2, exclude_within={"_encode_image"})
+    _assert_no_tiling_argument(calls, "pipeline_ltx2")
+
+
+def test_two_stage_call_site_passes_no_tiling_config():
+    """The two-stage image-conditioning call site must not request tiling."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages
+
+    _assert_no_tiling_argument(
+        _encode_call_sites(pipeline_ltx2_two_stages), "pipeline_ltx2_two_stages"
+    )
+
+
+def test_the_call_site_check_can_fail():
+    """Prove the checker discriminates, on both failure shapes.
+
+    A structural check that has only ever been run against passing source is not a
+    verified check. These feed it source that a regression would actually look
+    like.
+    """
+    import ast
+
+    import pytest
+
+    for bad, why in (
+        ("self._encode_video_window(image_5d, ORACLE_TILING)", "extra positional"),
+        ("self._encode_image(image_5d, tiling_config=ORACLE_TILING)", "explicit keyword"),
+    ):
+        calls = [
+            n
+            for n in ast.walk(ast.parse(bad))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        ]
+        with pytest.raises(AssertionError):
+            _assert_no_tiling_argument(calls, f"synthetic ({why})")
 
 
 def test_i2v_encode_matches_a_plain_forward():
