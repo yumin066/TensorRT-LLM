@@ -1132,13 +1132,21 @@ class LTX2RetakePipeline(BasePipeline):
             noise_latents, source_window_latents, conditioned_latent_ranges
         )
         # Carry the denoise latent in the model dtype (bf16), matching the a/b/c
-        # oracle whose ``_euler_step`` re-quantizes to bf16 every step. The VAE
-        # encode above produces an fp32 latent; keeping it fp32 through the loop
-        # would leave each Euler-stepped latent at fp32 precision while the oracle
-        # rounds to bf16, a ~1e-3/step divergence that compounds over the schedule.
+        # oracle whose ``_euler_step`` re-quantizes to bf16 every step. The blend
+        # above runs in fp32 (the noise is drawn fp32); keeping that fp32 through
+        # the loop would leave each Euler-stepped latent at fp32 precision while
+        # the oracle rounds to bf16, a ~1e-3/step divergence that compounds over
+        # the schedule.
         latents = native.video_patchifier.patchify(initial_latents).to(dtype)
 
-        clean_5d = torch.zeros_like(noise_latents)
+        # Follow ``source_window_latents`` rather than ``noise_latents``: the clean
+        # latent is the *encode*, and the oracle stores it in the model dtype.
+        # ``torch.zeros_like(noise_latents)`` inherited fp32 from the still-fp32
+        # noise tensor, which left this tensor incomparable to the oracle's bf16
+        # ``video_clean_latent`` even once the encode itself matched byte for byte.
+        # The blend that consumes it upcasts to fp32 internally, so nothing
+        # downstream loses precision.
+        clean_5d = torch.zeros_like(source_window_latents)
         total_latent = video_shape.frames
         for start_frame, end_frame in conditioned_latent_ranges:
             start_frame = max(0, start_frame)
