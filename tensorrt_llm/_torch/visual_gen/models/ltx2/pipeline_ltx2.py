@@ -544,6 +544,20 @@ def _read_safetensors_config(path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Single source of truth for how VAE checkpoint keys map into each component's
+# namespace. Declared here rather than inline at the call sites so an audit can
+# import the real spec instead of restating it -- a restated copy passes or fails
+# independently of the loader it claims to audit.
+VIDEO_ENCODER_WEIGHT_PREFIXES = [
+    ("vae.encoder.", ""),
+    ("vae.per_channel_statistics.", "per_channel_statistics."),
+]
+VIDEO_DECODER_WEIGHT_PREFIXES = [
+    ("vae.decoder.", ""),
+    ("vae.per_channel_statistics.", "per_channel_statistics."),
+]
+
+
 def _load_component_weights(
     safetensors_paths: List[str],
     module: torch.nn.Module,
@@ -1002,10 +1016,7 @@ class LTX2Pipeline(BasePipeline):
             _load_component_weights(
                 sft_paths,
                 self.video_decoder,
-                [
-                    ("vae.decoder.", ""),
-                    ("vae.per_channel_statistics.", "per_channel_statistics."),
-                ],
+                VIDEO_DECODER_WEIGHT_PREFIXES,
             )
             self.video_decoder = self.video_decoder.to(device=device, dtype=dtype)
 
@@ -1065,12 +1076,7 @@ class LTX2Pipeline(BasePipeline):
                 _load_component_weights(
                     sft_paths,
                     self.video_encoder,
-                    # NOT a bare "vae." prefix: that also pulls every decoder
-                    # tensor into this module's namespace as unexpected keys.
-                    [
-                        ("vae.encoder.", ""),
-                        ("vae.per_channel_statistics.", "per_channel_statistics."),
-                    ],
+                    VIDEO_ENCODER_WEIGHT_PREFIXES,
                 )
                 self.video_encoder = self.video_encoder.to(device=device, dtype=dtype)
             else:
