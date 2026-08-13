@@ -15,7 +15,7 @@ cd /tmp
 python3 $REPO/examples/visual_gen/ltx2_retake_e2e.py \
   --checkpoint /home/scratch.ylichen_sw/LTX2.3-script-editing/models/ltx-2.3-22b-distilled.safetensors \
   --text-encoder /home/scratch.ylichen_sw/LTX2.3-script-editing/models/gemma \
-  --source $CUST/script_editing/eval/reference_outputs/720p/retake_output.mp4 \
+  --source $CUST/artifacts/bf16/retake_input.mp4 \
   --output $OUT/retake_nvfp4.mp4 \
   --start 3.0 --end 3.9667 \
   --quant-algo NVFP4 --nvfp4-attn \
