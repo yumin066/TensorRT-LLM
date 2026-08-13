@@ -1,3 +1,8 @@
+# `pipefail` because the generation is piped through `tee`: without it the script's
+# exit status is tee's, so a Python traceback still reports success and a broken run
+# looks like a good one.
+set -uo pipefail
+
 CUST=/home/scratch.minyu_gpu/project/shopee/LTX2.3-script-editing
 REPO=/home/scratch.minyu_gpu/project/shopee/TensorRT-LLM
 OUT=/home/scratch.minyu_gpu/project/shopee/host_push/manual_m034

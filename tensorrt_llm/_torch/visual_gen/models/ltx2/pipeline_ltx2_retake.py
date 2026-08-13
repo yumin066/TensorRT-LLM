@@ -745,6 +745,22 @@ class LTX2RetakePipeline(BasePipeline):
             if not prompts:
                 return []
 
+            # Two independent defects have to be worked around here, and each alone
+            # still fails; only both together make the upstream prompt path run.
+            #
+            # 1. `self.model.device` is ``meta``. The LTX-2 checkpoint carries no
+            #    weights for Gemma's vision tower (this use is text-only), so those
+            #    437 parameters stay on meta while the language model lands on cuda.
+            #    `Module.device` reports the FIRST parameter's device, which is the
+            #    vision tower's -- so upstream's `torch.tensor(..., device=self.model
+            #    .device)` builds meta inputs and the forward raises
+            #    ``NotImplementedError: Cannot copy out of meta tensor``.
+            # 2. The model is left in TRAIN mode. `SingleGPUModelBuilder` never calls
+            #    `.eval()`, so `nn.Module`'s default `training=True` survives, and
+            #    transformers>=5's `create_causal_mask_mapping` raises
+            #    ``token_type_ids is required as a model input when training``.
+            #    Encoding a prompt is inference; train mode is never correct here.
+            self.model.eval()
             tokenized = [self.tokenizer.tokenize_with_weights(t)["gemma"] for t in prompts]
             device = cls._resolve_non_meta_model_device(self.model)
             input_ids = torch.tensor(
