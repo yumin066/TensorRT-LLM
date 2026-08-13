@@ -2,9 +2,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
+
+
+@dataclass(frozen=True)
+class Audio:
+    """Decoded audio samples plus the sampling rate they were decoded at.
+
+    ``waveform`` is ``(batch, channels, samples)`` float32 in ``[-1, 1]``.
+    """
+
+    waveform: torch.Tensor
+    sampling_rate: int
+
+    def to(self, **kwargs: object) -> "Audio":
+        return replace(self, waveform=self.waveform.to(**kwargs))
 
 
 class VideoPixelShape(NamedTuple):

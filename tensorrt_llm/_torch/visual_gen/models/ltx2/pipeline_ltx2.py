@@ -556,6 +556,10 @@ VIDEO_DECODER_WEIGHT_PREFIXES = [
     ("vae.decoder.", ""),
     ("vae.per_channel_statistics.", "per_channel_statistics."),
 ]
+AUDIO_ENCODER_WEIGHT_PREFIXES = [
+    ("audio_vae.encoder.", ""),
+    ("audio_vae.per_channel_statistics.", "per_channel_statistics."),
+]
 
 
 def _load_component_weights(

@@ -18,9 +18,10 @@ the upstream Lightricks ``DiffusionStage.run`` loop — is preserved behind the
 ``pipeline_config.extra_attrs['retake_use_upstream_stage']`` switch (default
 ``False`` / native) as a named oracle for comparison and GPU verification.
 
-Only the deterministic source pixel/audio decode and stream metadata are read
-from the upstream ``ltx_pipelines.utils.media_io`` readers; no upstream retake
-orchestration is used on the native path.
+Source audio decode and audio VAE encode are native (``ltx2_core.media_io`` and
+``ltx2_core.audio_vae``). Only the deterministic source *pixel* decode and stream
+metadata are still read from the upstream ``ltx_pipelines.utils.media_io``
+readers; no upstream retake orchestration is used on the native path.
 """
 
 from __future__ import annotations
@@ -202,6 +203,24 @@ def _init_retake_latents(
         if end_frame > start_frame:
             out[:, :, start_frame:end_frame] = source_latents[:, :, start_frame:end_frame]
     return out
+
+
+def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:
+    """Crop or zero-pad *latent* along dim 2 so it has exactly the expected frames.
+
+    Encoders emit a frame count driven by the decoded stream length, which need
+    not match the count the target shape implies; the transformer needs the exact
+    count. Padding is zeros, matching the upstream helper this replaces.
+    """
+    actual_frames = latent.shape[2]
+    if actual_frames > expected_frames_count:
+        return latent[:, :, :expected_frames_count]
+    if actual_frames < expected_frames_count:
+        pad_shape = list(latent.shape)
+        pad_shape[2] = expected_frames_count - actual_frames
+        pad = torch.zeros(pad_shape, device=latent.device, dtype=latent.dtype)
+        return torch.cat([latent, pad], dim=2)
+    return latent
 
 
 # Comfy-format LoRA key conventions. The two exporters use different factor
@@ -539,23 +558,21 @@ class LTX2RetakePipeline(BasePipeline):
         Builds a native ``LTX2Pipeline`` that shares this pipeline's native
         transformer (so no second transformer is constructed and no transformer
         weights are loaded twice) and loads its native video VAE encoder/decoder,
-        patchifier, scheduler, Gemma text encoder, and connectors. Only the
-        deterministic source pixel/audio decode and stream metadata come from the
-        upstream ``media_io`` readers.
+        patchifier, scheduler, Gemma text encoder, and connectors. Audio decode is
+        native; only the deterministic source *pixel* decode and stream metadata
+        still come from the upstream ``media_io`` readers.
         """
         try:
-            from ltx_pipelines.utils.media_io import (
-                decode_audio_from_file,
-                decode_video_by_frame,
-                get_videostream_metadata,
-            )
+            from ltx_pipelines.utils.media_io import decode_video_by_frame, get_videostream_metadata
         except (ImportError, OSError) as exc:
             raise ImportError(
                 "LTX-2 retake workflow requires the optional Lightricks "
-                "`ltx-pipelines` package for deterministic source video/audio "
+                "`ltx-pipelines` package for deterministic source video "
                 "decode. Install it in the VisualGen runtime environment before "
                 "starting trtllm-serve with pipeline_config.workflow=retake."
             ) from exc
+
+        from .ltx2_core.media_io import decode_audio_from_file
 
         self._get_videostream_metadata = get_videostream_metadata
         self._decode_video_by_frame = decode_video_by_frame
@@ -593,15 +610,18 @@ class LTX2RetakePipeline(BasePipeline):
         self._native = native
 
     def _load_retake_audio_encoder(self, native, checkpoint_dir: str, device) -> None:
-        """Load the ltx_core audio VAE encoder for retake audio conditioning."""
-        from ltx_core.model.audio_vae.model_configurator import AudioEncoderConfigurator
-
-        from .pipeline_ltx2 import _find_safetensors_files, _load_component_weights
+        """Load the native audio VAE encoder for retake audio conditioning."""
+        from .ltx2_core.audio_vae import AudioEncoderConfigurator
+        from .pipeline_ltx2 import (
+            AUDIO_ENCODER_WEIGHT_PREFIXES,
+            _find_safetensors_files,
+            _load_component_weights,
+        )
 
         config = native._native_config
         sft_paths = _find_safetensors_files(checkpoint_dir)
         encoder = AudioEncoderConfigurator.from_config(config)
-        _load_component_weights(sft_paths, encoder, ["audio_vae.encoder.", "audio_vae."])
+        _load_component_weights(sft_paths, encoder, AUDIO_ENCODER_WEIGHT_PREFIXES)
         native._audio_encoder = encoder.to(device=device, dtype=native.dtype)
 
     def _load_upstream_stage_components(
@@ -1187,10 +1207,8 @@ class LTX2RetakePipeline(BasePipeline):
         # joint AV transformer cross-attends the video denoise to the audio,
         # matching the step_a/b/c oracle. Video-only retake never regenerates the
         # audio: its latent stays the clean encoding and its timesteps are 0 at
-        # every step (frozen). audio_latent_from_file mirrors step_a's encode.
-        from ltx_pipelines.utils.helpers import audio_latent_from_file
-
-        audio_latent = audio_latent_from_file(
+        # every step (frozen).
+        audio_latent = self._encode_source_audio_latent(
             native._audio_encoder, video_path, pixel_shape, device, dtype
         )
         audio_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
@@ -1424,13 +1442,37 @@ class LTX2RetakePipeline(BasePipeline):
     def _read_source_audio(self, video_path, device):
         """Read the source audio unchanged (video-only retake preserves audio).
 
-        Uses the upstream ``media_io.decode_audio_from_file`` reader, which
-        decodes via PyAV (no torchaudio dependency — torchaudio is only needed by
-        the audio VAE / vocoder, which the video-only retake path never loads or
-        calls). Returns the upstream ``Audio`` object (``.waveform`` /
-        ``.sampling_rate``) or ``None`` when the source has no audio stream.
+        Uses the native ``ltx2_core.media_io.decode_audio_from_file`` reader,
+        which decodes via PyAV (no torchaudio dependency — torchaudio is only
+        needed by the audio VAE mel front-end). Returns an
+        :class:`~.ltx2_core.types.Audio` (``.waveform`` / ``.sampling_rate``) or
+        ``None`` when the source has no audio stream.
         """
         return self._decode_audio_from_file(video_path, device)
+
+    def _encode_source_audio_latent(self, audio_encoder, video_path, pixel_shape, device, dtype):
+        """Encode the source audio into the frozen conditioning latent, natively.
+
+        Native replacement for upstream ``helpers.audio_latent_from_file``: read
+        the audio stream for exactly the video's duration, run the native audio
+        VAE encoder over its mel spectrogram, and conform the latent length to
+        what the video pixel shape implies. Returns ``None`` when the source
+        carries no audio stream.
+
+        The duration is derived from the *video* shape (``frames / fps``) rather
+        than the audio stream's own length, because the audio latent has to line
+        up token-for-token with the video latent the transformer cross-attends
+        to.
+        """
+        from .ltx2_core.audio_vae import encode_audio
+
+        max_duration = pixel_shape.frames / pixel_shape.fps
+        audio_in = self._decode_audio_from_file(video_path, device, 0.0, max_duration)
+        if audio_in is None:
+            return None
+        latents = encode_audio(audio_in, audio_encoder).to(device, dtype)
+        required_latent_frames = AudioLatentShape.from_video_pixel_shape(pixel_shape).frames
+        return _conform_latent_length(latents, required_latent_frames)
 
     @staticmethod
     def _retake_distilled_sigmas(device) -> torch.Tensor:
