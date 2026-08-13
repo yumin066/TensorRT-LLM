@@ -551,20 +551,31 @@ def _load_component_weights(
 ) -> None:
     """Load weights from safetensors file(s) into *module* by filtering on *prefix*.
 
-    *prefix* can be a single string or a list of strings.  When multiple
-    prefixes are given, keys matching any prefix are collected (each prefix
-    is stripped independently).
+    *prefix* is a single string, or a list whose entries are either a string
+    (stripped, mapping to the bare module key) or a ``(source, target)`` pair that
+    strips *source* and prepends *target*.
+
+    The pair form exists because a component can own a sub-module whose keys live
+    under a different checkpoint namespace: the video VAE keeps its per-channel
+    statistics under ``vae.per_channel_statistics.`` while its layers live under
+    ``vae.encoder.``. Collecting those with a bare ``vae.`` prefix works, but it
+    also drags in every tensor of the *other* half of the VAE -- 84 ``decoder.*``
+    keys entered the encoder's namespace that way, where ``strict=False`` quietly
+    discarded them. Explicit remapping keeps the accepted key set exactly what the
+    module owns, which is what makes a state-dict audit meaningful.
     """
-    prefixes = [prefix] if isinstance(prefix, str) else prefix
+    if isinstance(prefix, str):
+        prefixes = [(prefix, "")]
+    else:
+        prefixes = [(p, "") if isinstance(p, str) else tuple(p) for p in prefix]
 
     state_dict: Dict[str, torch.Tensor] = {}
     for path in safetensors_paths:
         with safetensors.torch.safe_open(path, framework="pt") as f:
             for key in f.keys():
-                for pfx in prefixes:
-                    if key.startswith(pfx):
-                        stripped = key[len(pfx) :]
-                        state_dict[stripped] = f.get_tensor(key)
+                for src, dst in prefixes:
+                    if key.startswith(src):
+                        state_dict[dst + key[len(src) :]] = f.get_tensor(key)
                         break
 
     if not state_dict:
@@ -981,18 +992,20 @@ class LTX2Pipeline(BasePipeline):
         """Instantiate and load weights for native LTX-2 components."""
         skip_components = skip_components or []
 
-        # Video decoder — native checkpoint stores decoder weights under
+        # Video decoder — the checkpoint stores decoder weights under
         # "vae.decoder." and statistics under "vae.per_channel_statistics.".
-        # Prefixes are tried in order: "vae.decoder." strips to bare param
-        # names (e.g. conv_in.*), while "vae." catches per_channel_statistics
-        # and keeps the submodule prefix intact.
+        # Each is remapped explicitly: decoder weights strip to bare parameter
+        # names (conv_in.* etc.), statistics keep their submodule prefix.
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native video decoder...")
             self.video_decoder = VideoDecoderConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.video_decoder,
-                ["vae.decoder.", "vae."],
+                [
+                    ("vae.decoder.", ""),
+                    ("vae.per_channel_statistics.", "per_channel_statistics."),
+                ],
             )
             self.video_decoder = self.video_decoder.to(device=device, dtype=dtype)
 
@@ -1052,7 +1065,12 @@ class LTX2Pipeline(BasePipeline):
                 _load_component_weights(
                     sft_paths,
                     self.video_encoder,
-                    ["vae.encoder.", "vae."],
+                    # NOT a bare "vae." prefix: that also pulls every decoder
+                    # tensor into this module's namespace as unexpected keys.
+                    [
+                        ("vae.encoder.", ""),
+                        ("vae.per_channel_statistics.", "per_channel_statistics."),
+                    ],
                 )
                 self.video_encoder = self.video_encoder.to(device=device, dtype=dtype)
             else:

@@ -45,11 +45,17 @@ class PerChannelStatistics(nn.Module):
 
     def __init__(self, latent_channels: int = 128):
         super().__init__()
+        # Only the two statistics the checkpoint actually carries, and that
+        # normalize/un_normalize actually read. Three further buffers
+        # ("mean-of-stds", "mean-of-stds_over_std-of-means", "channel") used to be
+        # registered here; the checkpoint does not provide them and nothing reads
+        # them, so `torch.empty` left uninitialized memory in the module's
+        # state_dict and they showed up as missing keys under
+        # `load_state_dict(strict=False)` -- silently, because strict=False does
+        # not raise. Registering only what is loaded and used means an audit of the
+        # key sets is meaningful.
         self.register_buffer("std-of-means", torch.empty(latent_channels))
         self.register_buffer("mean-of-means", torch.empty(latent_channels))
-        self.register_buffer("mean-of-stds", torch.empty(latent_channels))
-        self.register_buffer("mean-of-stds_over_std-of-means", torch.empty(latent_channels))
-        self.register_buffer("channel", torch.empty(latent_channels))
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize encoder output to standard latent distribution."""

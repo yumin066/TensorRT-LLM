@@ -141,3 +141,85 @@ def test_tiled_encode_without_a_config_does_not_take_the_tiled_path():
 
     assert calls == [tuple(video.shape)], "no-config encode must be one whole-tensor forward"
     assert out is sentinel, "no-config encode must return forward()'s result untouched"
+
+
+# --------------------------------------------------------------------------------------
+# AC-5 / task8 — the image-to-video and two-stage callers must not request tiling.
+#
+# Both go through `LTX2Pipeline._encode_image`, which delegates to
+# `_encode_video_window`. These call the real methods against a minimal stub rather
+# than building a pipeline, so they run on CPU without weights while still
+# exercising the production code path.
+# --------------------------------------------------------------------------------------
+
+
+class _EncoderSpy:
+    """Stands in for the VAE encoder and records how it was called."""
+
+    def __init__(self):
+        self.calls = []
+        self.result = torch.zeros(1, LATENT_CHANNELS, 1, 4, 4)
+
+    def tiled_encode(self, video, tiling_config=None):
+        self.calls.append({"shape": tuple(video.shape), "tiling_config": tiling_config})
+        return self.result
+
+
+class _PipelineStub:
+    """Only what `_encode_image` / `_encode_video_window` actually touch."""
+
+    def __init__(self, encoder):
+        self.video_encoder = encoder
+
+    _encode_video_window = None  # bound below
+    _encode_image = None
+
+
+def _stub_with_spy():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+    spy = _EncoderSpy()
+    stub = _PipelineStub(spy)
+    # Bind the real, unmodified methods onto the stub.
+    stub._encode_video_window = LTX2Pipeline._encode_video_window.__get__(stub)
+    stub._encode_image = LTX2Pipeline._encode_image.__get__(stub)
+    return stub, spy
+
+
+def test_encode_image_requests_no_tiling():
+    """i2v conditioning must reach the encoder with tiling_config=None."""
+    stub, spy = _stub_with_spy()
+    out = stub._encode_image(torch.zeros(1, 3, 1, 128, 128))
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["tiling_config"] is None, (
+        "the image-to-video path must not opt into tiled encoding; doing so would "
+        "change its numerics"
+    )
+    assert out is spy.result
+
+
+def test_encode_video_window_defaults_to_no_tiling():
+    """The default must stay opt-in at the signature level.
+
+    The two-stage path calls `_encode_image(image_5d)` with no tiling argument, so
+    the default is what protects it; a change of default would silently alter both
+    callers without touching either call site.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+    sig = inspect.signature(LTX2Pipeline._encode_video_window)
+    assert sig.parameters["tiling_config"].default is None
+
+    stub, spy = _stub_with_spy()
+    stub._encode_video_window(torch.zeros(1, 3, 9, 64, 64))
+    assert spy.calls[0]["tiling_config"] is None
+
+
+def test_encode_video_window_forwards_an_explicit_config():
+    """Retake opts in explicitly, so the argument must actually reach the encoder."""
+    stub, spy = _stub_with_spy()
+    stub._encode_video_window(torch.zeros(1, 3, 9, 64, 64), ORACLE_TILING)
+    assert spy.calls[0]["tiling_config"] is ORACLE_TILING
