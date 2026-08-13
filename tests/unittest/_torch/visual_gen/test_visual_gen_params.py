@@ -243,6 +243,13 @@ class TestPipelineDefaults:
         assert d["max_sequence_length"] == 1024
         assert d["num_frames"] == 121
 
+    def test_ltx2_retake_defaults(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
+            LTX2RetakePipeline,
+        )
+
+        assert LTX2RetakePipeline.default_generation_params.fget(None) == {"num_inference_steps": 8}
+
     def test_base_pipeline_empty_defaults(self):
         from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
@@ -262,6 +269,18 @@ class TestPipelineExtraParamSpecs:
         assert "boundary_ratio" in specs
         assert specs["guidance_scale_2"].type == "float"
         assert specs["boundary_ratio"].range == (0.0, 1.0)
+
+    def test_ltx2_retake_extra_specs_only_expose_supported_options(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
+            LTX2RetakePipeline,
+        )
+
+        specs = LTX2RetakePipeline.extra_param_specs.fget(None)
+        assert set(specs) == {
+            "retake_video_path",
+            "retake_start_time",
+            "retake_end_time",
+        }
 
     def test_wan21_no_extra_specs(self):
         """Wan 2.1 has no model-specific extra params."""

@@ -45,11 +45,9 @@ class PerChannelStatistics(nn.Module):
 
     def __init__(self, latent_channels: int = 128):
         super().__init__()
+        # These are the only video latent statistics stored by the checkpoint.
         self.register_buffer("std-of-means", torch.empty(latent_channels))
         self.register_buffer("mean-of-means", torch.empty(latent_channels))
-        self.register_buffer("mean-of-stds", torch.empty(latent_channels))
-        self.register_buffer("mean-of-stds_over_std-of-means", torch.empty(latent_channels))
-        self.register_buffer("channel", torch.empty(latent_channels))
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize encoder output to standard latent distribution."""

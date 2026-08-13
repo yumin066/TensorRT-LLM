@@ -70,6 +70,21 @@ LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_THRESHOLD = 0.05
 LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
 
+# LTX-2.3 native retake (delete-disfluency). The source lives in the regular
+# golden-media archive; model paths remain environment-configurable because the
+# 22B checkpoint and Gemma are not test artifacts. The existing retake golden is
+# an upstream reference and is intentionally not used as a native pixel oracle.
+LTX2_RETAKE_START_SECONDS = 2.9667
+LTX2_RETAKE_END_SECONDS = 3.9333
+LTX2_RETAKE_EXPECTED_FRAMES = 209
+LTX2_RETAKE_EXPECTED_HEIGHT = 1280
+LTX2_RETAKE_EXPECTED_WIDTH = 704
+LTX2_RETAKE_EXPECTED_FPS = 30.0
+LTX2_RETAKE_EXPECTED_AUDIO_RATE = 48000
+LTX2_RETAKE_CHECKPOINT_SUBPATH = ("LTX-2.3", "ltx-2.3-22b-distilled.safetensors")
+LTX2_RETAKE_CHECKPOINT_ENV = "LTX2_RETAKE_CHECKPOINT"
+LTX2_RETAKE_TEXT_ENCODER_ENV = "LTX2_RETAKE_TEXT_ENCODER"
+
 WAN21_LPIPS_PROMPT = "A cat sitting on a windowsill"
 WAN21_LPIPS_NEGATIVE_PROMPT = None
 WAN21_LPIPS_HEIGHT = 256
@@ -466,27 +481,36 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
-def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, generated_path):
+def _run_lpips_eval(
+    tmp_path,
+    sample_id,
+    media_type,
+    prompt,
+    reference_path,
+    generated_path,
+    frame_start=None,
+    frame_stop=None,
+):
     reference_key = "reference_video_path" if media_type == "video" else "reference_image_path"
     generated_key = "generated_video_path" if media_type == "video" else "generated_image_path"
     dataset_path = tmp_path / f"{sample_id}_dataset.json"
     output_json = tmp_path / f"{sample_id}_lpips_results.json"
+    sample = {
+        "id": sample_id,
+        "media_type": media_type,
+        "prompt": prompt,
+        reference_key: str(reference_path),
+        generated_key: str(generated_path),
+    }
+    # Optionally gate LPIPS on a half-open frame window [frame_start, frame_stop).
+    # The eval script slices the originally decoded frames of both videos (no
+    # re-encoding), so per-frame pixels match a full-video decode exactly.
+    if frame_start is not None:
+        sample["frame_start"] = int(frame_start)
+    if frame_stop is not None:
+        sample["frame_stop"] = int(frame_stop)
     dataset_path.write_text(
-        json.dumps(
-            {
-                "samples": [
-                    {
-                        "id": sample_id,
-                        "media_type": media_type,
-                        "prompt": prompt,
-                        reference_key: str(reference_path),
-                        generated_key: str(generated_path),
-                    }
-                ]
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps({"samples": [sample]}, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -1005,6 +1029,81 @@ def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_
         "ltx2_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+def _generate_ltx2_retake_native_bf16_video(tmp_path, output_path):
+    """Run the native delete-disfluency retake example and return its output."""
+    source = _golden_media_path(
+        tmp_path,
+        "retake_input.mp4",
+        "LTX-2.3 delete-disfluency retake input",
+    )
+    checkpoint = os.environ.get(LTX2_RETAKE_CHECKPOINT_ENV) or _lpips_model_path(
+        *LTX2_RETAKE_CHECKPOINT_SUBPATH
+    )
+    _skip_if_missing(checkpoint, "LTX-2.3 retake checkpoint")
+    text_encoder = os.environ.get(LTX2_RETAKE_TEXT_ENCODER_ENV)
+    if not text_encoder:
+        pytest.skip(f"set {LTX2_RETAKE_TEXT_ENCODER_ENV} to the Gemma3 model directory")
+    _skip_if_missing(text_encoder, "LTX-2.3 Gemma text encoder", is_dir=True)
+
+    example = os.path.join(REPO_ROOT, "examples", "visual_gen", "ltx2_retake_e2e.py")
+    check_call(
+        [
+            sys.executable,
+            example,
+            "--checkpoint",
+            checkpoint,
+            "--text-encoder",
+            text_encoder,
+            "--source",
+            str(source),
+            "--output",
+            str(output_path),
+            "--start",
+            str(LTX2_RETAKE_START_SECONDS),
+            "--end",
+            str(LTX2_RETAKE_END_SECONDS),
+            "--num-inference-steps",
+            "8",
+        ],
+        shell=False,
+    )
+    assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
+    return output_path
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_retake_native_bf16_delete_disfluency_e2e(tmp_path):
+    """Native delete-disfluency smoke test; upstream pixels are not an oracle."""
+    import av
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.media_io import (
+        decode_video_by_frame,
+        get_videostream_metadata,
+    )
+
+    generated_path = tmp_path / "ltx2_retake_generated.mp4"
+    _generate_ltx2_retake_native_bf16_video(tmp_path, generated_path)
+
+    metadata = get_videostream_metadata(str(generated_path))
+    assert metadata.frames == LTX2_RETAKE_EXPECTED_FRAMES
+    assert metadata.height == LTX2_RETAKE_EXPECTED_HEIGHT
+    assert metadata.width == LTX2_RETAKE_EXPECTED_WIDTH
+    assert metadata.fps == pytest.approx(LTX2_RETAKE_EXPECTED_FPS)
+    assert (
+        sum(1 for _ in decode_video_by_frame(str(generated_path), torch.device("cpu")))
+        == LTX2_RETAKE_EXPECTED_FRAMES
+    )
+
+    container = av.open(str(generated_path))
+    try:
+        audio_streams = list(container.streams.audio)
+        assert len(audio_streams) == 1
+        assert audio_streams[0].rate == LTX2_RETAKE_EXPECTED_AUDIO_RATE
+        assert audio_streams[0].codec_context.channels == 2
+    finally:
+        container.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -13,11 +13,13 @@ Major modifications:
 from .adaln import AdaLayerNormSingle
 from .attention import Attention, FeedForward, GELUApprox
 from .connector import (
+    AudioEmbeddings1DConnectorConfigurator,
     Embeddings1DConnector,
     Embeddings1DConnectorConfigurator,
-    GemmaFeaturesExtractorProjLinear,
+    GemmaFeaturesExtractorConfigurator,
 )
 from .diffusion_steps import EulerDiffusionStep
+from .media_io import decode_audio_from_file, decode_video_by_frame, get_videostream_metadata
 from .modality import Modality
 from .normalization import NormType, PixelNorm, build_normalization_layer
 from .patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
@@ -38,6 +40,7 @@ from .transformer_args import (
 )
 from .types import (
     VIDEO_SCALE_FACTORS,
+    Audio,
     AudioLatentShape,
     SpatioTemporalScaleFactors,
     VideoLatentShape,
@@ -48,15 +51,17 @@ from .utils_ltx2 import rms_norm, to_velocity
 __all__ = [
     "AdaLayerNormSingle",
     "Attention",
+    "Audio",
     "AudioLatentShape",
     "AudioPatchifier",
     "DiffusionStepProtocol",
+    "AudioEmbeddings1DConnectorConfigurator",
     "Embeddings1DConnector",
     "Embeddings1DConnectorConfigurator",
     "EulerDiffusionStep",
     "FeedForward",
     "GELUApprox",
-    "GemmaFeaturesExtractorProjLinear",
+    "GemmaFeaturesExtractorConfigurator",
     "LTX2Scheduler",
     "LTXRopeType",
     "Modality",
@@ -79,6 +84,9 @@ __all__ = [
     "VideoPixelShape",
     "apply_rotary_emb",
     "build_normalization_layer",
+    "decode_audio_from_file",
+    "decode_video_by_frame",
+    "get_videostream_metadata",
     "get_pixel_coords",
     "precompute_freqs_cis",
     "rms_norm",

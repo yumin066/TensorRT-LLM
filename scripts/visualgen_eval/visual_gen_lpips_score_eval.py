@@ -50,6 +50,12 @@ The dataset may also be a top-level object with "samples" plus optional
 For video-only scoring, provide "reference_video_path" and
 "generated_video_path"; model/config are only required when generation is
 needed.
+
+A video sample may also set integer "frame_start" and/or "frame_stop" to
+restrict LPIPS scoring to the half-open frame window [frame_start, frame_stop).
+The window is applied to the originally decoded frames of both videos (no
+re-encoding), which is useful for gating quality on an edited sub-region such
+as a retake bridge window.
 """
 
 from __future__ import annotations
@@ -357,6 +363,8 @@ def _normalize_dataset(
         if generated_path is None and not isinstance(prompt, str):
             raise ValueError(f"Dataset sample {sample_id} must provide a string prompt.")
 
+        frame_start, frame_stop = _extract_frame_window(sample, sample_id, media_type)
+
         sample_params = defaults | _extract_generation_params(sample)
         samples.append(
             {
@@ -367,6 +375,8 @@ def _normalize_dataset(
                 "generated_path": generated_path,
                 "output_media": output_media,
                 "params": sample_params,
+                "frame_start": frame_start,
+                "frame_stop": frame_stop,
             }
         )
 
@@ -485,9 +495,54 @@ def _score_images(
         return float(lpips_model(generated_tensor, reference_tensor).reshape(-1).mean().item())
 
 
+def _extract_frame_window(
+    sample: dict[str, Any],
+    sample_id: str,
+    media_type: str,
+) -> tuple[int | None, int | None]:
+    """Read an optional half-open LPIPS scoring window [frame_start, frame_stop).
+
+    Only meaningful for video samples; the window restricts LPIPS scoring to the
+    given frame range so a caller can gate on a sub-region (e.g. an edited bridge
+    window) without re-encoding a clipped video.
+    """
+    frame_start = sample.get("frame_start")
+    frame_stop = sample.get("frame_stop")
+    if frame_start is None and frame_stop is None:
+        return None, None
+    if media_type != "video":
+        raise ValueError(
+            f"Dataset sample {sample_id} sets frame_start/frame_stop but is not a video sample."
+        )
+
+    def _as_index(value: Any, name: str) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"Dataset sample {sample_id} {name} must be an integer, got {value!r}."
+            )
+        if value < 0:
+            raise ValueError(
+                f"Dataset sample {sample_id} {name} must be non-negative, got {value}."
+            )
+        return value
+
+    frame_start = _as_index(frame_start, "frame_start")
+    frame_stop = _as_index(frame_stop, "frame_stop")
+    if frame_start is not None and frame_stop is not None and frame_start >= frame_stop:
+        raise ValueError(
+            f"Dataset sample {sample_id} requires frame_start < frame_stop, "
+            f"got [{frame_start}, {frame_stop})."
+        )
+    return frame_start, frame_stop
+
+
 def _decode_video_to_lpips_batch(
     video_path: pathlib.Path,
     device: str,
+    frame_start: int | None = None,
+    frame_stop: int | None = None,
 ) -> torch.Tensor:
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found for LPIPS comparison: {video_path}")
@@ -509,6 +564,24 @@ def _decode_video_to_lpips_batch(
     if not frames:
         raise ValueError(f"Decoded video contains no frames: {video_path}")
 
+    # Slice the decoded frame arrays directly; no clipped video is re-encoded.
+    if frame_start is not None or frame_stop is not None:
+        decoded = len(frames)
+        start = 0 if frame_start is None else frame_start
+        stop = decoded if frame_stop is None else frame_stop
+        if start < 0 or stop < 0:
+            raise ValueError(
+                f"frame_start/frame_stop must be non-negative: got [{frame_start}, {frame_stop})."
+            )
+        if start >= stop:
+            raise ValueError(f"frame_start must be < frame_stop: got [{start}, {stop}).")
+        if start >= decoded:
+            raise ValueError(
+                f"frame_start {start} is beyond the {decoded} decoded frames of {video_path}."
+            )
+        stop = min(stop, decoded)
+        frames = frames[start:stop]
+
     frames_array = np.stack(frames, axis=0)
     batch = torch.from_numpy(frames_array.copy()).permute(0, 3, 1, 2).float() / 255.0
     return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
@@ -527,9 +600,11 @@ def _score_video_files(
     generated_video_path: pathlib.Path,
     reference_video_path: pathlib.Path,
     device: str,
+    frame_start: int | None = None,
+    frame_stop: int | None = None,
 ) -> float:
-    generated = _decode_video_to_lpips_batch(generated_video_path, device)
-    reference = _decode_video_to_lpips_batch(reference_video_path, device)
+    generated = _decode_video_to_lpips_batch(generated_video_path, device, frame_start, frame_stop)
+    reference = _decode_video_to_lpips_batch(reference_video_path, device, frame_start, frame_stop)
     _validate_paired_video_shapes(generated, reference)
 
     paired_frame_count = min(generated.shape[0], reference.shape[0])
@@ -718,6 +793,8 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     generated_media,
                     sample["reference_path"],
                     lpips_device,
+                    sample["frame_start"],
+                    sample["frame_stop"],
                 )
 
             sample_results.append(
@@ -731,6 +808,8 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "generated_path": str(output_path) if output_path is not None else None,
                     "generation_time_sec": generation_time_sec,
                     "params": sample["params"],
+                    "frame_start": sample["frame_start"],
+                    "frame_stop": sample["frame_stop"],
                 }
             )
     finally:
@@ -752,7 +831,14 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "dataset": str(args.dataset),
         "lpips_net": lpips_net,
         "lpips_device": lpips_device,
-        "video_frame_selection": "all_paired_frames",
+        "video_frame_selection": (
+            "per_sample_windows"
+            if any(
+                sample["frame_start"] is not None or sample["frame_stop"] is not None
+                for sample in sample_results
+            )
+            else "all_paired_frames"
+        ),
         "threshold": threshold,
         "passed": passed,
         "num_samples": len(sample_results),

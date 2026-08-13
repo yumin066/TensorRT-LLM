@@ -1647,6 +1647,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     positions=video_positions,
                     context=video_embeds,
                     context_mask=connector_mask,
+                    sigma=timestep.to(self.dtype),
                 )
 
                 audio_mod = None
@@ -1657,6 +1658,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                         positions=audio_positions,
                         context=audio_embeds,
                         context_mask=connector_mask,
+                        sigma=timestep.to(self.dtype),
                     )
 
                 vel_v, vel_a = self.transformer(

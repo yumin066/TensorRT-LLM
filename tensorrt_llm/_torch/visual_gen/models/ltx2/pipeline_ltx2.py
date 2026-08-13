@@ -8,7 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -26,7 +26,11 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
-from .ltx2_core.connector import Embeddings1DConnectorConfigurator, GemmaFeaturesExtractorProjLinear
+from .ltx2_core.connector import (
+    AudioEmbeddings1DConnectorConfigurator,
+    Embeddings1DConnectorConfigurator,
+    GemmaFeaturesExtractorConfigurator,
+)
 from .ltx2_core.guiders import MultiModalGuider, MultiModalGuiderParams
 from .ltx2_core.modality import Modality
 from .ltx2_core.patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
@@ -418,6 +422,7 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
                 context=v.context.clone(),
                 enabled=v.enabled,
                 context_mask=v.context_mask.clone() if v.context_mask is not None else None,
+                sigma=v.sigma.clone() if v.sigma is not None else None,
             )
         return v
 
@@ -457,6 +462,8 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             dst.context.copy_(src.context)
             if src.context_mask is not None and dst.context_mask is not None:
                 dst.context_mask.copy_(src.context_mask)
+            if src.sigma is not None and dst.sigma is not None:
+                dst.sigma.copy_(src.sigma)
             return dst
         return src
 
@@ -540,27 +547,47 @@ def _read_safetensors_config(path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Shared mappings for component weights stored in multiple checkpoint namespaces.
+VIDEO_ENCODER_WEIGHT_PREFIXES = (
+    ("vae.encoder.", ""),
+    ("vae.per_channel_statistics.", "per_channel_statistics."),
+)
+VIDEO_DECODER_WEIGHT_PREFIXES = (
+    ("vae.decoder.", ""),
+    ("vae.per_channel_statistics.", "per_channel_statistics."),
+)
+AUDIO_ENCODER_WEIGHT_PREFIXES = (
+    ("audio_vae.encoder.", ""),
+    ("audio_vae.per_channel_statistics.", "per_channel_statistics."),
+)
+
+
 def _load_component_weights(
     safetensors_paths: List[str],
     module: torch.nn.Module,
-    prefix: Union[str, List[str]],
+    prefix: Union[str, Sequence[Union[str, Tuple[str, str]]]],
 ) -> None:
     """Load weights from safetensors file(s) into *module* by filtering on *prefix*.
 
-    *prefix* can be a single string or a list of strings.  When multiple
-    prefixes are given, keys matching any prefix are collected (each prefix
-    is stripped independently).
+    *prefix* is a single string, or a list whose entries are either a string
+    (stripped, mapping to the bare module key) or a ``(source, target)`` pair that
+    strips *source* and prepends *target*.
+
+    Pair entries support component submodules stored under a separate checkpoint
+    namespace, such as VAE per-channel statistics.
     """
-    prefixes = [prefix] if isinstance(prefix, str) else prefix
+    if isinstance(prefix, str):
+        prefixes = [(prefix, "")]
+    else:
+        prefixes = [(p, "") if isinstance(p, str) else tuple(p) for p in prefix]
 
     state_dict: Dict[str, torch.Tensor] = {}
     for path in safetensors_paths:
         with safetensors.torch.safe_open(path, framework="pt") as f:
             for key in f.keys():
-                for pfx in prefixes:
-                    if key.startswith(pfx):
-                        stripped = key[len(pfx) :]
-                        state_dict[stripped] = f.get_tensor(key)
+                for src, dst in prefixes:
+                    if key.startswith(src):
+                        state_dict[dst + key[len(src) :]] = f.get_tensor(key)
                         break
 
     if not state_dict:
@@ -578,6 +605,85 @@ def _load_component_weights(
             f"Unexpected keys for prefix '{prefixes}' ({len(unexpected)}): "
             f"{unexpected[:5]}{'...' if len(unexpected) > 5 else ''}"
         )
+
+
+def build_ltx2_transformer(pipeline_config) -> LTXModel:
+    """Construct the native LTX-2 transformer (``LTXModel``) from checkpoint config.
+
+    Generation and retake share this factory so both use the checkpoint's native
+    architecture parameters. Missing keys use LTX-2 defaults.
+    """
+    attn_cfg = getattr(pipeline_config, "attention", None)
+    if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+        raise NotImplementedError(
+            "Quantized attention is not yet supported for the LTX-2 pipeline."
+        )
+
+    model_config = pipeline_config.model_configs["transformer"]
+    cfg = model_config.pretrained_config
+
+    rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
+    freq_prec = getattr(cfg, "frequencies_precision", False)
+    double_precision_rope = freq_prec == "float64"
+    apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
+    cross_attention_adaln = getattr(cfg, "cross_attention_adaln", False)
+
+    logger.info(
+        f"LTX2 transformer config: rope_type={rope_type.value}, "
+        f"double_precision_rope={double_precision_rope}, "
+        f"apply_gated_attention={apply_gated_attention}, "
+        f"cross_attention_adaln={cross_attention_adaln}"
+    )
+
+    transformer = LTXModel(
+        model_type=LTXModelType.AudioVideo,
+        num_attention_heads=getattr(cfg, "num_attention_heads", 32),
+        attention_head_dim=getattr(cfg, "attention_head_dim", 128),
+        in_channels=getattr(cfg, "in_channels", 128),
+        out_channels=getattr(cfg, "out_channels", 128),
+        num_layers=getattr(cfg, "num_layers", 48),
+        cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
+        norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
+        caption_channels=getattr(cfg, "caption_channels", 3840),
+        positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
+        positional_embedding_max_pos=getattr(cfg, "positional_embedding_max_pos", [20, 2048, 2048]),
+        timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
+        use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
+        audio_num_attention_heads=getattr(cfg, "audio_num_attention_heads", 32),
+        audio_attention_head_dim=getattr(cfg, "audio_attention_head_dim", 64),
+        audio_in_channels=getattr(cfg, "audio_in_channels", 128),
+        audio_out_channels=getattr(cfg, "audio_out_channels", 128),
+        audio_cross_attention_dim=getattr(cfg, "audio_cross_attention_dim", 2048),
+        audio_positional_embedding_max_pos=getattr(cfg, "audio_positional_embedding_max_pos", [20]),
+        av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
+        rope_type=rope_type,
+        double_precision_rope=double_precision_rope,
+        apply_gated_attention=apply_gated_attention,
+        cross_attention_adaln=cross_attention_adaln,
+        model_config=model_config,
+    )
+    transformer._transformer_config = vars(cfg)
+
+    # LTX-2.3 (22b): the text caption is projected to the cross-attention width
+    # inside the connector's feature extractor (``caption_proj_before_connector``),
+    # so the connector already emits ``cross_attention_dim``-wide context and the
+    # checkpoint carries NO in-transformer ``caption_projection`` weights. The
+    # transformer's arg preprocessors apply ``caption_projection`` to the context
+    # unconditionally, so replace it with an identity pass-through; otherwise the
+    # (uninitialized) projection would try to map the already-projected context
+    # from ``caption_channels`` and fail on the dimension mismatch.
+    if getattr(cfg, "caption_proj_before_connector", False):
+        for _pre_attr in ("video_args_preprocessor", "audio_args_preprocessor"):
+            _pre = getattr(transformer, _pre_attr, None)
+            if _pre is None:
+                continue
+            # ``MultiModalTransformerArgsPreprocessor`` (AudioVideo) wraps a
+            # ``TransformerArgsPreprocessor`` as ``simple_preprocessor``; the
+            # single-modal preprocessor holds ``caption_projection`` directly.
+            _target = getattr(_pre, "simple_preprocessor", _pre)
+            if getattr(_target, "caption_projection", None) is not None:
+                _target.caption_projection = torch.nn.Identity()
+    return transformer
 
 
 # ---------------------------------------------------------------------------
@@ -602,13 +708,19 @@ def _load_component_weights(
         "text_encoder_path": "google/gemma-3-12b-it",
         "spatial_upsampler_path": None,
         "distilled_lora_path": None,
+        "workflow": "generation",
+        # Retake can fuse an identity/style LoRA independently of the
+        # generation/two-stage distilled LoRA.
+        "retake_lora_path": None,
+        "retake_lora_strength": 1.0,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
         "superset of knobs for one-stage and two-stage. Pipeline will "
         "run two-stage if both ``spatial_upsampler_path`` and "
         "``distilled_lora_path`` are not ``None``, either set by the "
-        "user or auto-discovered from the checkpoint."
+        "user or auto-discovered from the checkpoint. Set "
+        "``workflow='retake'`` to use the optional LTX-2 retake workflow."
     ),
 )
 class LTX2Pipeline(BasePipeline):
@@ -632,6 +744,17 @@ class LTX2Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
+        workflow = config.extra_attrs.get("workflow", "generation")
+        if workflow == "retake":
+            from .pipeline_ltx2_retake import LTX2RetakePipeline
+
+            return LTX2RetakePipeline
+        if workflow != "generation":
+            raise ValueError(
+                f"Unsupported LTX-2 workflow {workflow!r}. "
+                "Supported values are 'generation' and 'retake'."
+            )
+
         if getattr(config, "cache_backend", None) == "cache_dit":
             logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
             return cls
@@ -738,63 +861,8 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def _init_transformer(self) -> None:
-        """Create LTXModel from pretrained_config.
-
-        Reads all architecture parameters from the checkpoint config to match
-        the reference ``LTXModelConfigurator.from_config()``.  Missing keys
-        fall back to the same defaults the reference uses.
-        """
-        attn_cfg = getattr(self.pipeline_config, "attention", None)
-        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
-            raise NotImplementedError(
-                "Quantized attention is not yet supported for the LTX-2 pipeline."
-            )
-
-        model_config = self.pipeline_config.model_configs["transformer"]
-        cfg = model_config.pretrained_config
-
-        rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
-        freq_prec = getattr(cfg, "frequencies_precision", False)
-        double_precision_rope = freq_prec == "float64"
-        apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
-
-        logger.info(
-            f"LTX2 transformer config: rope_type={rope_type.value}, "
-            f"double_precision_rope={double_precision_rope}, "
-            f"apply_gated_attention={apply_gated_attention}"
-        )
-
-        self.transformer = LTXModel(
-            model_type=LTXModelType.AudioVideo,
-            num_attention_heads=getattr(cfg, "num_attention_heads", 32),
-            attention_head_dim=getattr(cfg, "attention_head_dim", 128),
-            in_channels=getattr(cfg, "in_channels", 128),
-            out_channels=getattr(cfg, "out_channels", 128),
-            num_layers=getattr(cfg, "num_layers", 48),
-            cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
-            norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
-            caption_channels=getattr(cfg, "caption_channels", 3840),
-            positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
-            positional_embedding_max_pos=getattr(
-                cfg, "positional_embedding_max_pos", [20, 2048, 2048]
-            ),
-            timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
-            use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
-            audio_num_attention_heads=getattr(cfg, "audio_num_attention_heads", 32),
-            audio_attention_head_dim=getattr(cfg, "audio_attention_head_dim", 64),
-            audio_in_channels=getattr(cfg, "audio_in_channels", 128),
-            audio_out_channels=getattr(cfg, "audio_out_channels", 128),
-            audio_cross_attention_dim=getattr(cfg, "audio_cross_attention_dim", 2048),
-            audio_positional_embedding_max_pos=getattr(
-                cfg, "audio_positional_embedding_max_pos", [20]
-            ),
-            av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
-            rope_type=rope_type,
-            double_precision_rope=double_precision_rope,
-            apply_gated_attention=apply_gated_attention,
-            model_config=model_config,
-        )
-        self.transformer._transformer_config = vars(cfg)
+        """Create LTXModel from pretrained_config via :func:`build_ltx2_transformer`."""
+        self.transformer = build_ltx2_transformer(self.pipeline_config)
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)
@@ -887,9 +955,12 @@ class LTX2Pipeline(BasePipeline):
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info(f"Loading text encoder (Gemma3) from {text_encoder_path}...")
+            # Load on CPU before one device transfer instead of incrementally
+            # materializing meta-device parameters.
             self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
                 text_encoder_path,
                 torch_dtype=dtype,
+                low_cpu_mem_usage=False,
             ).to(device)
 
         # --- Resolve native config ----------------------------------------
@@ -928,18 +999,17 @@ class LTX2Pipeline(BasePipeline):
         """Instantiate and load weights for native LTX-2 components."""
         skip_components = skip_components or []
 
-        # Video decoder — native checkpoint stores decoder weights under
+        # Video decoder — the checkpoint stores decoder weights under
         # "vae.decoder." and statistics under "vae.per_channel_statistics.".
-        # Prefixes are tried in order: "vae.decoder." strips to bare param
-        # names (e.g. conv_in.*), while "vae." catches per_channel_statistics
-        # and keeps the submodule prefix intact.
+        # Each is remapped explicitly: decoder weights strip to bare parameter
+        # names (conv_in.* etc.), statistics keep their submodule prefix.
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native video decoder...")
             self.video_decoder = VideoDecoderConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.video_decoder,
-                ["vae.decoder.", "vae."],
+                VIDEO_DECODER_WEIGHT_PREFIXES,
             )
             self.video_decoder = self.video_decoder.to(device=device, dtype=dtype)
 
@@ -966,7 +1036,7 @@ class LTX2Pipeline(BasePipeline):
         # connectors inside the diffusion model prefix.
         if "connectors" not in skip_components:
             logger.info("Loading native text connectors...")
-            self.feature_extractor = GemmaFeaturesExtractorProjLinear.from_config(config)
+            self.feature_extractor = GemmaFeaturesExtractorConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.feature_extractor,
@@ -982,7 +1052,7 @@ class LTX2Pipeline(BasePipeline):
             )
             self.video_connector = self.video_connector.to(device=device, dtype=dtype)
 
-            self.audio_connector = Embeddings1DConnectorConfigurator.from_config(config)
+            self.audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.audio_connector,
@@ -999,7 +1069,7 @@ class LTX2Pipeline(BasePipeline):
                 _load_component_weights(
                     sft_paths,
                     self.video_encoder,
-                    ["vae.encoder.", "vae."],
+                    VIDEO_ENCODER_WEIGHT_PREFIXES,
                 )
                 self.video_encoder = self.video_encoder.to(device=device, dtype=dtype)
             else:
@@ -1088,55 +1158,20 @@ class LTX2Pipeline(BasePipeline):
     # Text encoding
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _pack_text_embeds(
-        text_hidden_states: torch.Tensor,
-        sequence_lengths: torch.Tensor,
-        device: Union[str, torch.device],
-        padding_side: str = "left",
-        scale_factor: int = 8,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """Pack and normalize text encoder hidden states."""
-        batch_size, seq_len, hidden_dim, num_layers = text_hidden_states.shape
-        original_dtype = text_hidden_states.dtype
-
-        token_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-        if padding_side == "right":
-            mask = token_indices < sequence_lengths[:, None]
-        elif padding_side == "left":
-            start_indices = seq_len - sequence_lengths[:, None]
-            mask = token_indices >= start_indices
-        else:
-            raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
-        mask = mask[:, :, None, None]
-
-        masked_text_hidden_states = text_hidden_states.masked_fill(~mask, 0.0)
-        num_valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
-        masked_mean = masked_text_hidden_states.sum(dim=(1, 2), keepdim=True) / (
-            num_valid_positions + eps
-        )
-
-        x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(dim=(1, 2), keepdim=True)
-        x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(dim=(1, 2), keepdim=True)
-
-        normalized_hidden_states = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
-        normalized_hidden_states = normalized_hidden_states * scale_factor
-
-        normalized_hidden_states = normalized_hidden_states.flatten(2)
-        mask_flat = mask.squeeze(-1).expand(-1, -1, hidden_dim * num_layers)
-        normalized_hidden_states = normalized_hidden_states.masked_fill(~mask_flat, 0.0)
-        normalized_hidden_states = normalized_hidden_states.to(dtype=original_dtype)
-        return normalized_hidden_states
-
     def _encode_prompt(
         self,
         prompt: Union[str, List[str]],
         num_videos_per_prompt: int = 1,
         max_sequence_length: int = 1024,
-        scale_factor: int = 8,
     ):
-        """Encode prompt into text embeddings via Gemma3."""
+        """Encode prompt into raw stacked Gemma3 hidden states.
+
+        Returns the stacked per-layer hidden states ``[B, T, D, L]`` (in the
+        pipeline dtype) together with the binary attention mask ``[B, T]``.
+        Normalization and projection are deferred to the feature extractor so
+        that the V1 (mean/range) and V2 (per-token RMS) paths can each apply
+        their own normalization to the raw hidden states.
+        """
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -1157,27 +1192,24 @@ class LTX2Pipeline(BasePipeline):
             attention_mask=prompt_attention_mask,
             output_hidden_states=True,
         )
-        text_encoder_hidden_states = text_encoder_outputs.hidden_states
-        text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
-        sequence_lengths = prompt_attention_mask.sum(dim=-1)
+        # Stack per-layer hidden states -> [B, T, D, L] (L = num_layers + 1).
+        text_encoder_hidden_states = torch.stack(text_encoder_outputs.hidden_states, dim=-1)
+        text_encoder_hidden_states = text_encoder_hidden_states.to(dtype=self.dtype)
 
-        prompt_embeds = self._pack_text_embeds(
-            text_encoder_hidden_states,
-            sequence_lengths,
-            device=self.device,
-            padding_side=self.tokenizer.padding_side,
-            scale_factor=scale_factor,
+        _, seq_len, hidden_dim, num_layers = text_encoder_hidden_states.shape
+        text_encoder_hidden_states = text_encoder_hidden_states.repeat(
+            1, num_videos_per_prompt, 1, 1
         )
-        prompt_embeds = prompt_embeds.to(dtype=self.dtype)
-
-        _, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+        text_encoder_hidden_states = text_encoder_hidden_states.view(
+            batch_size * num_videos_per_prompt, seq_len, hidden_dim, num_layers
+        )
 
         prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
-        prompt_attention_mask = prompt_attention_mask.repeat(num_videos_per_prompt, 1)
+        prompt_attention_mask = prompt_attention_mask.repeat_interleave(
+            num_videos_per_prompt, dim=0
+        )
 
-        return prompt_embeds, prompt_attention_mask
+        return text_encoder_hidden_states, prompt_attention_mask
 
     # ------------------------------------------------------------------
     # Connector processing
@@ -1185,19 +1217,25 @@ class LTX2Pipeline(BasePipeline):
 
     def _process_connectors(
         self,
-        prompt_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple:
         """Run feature extraction and video/audio connectors.
 
+        ``hidden_states`` are the raw stacked Gemma hidden states ``[B, T, D, L]``
+        and ``attention_mask`` is the binary mask ``[B, T]``. The feature
+        extractor normalizes and projects the hidden states, returning separate
+        video and audio features (V1 returns the same tensor for both, so its
+        behavior is unchanged).
+
         Returns (video_embeds, audio_embeds, connector_mask).
         """
-        additive_mask = (1 - attention_mask.to(prompt_embeds.dtype)) * -1000000.0
+        additive_mask = (1 - attention_mask.to(hidden_states.dtype)) * -1000000.0
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
 
-        projected = self.feature_extractor(prompt_embeds)
-        video_embeds, video_mask = self.video_connector(projected, additive_mask)
-        audio_embeds, _ = self.audio_connector(projected, additive_mask)
+        video_features, audio_features = self.feature_extractor(hidden_states, attention_mask)
+        video_embeds, video_mask = self.video_connector(video_features, additive_mask)
+        audio_embeds, _ = self.audio_connector(audio_features, additive_mask)
 
         return video_embeds, audio_embeds, video_mask
 
@@ -1254,38 +1292,76 @@ class LTX2Pipeline(BasePipeline):
         )
 
     @torch.inference_mode()
-    def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
-        """Encode a preprocessed image tensor through the VAE encoder.
+    def _encode_video_window(
+        self,
+        video_5d: torch.Tensor,
+        tiling_config: TilingConfig | None = None,
+    ) -> torch.Tensor:
+        """Encode an arbitrary source-video window through the VAE encoder.
+
+        Generalizes :meth:`_encode_image` (single frame) to a multi-frame window
+        so retake can VAE-encode the full source window for two-sided
+        conditioning, not just a leading image. The video VAE is temporally
+        causal, so ``T`` pixel frames map to
+        ``(T - 1) // vae_temporal_compression_ratio + 1`` latent frames.
 
         Args:
-            image_5d: ``(B, 3, 1, H, W)`` tensor in ``[-1, 1]``.
+            video_5d: ``(B, 3, T, H, W)`` tensor in ``[-1, 1]``.
+            tiling_config: Optional tiling configuration. ``None`` (the default)
+                encodes the whole window in one pass, which is what the
+                image-to-video and two-stage paths rely on; tiling is opt-in so
+                those callers keep their existing numerics.
 
         Returns:
-            Latent tensor ``(B, C, 1, H_lat, W_lat)``.
+            Latent tensor ``(B, C, T_lat, H_lat, W_lat)``.
         """
         if self.video_encoder is None:
             raise RuntimeError(
-                "Image-to-video requires a VAE encoder but video_encoder was "
-                "not loaded. Ensure the checkpoint contains encoder weights "
+                "Retake / image-to-video requires a VAE encoder but video_encoder "
+                "was not loaded. Ensure the checkpoint contains encoder weights "
                 "(vae.encoder.*) and encoder_blocks config."
             )
-        return self.video_encoder(image_5d)
+        if video_5d.dim() != 5 or video_5d.shape[1] != 3:
+            raise ValueError(
+                f"expected a (B, 3, T, H, W) video window; got {tuple(video_5d.shape)}"
+            )
+        return self.video_encoder.tiled_encode(video_5d, tiling_config)
+
+    def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
+        """Encode a single preprocessed image (``(B, 3, 1, H, W)`` in ``[-1, 1]``).
+
+        Single-frame special case of :meth:`_encode_video_window`; returns
+        ``(B, C, 1, H_lat, W_lat)``.
+        """
+        return self._encode_video_window(image_5d)
 
     def _build_denoise_mask(
         self,
         video_shape: "VideoLatentShape",
         num_cond_latent_frames: int = 1,
         strength: float = 1.0,
+        *,
+        cond_latent_frame_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
-        """Create a per-token denoise mask for image conditioning.
+        """Create a per-token denoise mask for conditioning.
 
         Convention follows LTX-2: ``0.0`` = conditioned (don't denoise),
         ``1.0`` = unconditioned (fully denoise).
 
         Args:
             video_shape: Latent shape for the video.
-            num_cond_latent_frames: Number of latent frames to condition on.
+            num_cond_latent_frames: Number of leading latent frames to condition
+                on (image-conditioning / i2v default).
             strength: Conditioning strength (1.0 = fully conditioned).
+            cond_latent_frame_ranges: Optional explicit half-open latent-frame
+                ranges ``[(start, end), ...]`` to condition. When given, these
+                ranges are conditioned and everything else is left unconditioned
+                — this generalizes the leading-frame mask to a two-sided internal
+                retake window (pass the leading and trailing context ranges,
+                leaving the middle regenerated window unconditioned). Ranges are
+                clamped to ``[0, grid_f]`` and empty/inverted ranges are skipped.
+                When ``None``, the leading ``num_cond_latent_frames`` frames are
+                conditioned (backward-compatible i2v behavior).
 
         Returns:
             ``(1, T)`` mask in patchified token space.
@@ -1296,11 +1372,145 @@ class LTX2Pipeline(BasePipeline):
         grid_w = video_shape.width // patch_w
         tokens_per_frame = grid_h * grid_w
         total_tokens = grid_f * tokens_per_frame
-        cond_tokens = num_cond_latent_frames * tokens_per_frame
+
+        if cond_latent_frame_ranges is None:
+            cond_latent_frame_ranges = [(0, num_cond_latent_frames)]
 
         mask = torch.ones(1, total_tokens, device=self.device, dtype=torch.float32)
-        mask[:, :cond_tokens] = 1.0 - strength
+        cond_value = 1.0 - strength
+        for start_frame, end_frame in cond_latent_frame_ranges:
+            start_frame = max(0, start_frame)
+            end_frame = min(grid_f, end_frame)
+            if end_frame <= start_frame:
+                continue
+            mask[:, start_frame * tokens_per_frame : end_frame * tokens_per_frame] = cond_value
         return mask
+
+    def _masked_transformer_step(
+        self,
+        v_latents,
+        a_latents,
+        step_index,
+        timestep_val,
+        v_context,
+        a_context,
+        mask,
+        *,
+        video_positions,
+        audio_positions,
+        denoise_mask,
+        clean_latent,
+        num_steps,
+        text_cache,
+        perturbations=None,
+        a_frozen=False,
+    ):
+        """Single masked transformer pass -> (denoised_video, denoised_audio).
+
+        Reusable masked-denoise entry shared by the generation ``forward``
+        (image-to-video / text-to-video) and the retake pre/post runtime path.
+        The masking mechanism is identical to i2v: when *denoise_mask* is active
+        the video timesteps become per-token values (conditioned tokens -> 0) and
+        the denoised prediction is blended with *clean_latent* at the conditioned
+        positions. Retake reuses this with a two-sided *denoise_mask* /
+        *clean_latent* (leading + trailing context conditioned, the middle window
+        regenerated) instead of the single leading frame.
+
+        Either *v_latents* or *a_latents* (but not both) may be ``None`` for
+        modality-isolated passes. The masking / positions / step schedule state
+        that the generation loop closes over is passed explicitly here so the
+        method has no hidden dependency on any particular ``forward`` call.
+        """
+        v_latents_f32 = v_latents.float() if v_latents is not None else None
+        v_latents_bf = v_latents.to(self.dtype) if v_latents is not None else None
+        a_latents_f32 = a_latents.float() if a_latents is not None else None
+        a_latents_bf = a_latents.to(self.dtype) if a_latents is not None else None
+
+        # Per-token masked timesteps use the model dtype. Keeping them in float32
+        # changes AdaLN inputs whenever sigma is not exactly representable in BF16.
+        if denoise_mask is not None and v_latents_bf is not None:
+            v_timestep = (denoise_mask * timestep_val.unsqueeze(-1)).to(self.dtype)  # (B, T)
+        else:
+            v_timestep = timestep_val
+
+        video_mod = (
+            Modality(
+                latent=v_latents_bf,
+                timesteps=v_timestep,
+                positions=video_positions,
+                context=v_context,
+                context_mask=mask,
+                # Per-batch noise level; the prompt AdaLN (cross_attention_adaln,
+                # e.g. the LTX-2.3 22b) derives its text-context timestep from this.
+                # It is the unmasked scalar sigma, not the per-token ``v_timestep``.
+                sigma=timestep_val.to(self.dtype),
+            )
+            if v_latents_bf is not None
+            else None
+        )
+
+        # Frozen audio has zero per-token timesteps, but prompt AdaLN still uses
+        # the current sigma. The caller advances its latent from noise to clean on
+        # the same schedule. Joint AV generation uses the current timestep here.
+        a_timestep = torch.zeros_like(timestep_val) if a_frozen else timestep_val
+        audio_mod = (
+            Modality(
+                latent=a_latents_bf,
+                timesteps=a_timestep,
+                positions=audio_positions,
+                context=a_context,
+                context_mask=mask,
+                sigma=timestep_val.to(self.dtype),
+            )
+            if a_latents_bf is not None
+            else None
+        )
+
+        # At configured diffusion steps, run the resident FP8 transformer instead
+        # of the primary
+        # (e.g. NVFP4) one to recover the quality NVFP4 linears lose at those
+        # sensitive steps. The FP8 transformer carries its own prepared text cache
+        # (prepare_text_cache runs the model's quantized cross-attention context),
+        # so swap both the transformer and its text cache together.
+        _tf = self.transformer
+        _tc = text_cache
+        _fp8_steps = getattr(self, "_fp8_step_indices", None)
+        if _fp8_steps and step_index in _fp8_steps:
+            _fp8_tf = getattr(self, "_fp8_step_transformer", None)
+            if _fp8_tf is not None:
+                _tf = _fp8_tf
+                _tc = getattr(self, "_fp8_step_text_cache", None) or text_cache
+
+        vel_v, vel_a = _tf(
+            video=video_mod,
+            audio=audio_mod,
+            perturbations=perturbations,
+            text_cache=_tc,
+            timestep=timestep_val.new_tensor(float(step_index) / num_steps),
+            step_index=step_index,
+        )
+
+        dn_v = None
+        if vel_v is not None and v_latents_f32 is not None:
+            # Use the same model-dtype sigma as the per-token modulation.
+            sigma = timestep_val.to(self.dtype).float()
+            while sigma.dim() < vel_v.dim():
+                sigma = sigma.unsqueeze(-1)
+            # Requantize x0 after each stage to preserve the BF16 denoise trajectory.
+            dn_v = (v_latents_f32 - vel_v.float() * sigma).to(self.dtype)
+
+            if denoise_mask is not None and clean_latent is not None:
+                dm = denoise_mask.unsqueeze(-1).float()  # (B, T, 1)
+                dn_v = (dn_v.float() * dm + clean_latent.float() * (1.0 - dm)).to(self.dtype)
+
+        dn_a = None
+        if vel_a is not None and a_latents_f32 is not None:
+            sigma = timestep_val.to(self.dtype).float()
+            while sigma.dim() < vel_a.dim():
+                sigma = sigma.unsqueeze(-1)
+            dn_a = a_latents_f32 - vel_a.float() * sigma
+
+        return dn_v, dn_a
 
     # ------------------------------------------------------------------
     # Inference
@@ -1767,78 +1977,26 @@ class LTX2Pipeline(BasePipeline):
             *,
             text_cache,
         ):
-            """Single transformer pass → (denoised_video, denoised_audio).
-
-            Either *v_latents* or *a_latents* (but not both) may be ``None``
-            for modality-isolated passes.
-
-            When *denoise_mask* is active (i2v mode), video timesteps are
-            converted to per-token values (conditioned tokens → 0) and the
-            denoised prediction is blended with the clean conditioning latent.
+            """Thin closure over this ``forward``'s masking / positions / step
+            schedule that delegates to :meth:`_masked_transformer_step` (the
+            reusable masked-denoise entry, also used by the retake path).
             """
-            v_latents_f32 = v_latents.float() if v_latents is not None else None
-            v_latents_bf = v_latents.to(self.dtype) if v_latents is not None else None
-            a_latents_f32 = a_latents.float() if a_latents is not None else None
-            a_latents_bf = a_latents.to(self.dtype) if a_latents is not None else None
-
-            # Per-token timesteps for image conditioning
-            if denoise_mask is not None and v_latents_bf is not None:
-                v_timestep = denoise_mask * timestep_val.unsqueeze(-1)  # (B, T)
-            else:
-                v_timestep = timestep_val
-
-            video_mod = (
-                Modality(
-                    latent=v_latents_bf,
-                    timesteps=v_timestep,
-                    positions=video_positions,
-                    context=v_context,
-                    context_mask=mask,
-                )
-                if v_latents_bf is not None
-                else None
-            )
-
-            audio_mod = (
-                Modality(
-                    latent=a_latents_bf,
-                    timesteps=timestep_val,
-                    positions=audio_positions,
-                    context=a_context,
-                    context_mask=mask,
-                )
-                if a_latents_bf is not None
-                else None
-            )
-
-            vel_v, vel_a = self.transformer(
-                video=video_mod,
-                audio=audio_mod,
-                perturbations=perturbations,
+            return self._masked_transformer_step(
+                v_latents,
+                a_latents,
+                step_index,
+                timestep_val,
+                v_context,
+                a_context,
+                mask,
+                video_positions=video_positions,
+                audio_positions=audio_positions,
+                denoise_mask=denoise_mask,
+                clean_latent=clean_latent,
+                num_steps=num_steps,
                 text_cache=text_cache,
-                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
-                step_index=step_index,
+                perturbations=perturbations,
             )
-
-            dn_v = None
-            if vel_v is not None and v_latents_f32 is not None:
-                sigma = timestep_val.float()
-                while sigma.dim() < vel_v.dim():
-                    sigma = sigma.unsqueeze(-1)
-                dn_v = v_latents_f32 - vel_v.float() * sigma
-
-                if denoise_mask is not None and clean_latent is not None:
-                    dm = denoise_mask.unsqueeze(-1)  # (B, T, 1)
-                    dn_v = dn_v * dm + clean_latent.float() * (1.0 - dm)
-
-            dn_a = None
-            if vel_a is not None and a_latents_f32 is not None:
-                sigma = timestep_val.float()
-                while sigma.dim() < vel_a.dim():
-                    sigma = sigma.unsqueeze(-1)
-                dn_a = a_latents_f32 - vel_a.float() * sigma
-
-            return dn_v, dn_a
 
         def forward_fn(
             video_latents,

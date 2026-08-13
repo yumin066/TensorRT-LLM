@@ -73,16 +73,21 @@ def to_velocity(
     """Convert denoised prediction to flow velocity (flow-matching parameterization).
 
     velocity = (sample - denoised) / sigma
+
+    The velocity is returned in ``calc_dtype`` and is not rounded back to
+    ``sample.dtype``. The Euler step requantizes only the updated latent.
+
+    A tensor ``sigma`` is reduced to a Python float via ``.item()`` so the
+    division ``x / sigma`` takes PyTorch's scalar path. Dividing by a 0-dim
+    tensor instead takes a measurably different FP32 arithmetic path. This runs
+    in the eager Euler step outside the transformer CUDA graph, so the scalar
+    extraction is acceptable.
     """
-    # Tensor sigma: keep on device. `.item()` would force a D2H sync that
-    # deadlocks under nsys profiling combined with CUDA graph replay.
-    # The scheduler guarantees sigma > 0 inside the denoise loop, so we
-    # skip the zero check on the tensor path (re-checking would re-sync).
     if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype)
-    elif sigma == 0:
+        sigma = sigma.to(calc_dtype).item()
+    if sigma == 0:
         raise ValueError("Sigma can't be 0.0")
-    return ((sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma).to(sample.dtype)
+    return (sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma
 
 
 def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

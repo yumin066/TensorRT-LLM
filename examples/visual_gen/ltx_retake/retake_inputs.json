@@ -1,0 +1,45 @@
+{
+  "delete_disfluency": {
+    "video": "delete_disfluency_retake_input.mp4",
+    "sha256": "269ca85b7e326c60b8f193ec71f78b005dbf2a5eefd9d1436f3eafe2868bdc58",
+    "frames": 209,
+    "width": 704,
+    "height": 1280,
+    "fps": 30.0,
+    "retake_start_seconds": 2.9667,
+    "retake_end_seconds": 3.9333
+  },
+  "add_word": {
+    "video": "add_word_retake_input.mp4",
+    "sha256": "da658702da8a9f6fbd2edff38af6ea82f1d82bfde92b2117ca664fb06da231f6",
+    "eval_case_file": "LTX2.3-eval/script_editing/eval/eval_cases_subset.json",
+    "eval_case_index": 0,
+    "clip_id": "--Y9imYnfBw-f0-484",
+    "after_word_index": 20,
+    "insert_text": "actually",
+    "synth_duration_seconds": 0.8,
+    "frames": 225,
+    "width": 1920,
+    "height": 1088,
+    "fps": 29.97002997002997,
+    "retake_start_seconds": 3.003,
+    "retake_end_seconds": 4.5045
+  },
+  "replace_word": {
+    "video": "replace_word_retake_input.mp4",
+    "sha256": "0fea4db67939d4c816b0eb9552cd16729f76bdf14d196a3e4d3a901781567c80",
+    "eval_case_file": "LTX2.3-eval/script_editing/eval/eval_cases_subset.json",
+    "eval_case_index": 0,
+    "clip_id": "--Y9imYnfBw-f0-484",
+    "word_index": 47,
+    "original_text": "surprising",
+    "replacement_text": "surprising",
+    "synth_duration_seconds": 0.64,
+    "frames": 113,
+    "width": 1920,
+    "height": 1088,
+    "fps": 29.97002997002997,
+    "retake_start_seconds": 1.2679333333333334,
+    "retake_end_seconds": 2.5025
+  }
+}
