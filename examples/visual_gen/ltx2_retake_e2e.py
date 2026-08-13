@@ -16,11 +16,10 @@
 
 r"""End-to-end example for the native LTX-2 retake workflow.
 
-Regenerates an internal time-window ``[start, end)`` of a source video and
-composites it back so the frames outside the window stay byte-identical to the
-source. Unlike the external step_a/step_b/step_c pipeline, this drives the
-native :class:`LTX2RetakePipeline` in a single process: source read -> VAE
-encode -> two-sided masked denoise -> VAE decode -> composite.
+Regenerates an internal time-window ``[start, end)`` of a source video and emits
+the whole VAE-decoded retake clip. Unlike the external step_a/step_b/step_c
+pipeline, this drives the native :class:`LTX2RetakePipeline` in a single process:
+source read -> VAE encode -> two-sided masked denoise -> VAE decode.
 
 The source-video read uses the optional Lightricks ``ltx-pipelines``
 ``media_io`` helpers (the pipeline imports them lazily); install that package in
@@ -28,12 +27,18 @@ the VisualGen runtime before running.
 
 Example::
 
+    : "${RETAKE_START:?set RETAKE_START to the retake-window start in seconds}"
+    : "${RETAKE_END:?set RETAKE_END to the retake-window end in seconds}"
+
     python examples/visual_gen/ltx2_retake_e2e.py \\
         --checkpoint /path/to/ltx-2.3-22b-distilled.safetensors \\
         --text-encoder /path/to/gemma-3-12b-it \\
         --source retake_input.mp4 --output retake_output.mp4 \\
-        --start 3.0 --end 3.9667 \\
+        --start "$RETAKE_START" --end "$RETAKE_END" \\
         --prompt "a person talking to the camera, natural head motion, clear speech"
+
+``--start`` and ``--end`` intentionally have no defaults: every caller must
+provide the window associated with its own ``retake_input.mp4``.
 
 Note: the full-resolution 22B retake (source + Gemma text encoder + 22B
 transformer resident) needs a large-memory GPU (e.g. H200 141GB); an 80GB GPU
@@ -63,22 +68,30 @@ def _parse_args() -> argparse.Namespace:
         help="Gemma3 text encoder directory (config.json + model*.safetensors + tokenizer).",
     )
     parser.add_argument("--source", required=True, help="Source video to retake (.mp4).")
-    parser.add_argument("--output", required=True, help="Output composited retake video (.mp4).")
+    parser.add_argument("--output", required=True, help="Output decoded retake video (.mp4).")
     parser.add_argument(
         "--dump-frames",
         default=None,
         help=(
-            "Optional path to save the composited uint8 frames (1, T, H, W, C) as a "
+            "Optional path to save the decoded uint8 frames (1, T, H, W, C) as a "
             ".pt tensor, before H.264 encoding. Quality evaluation should score "
             "these rather than a decoded mp4, since the codec's own re-encode loss "
             "is larger than the differences being measured."
         ),
     )
     parser.add_argument(
-        "--start", type=float, required=True, help="Start time (seconds) of the regenerated window."
+        "--start",
+        type=float,
+        required=True,
+        metavar="SECONDS",
+        help="Required start time of the regenerated window; no default is used.",
     )
     parser.add_argument(
-        "--end", type=float, required=True, help="End time (seconds) of the regenerated window."
+        "--end",
+        type=float,
+        required=True,
+        metavar="SECONDS",
+        help="Required end time of the regenerated window; no default is used.",
     )
     parser.add_argument(
         "--prompt",
