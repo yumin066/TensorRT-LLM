@@ -233,20 +233,55 @@ def _make_request(args: argparse.Namespace) -> SimpleNamespace:
 
 
 def _save_video(video: torch.Tensor, frame_rate: float, output_path: str) -> int:
-    """Encode a ``(1, T, H, W, C)`` uint8 RGB video to H.264 via PyAV."""
+    """Encode a ``(1, T, H, W, C)`` uint8 RGB video to H.264 via PyAV.
+
+    Three things this has to get right, all of which it previously did not:
+
+    * **Colour.** The conversion is done here, explicitly, in BT.709 limited
+      range, and the stream is tagged with the same constants. Handing RGB24 to
+      PyAV lets libswscale choose the matrix, and the file then carried no
+      ``color_range``/``color_space`` at all (``unknown``/``unknown`` against the
+      reference's ``tv``/``bt709``), leaving every decoder to guess.
+    * **Frame rate.** ``Fraction`` preserves fractional rates such as 30000/1001;
+      ``int(round(fps))`` silently turned 29.97 into 30 and desynchronised the
+      audio over a long clip.
+    * **Quantiser.** ``crf``/``preset`` match the reference encode, so the
+      re-encode loss is comparable rather than an extra unexplained variable.
+    """
+    from fractions import Fraction
+
     import av
 
-    frames = video[0].cpu().to(torch.uint8).numpy()  # (T, H, W, C)
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.color_conversion import (
+        AVCOL_RANGE_MPEG,
+        AVCOL_SPC_BT709,
+        rgb_to_yuv420p_bt709_limited,
+    )
+
+    rgb = video[0].cpu()  # (T, H, W, C) uint8
+    height, width = int(rgb.shape[1]), int(rgb.shape[2])
+    i420 = rgb_to_yuv420p_bt709_limited(rgb).numpy()  # (T, H*3//2, W) uint8
+
+    # limit_denominator keeps exact rates exact (30 -> 30/1) while still
+    # representing 29.97 as 30000/1001 rather than as a float.
+    rate = Fraction(frame_rate).limit_denominator(1000000)
+
     container = av.open(output_path, mode="w")
-    stream = container.add_stream("libx264", rate=int(round(frame_rate)))
-    stream.width, stream.height, stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
-    for frame in frames:
-        for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+    try:
+        stream = container.add_stream(
+            "libx264", rate=rate, options={"crf": "19", "preset": "veryfast"}
+        )
+        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        stream.codec_context.colorspace = AVCOL_SPC_BT709
+        stream.codec_context.color_range = AVCOL_RANGE_MPEG
+        for frame in i420:
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="yuv420p")):
+                container.mux(packet)
+        for packet in stream.encode():
             container.mux(packet)
-    for packet in stream.encode():
-        container.mux(packet)
-    container.close()
-    return frames.shape[0]
+    finally:
+        container.close()
+    return int(rgb.shape[0])
 
 
 def main() -> None:
