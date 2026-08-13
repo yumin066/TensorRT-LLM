@@ -55,6 +55,139 @@ ORACLE_TILING = TilingConfig(
 )
 
 
+# --------------------------------------------------------------------------------------
+# AC-9 / task13 — the retake DECODE must use the oracle's geometry too.
+#
+# The encode was aligned first; the decode kept calling native's `TilingConfig.default()`,
+# which emits 5 temporal chunks where the oracle emits 4. Aligning it moved the measured
+# decoder gap from relL2 1.297e-2 to 1.640e-3 on H200.
+# --------------------------------------------------------------------------------------
+
+
+def test_oracle_tiling_constant_matches_the_reference_geometry():
+    """Pin the four numbers the reference decodes and encodes with.
+
+    Upstream's `TilingConfig.default()` is 768/64 spatial and 80/24 temporal, and
+    `RetakePipeline`'s callers pass exactly that. This constant is native's
+    transcription of it; if upstream's default ever moves, this test is what says so.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
+        _ORACLE_TILING_CONFIG,
+    )
+
+    assert _ORACLE_TILING_CONFIG.spatial_config.tile_size_in_pixels == 768
+    assert _ORACLE_TILING_CONFIG.spatial_config.tile_overlap_in_pixels == 64
+    assert _ORACLE_TILING_CONFIG.temporal_config.tile_size_in_frames == 80
+    assert _ORACLE_TILING_CONFIG.temporal_config.tile_overlap_in_frames == 24
+
+
+def test_native_default_tiling_is_left_alone():
+    """The reverse assertion: retake must not have moved the shared default.
+
+    The generation and two-stage paths decode with native's `TilingConfig.default()`.
+    Aligning retake by editing that default would have silently changed their
+    numerics — which is why retake passes its geometry explicitly instead.
+    """
+    default = TilingConfig.default()
+    assert default.spatial_config.tile_size_in_pixels == 512
+    assert default.spatial_config.tile_overlap_in_pixels == 64
+    assert default.temporal_config.tile_size_in_frames == 64
+    assert default.temporal_config.tile_overlap_in_frames == 24
+
+
+def test_the_two_tilings_really_are_different_work():
+    """If both geometries produced the same tiles, aligning them would be a no-op.
+
+    They do not: on the retake window the oracle geometry emits 8 encode tiles and
+    native's default emits more, so this is a structurally different computation
+    rather than a rounding difference.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_retake import (
+        _ORACLE_TILING_CONFIG,
+    )
+
+    oracle_tiles = prepare_tiles_for_encoding(_video(), _ORACLE_TILING_CONFIG)
+    default_tiles = prepare_tiles_for_encoding(_video(), TilingConfig.default())
+    assert len(oracle_tiles) != len(default_tiles), (
+        "the two tiling configs produce the same tiling, so nothing was actually aligned"
+    )
+
+
+def _tiling_args_at(module, func_name, callee):
+    """The tiling argument expression passed to *callee* inside *func_name*, as source."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(module))
+    found = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name != func_name:
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == callee
+            ):
+                args = list(node.args) + [k.value for k in node.keywords]
+                found.append([ast.unparse(a) for a in args])
+    return found
+
+
+def test_retake_decode_call_site_passes_the_oracle_geometry():
+    """The retake decode must name the constant, not call `default()`.
+
+    Checked structurally: `_run_native_pre_post_retake` needs a checkpoint, weights
+    and a GPU to execute, so the executed proof for this row is the GPU A/B probe.
+    What this pins is that the call site cannot quietly go back to `default()`.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_retake
+
+    calls = _tiling_args_at(pipeline_ltx2_retake, "_run_native_pre_post_retake", "tiled_decode")
+    assert len(calls) == 1, f"expected exactly one native decode call; got {calls}"
+    args = calls[0]
+    assert any("_ORACLE_TILING_CONFIG" in a for a in args), (
+        f"retake decode must pass _ORACLE_TILING_CONFIG; got {args}"
+    )
+    assert not any("default()" in a for a in args), (
+        f"retake decode must not fall back to a default() geometry; got {args}"
+    )
+
+
+def test_encode_and_decode_share_one_tiling_object():
+    """Both retake call sites must reference the same constant, not two copies.
+
+    Two hand-written copies of the same four numbers can drift apart silently —
+    the failure mode that had an audit reporting a fixed loader's stale key counts.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_retake
+
+    encode = _tiling_args_at(
+        pipeline_ltx2_retake, "_run_native_pre_post_retake", "_encode_video_window"
+    )
+    assert len(encode) == 1, f"expected exactly one native encode call; got {encode}"
+    assert any("_ORACLE_TILING_CONFIG" in a for a in encode[0]), (
+        f"retake encode must pass the shared constant; got {encode[0]}"
+    )
+
+
+def test_generation_and_two_stage_decode_keep_the_native_default():
+    """Retake's geometry must not leak into the paths that never asked for it.
+
+    Those paths were characterized against native's default; silently decoding them
+    with the oracle geometry would change their output with no call-site change.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2, pipeline_ltx2_two_stages
+
+    for module in (pipeline_ltx2, pipeline_ltx2_two_stages):
+        source = __import__("inspect").getsource(module)
+        assert "_ORACLE_TILING_CONFIG" not in source, (
+            f"{module.__name__} must not use retake's tiling geometry"
+        )
+
+
 def _video():
     # Only the shape matters: prepare_tiles_for_encoding is pure index arithmetic.
     return torch.zeros(1, 3, FRAMES, HEIGHT, WIDTH)

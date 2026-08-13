@@ -72,6 +72,28 @@ _RETAKE_DISTILLED_SIGMA_VALUES = [
     0.0,
 ]
 
+# The tiling geometry the a/b/c oracle actually runs, for BOTH encode and decode.
+#
+# Upstream's ``TilingConfig.default()`` is 768 px / 64 px spatial and 80 / 24
+# temporal; native's is 512 / 64 and 64 / 24. The two defaults are independent by
+# design -- native's is what the generation and two-stage paths depend on and is
+# deliberately left alone -- so retake states the oracle's geometry explicitly
+# rather than relying on either side's ``default()``.
+#
+# Declared once because the encode and decode call sites must agree: a second
+# hand-written copy of these four numbers can drift from this one silently, which
+# is the same restated-constant defect that made an earlier state-dict audit
+# report a fixed loader's stale key counts.
+#
+# Tiling is not a rounding difference. For this window (209 frames, 1280x704)
+# both axes exceed their tile size, so the geometry decides how many tiles are
+# computed and where each lands -- a different computation entirely. Matching it
+# is what took the encode to ``torch.equal``.
+_ORACLE_TILING_CONFIG = TilingConfig(
+    spatial_config=SpatialTilingConfig(tile_size_in_pixels=768, tile_overlap_in_pixels=64),
+    temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=24),
+)
+
 
 def _retake_pixel_window(start_time: float, end_time: float, fps: float, num_frames: int) -> tuple:
     """Half-open source pixel-frame window ``[start, end)`` for a retake window.
@@ -666,6 +688,13 @@ class LTX2RetakePipeline(BasePipeline):
         self._retake_pipeline.prompt_encoder._trtllm_prompt_cache_size = prompt_cache_size
         self._retake_pipeline.prompt_encoder._trtllm_prompt_cache = OrderedDict()
         self._retake_params = detect_params(checkpoint_dir)
+        # NOTE: this is ``ltx_core``'s ``TilingConfig``, imported into this
+        # function's scope above and shadowing the module-level native one -- so
+        # this is upstream's 768/64 + 80/24 default, which is what the reference
+        # caller (``ltx_pipelines.retake``'s CLI, and the customer's
+        # ``delete_disfluency.py``) passes. It is numerically the same geometry as
+        # ``_ORACLE_TILING_CONFIG``, but deliberately left as the upstream *type*,
+        # because this object is handed to the upstream decoder.
         self._tiling_config = TilingConfig.default()
         self._get_videostream_metadata = get_videostream_metadata
 
@@ -1103,35 +1132,15 @@ class LTX2RetakePipeline(BasePipeline):
         if timer is not None:
             timer.mark("vae_encode")
         # Encode the source window the way the a/b/c oracle does: tiled, with the
-        # oracle's tiling geometry, and left in the model dtype.
-        #
-        # The oracle encodes through ``video_latent_from_file``, which defaults to
-        # its own ``TilingConfig.default()`` -- 768 px / 64 px spatial and 80 / 24
-        # temporal. Native's ``TilingConfig.default()`` is 512/64 and 64/24, which
-        # is used by the decoder and is deliberately left alone here; passing the
-        # geometry explicitly keeps the two defaults independent.
-        #
-        # For this window (209 frames, 1280x704) both axes exceed their tile size,
-        # so the oracle tiles in space *and* time while native used to encode the
-        # whole window in a single pass -- a different computation, not a different
-        # rounding, which is why the encoded latents diverged (relL2 5.8e-2).
+        # oracle's tiling geometry (see ``_ORACLE_TILING_CONFIG``), and left in the
+        # model dtype.
         #
         # No ``.float()``: the encoder already returns the model dtype (bf16), so
         # the old upcast only changed the container, not the values. Dropping it
         # makes the tensor directly comparable to the oracle's bf16
         # ``video_clean_latent``; the fp32 blend below is unaffected because
         # widening bf16 to fp32 is exact.
-        source_window_latents = native._encode_video_window(
-            source_norm_5d,
-            TilingConfig(
-                spatial_config=SpatialTilingConfig(
-                    tile_size_in_pixels=768, tile_overlap_in_pixels=64
-                ),
-                temporal_config=TemporalTilingConfig(
-                    tile_size_in_frames=80, tile_overlap_in_frames=24
-                ),
-            ),
-        )
+        source_window_latents = native._encode_video_window(source_norm_5d, _ORACLE_TILING_CONFIG)
         if timer is not None:
             timer.mark("conditioning")
         expected_latent_shape = tuple(video_shape.to_torch_shape())
@@ -1360,9 +1369,16 @@ class LTX2RetakePipeline(BasePipeline):
         video_latents_5d = native.video_patchifier.unpatchify(denoised_latents, video_shape).to(
             dtype
         )
+        # Decode with the oracle's tiling geometry, not native's ``default()``.
+        # ``RetakePipeline.__call__`` receives ``TilingConfig.default()`` from its
+        # caller -- upstream's 768/64 + 80/24 -- while native's ``default()`` is
+        # 512/64 + 64/24, which emits 5 temporal chunks where the oracle emits 4.
+        # That is a structurally different decode, and it was measured as the
+        # dominant term in the decoder gap (relL2 1.30e-2 -> 1.64e-3 from aligning
+        # this alone).
         chunks = list(
             native.video_decoder.tiled_decode(
-                video_latents_5d, TilingConfig.default(), generator=generator
+                video_latents_5d, _ORACLE_TILING_CONFIG, generator=generator
             )
         )
         decoded = torch.cat(chunks, dim=2)  # (B, C, T, H, W)
