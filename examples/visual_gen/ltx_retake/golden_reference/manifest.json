@@ -1,0 +1,113 @@
+{
+  "description": "Upstream LTX2.3-eval retake outputs for LPIPS comparison with the TensorRT-LLM native implementation.",
+  "generated_on": "2026-08-14",
+  "source": {
+    "repository": "LTX2.3-eval",
+    "commit": "73c9d47b8b4f660dc88912c54ca474826d4120e1",
+    "pipeline": "ltx_pipelines.retake.RetakePipeline",
+    "checkpoint": {
+      "filename": "ltx-2.3-22b-distilled.safetensors",
+      "sha256": "b33b7fe4bbfe084f484be4aaf90b0f1d95dca20d403ac4c0e037eb8c4f0af7cc"
+    },
+    "text_encoder": "Gemma 3",
+    "identity_lora": {
+      "filename": "talkvid-id-lora.safetensors",
+      "sha256": "e5af73441743b4852f228b03e444888dff3da80d2666033af2367ab7bda6d8b9",
+      "strength": 1.0
+    },
+    "prompt": "a person talking to the camera, natural head motion, clear speech",
+    "seed": 42,
+    "quantization": "fp8-cast",
+    "offload_mode": "cpu",
+    "distilled": true,
+    "regenerate_video": true,
+    "regenerate_audio": false
+  },
+  "input_manifest": "../retake_inputs.json",
+  "workflows": {
+    "delete_disfluency": {
+      "generation_script": "script_editing/delete_disfluency.py",
+      "input": "../delete_disfluency_retake_input.mp4",
+      "input_sha256": "269ca85b7e326c60b8f193ec71f78b005dbf2a5eefd9d1436f3eafe2868bdc58",
+      "output": "delete_disfluency_retake_output.mp4",
+      "output_sha256": "fe3ee919ceffa1cc9cee7a0cd96f4c060b04969555d3adc66839a9deece249c7",
+      "output_size_bytes": 2295367,
+      "retake_window_seconds": [
+        2.966666666666667,
+        3.933333333333333
+      ],
+      "bridge_frame_range": [
+        89,
+        118
+      ],
+      "video": {
+        "codec": "h264",
+        "frames": 209,
+        "width": 704,
+        "height": 1280,
+        "fps": 30.0
+      },
+      "audio": {
+        "codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2
+      }
+    },
+    "add_word": {
+      "generation_script": "script_editing/add_word.py",
+      "input": "../add_word_retake_input.mp4",
+      "input_sha256": "da658702da8a9f6fbd2edff38af6ea82f1d82bfde92b2117ca664fb06da231f6",
+      "output": "add_word_retake_output.mp4",
+      "output_sha256": "f7e8d00d2790c8bb488267dec72305ce8009926afed7d173f04929c08592eacc",
+      "output_size_bytes": 2942432,
+      "retake_window_seconds": [
+        3.003,
+        4.5045
+      ],
+      "bridge_frame_range": [
+        90,
+        135
+      ],
+      "video": {
+        "codec": "h264",
+        "frames": 225,
+        "width": 1920,
+        "height": 1088,
+        "fps": 30.0
+      },
+      "audio": {
+        "codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2
+      }
+    },
+    "replace_word": {
+      "generation_script": "script_editing/replace_word.py",
+      "input": "../replace_word_retake_input.mp4",
+      "input_sha256": "0fea4db67939d4c816b0eb9552cd16729f76bdf14d196a3e4d3a901781567c80",
+      "output": "replace_word_retake_output.mp4",
+      "output_sha256": "d4dac26b8cf88e6a46adb7cba8379085f217a6c2c18d6d02d2991e563222ad5b",
+      "output_size_bytes": 1393201,
+      "retake_window_seconds": [
+        1.2679333333333334,
+        2.5025
+      ],
+      "bridge_frame_range": [
+        38,
+        75
+      ],
+      "video": {
+        "codec": "h264",
+        "frames": 113,
+        "width": 1920,
+        "height": 1088,
+        "fps": 30.0
+      },
+      "audio": {
+        "codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2
+      }
+    }
+  }
+}

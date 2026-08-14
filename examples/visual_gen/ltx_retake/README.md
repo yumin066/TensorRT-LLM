@@ -45,9 +45,9 @@ time to select which GPU is visible.
 - Internet access to the package index during setup. The SM120 setup also needs
   GitHub access to build pinned FlashInfer PR #4272. An air-gapped FlashInfer
   source archive can be supplied with `FLASHINFER_SHARED_ARCHIVE`.
-- Git LFS content available for the bundled retake inputs. If LPIPS evaluation
-  is required, fetch its golden archive at the same time:
-  `git lfs pull --include='examples/visual_gen/ltx_retake/*_retake_input.mp4,examples/visual_gen/ltx_retake/default_prompt_conditioning.safetensors,tests/integration/defs/examples/visual_gen/golden/visual_gen_lpips/visual_gen_lpips_golden_media.zip'`.
+- Git LFS content available for the bundled retake inputs, upstream golden
+  references, and default prompt conditioning:
+  `git lfs pull --include='examples/visual_gen/ltx_retake/*_retake_input.mp4,examples/visual_gen/ltx_retake/golden_reference/*.mp4,examples/visual_gen/ltx_retake/default_prompt_conditioning.safetensors'`.
 
 A default-prompt run only needs the LTX checkpoint. A custom-prompt layout is:
 
@@ -228,34 +228,36 @@ selection uses a fast checkpoint fingerprint (shard sizes and safetensors
 configuration metadata); the full SHA-256 remains recorded for audit without
 re-reading the 46 GB checkpoint at every invocation.
 
-## Delete-disfluency LPIPS evaluation
+## Upstream-golden LPIPS evaluation
 
-`lpips_eval.sh` is specific to the bundled delete-disfluency case because its
-upstream golden and bridge frames `[89, 118)` are fixed to that input. It is not
-an add-word, replace-word, or arbitrary-input metric script.
+`golden_reference/` contains the three `retake_output.mp4` files produced by the
+unmodified `LTX2.3-eval` upstream `RetakePipeline`. They use its default
+`fp8-cast` policy, ID-LoRA, seed 42, and the same prepared inputs and timestamps
+as the native recipes. See `golden_reference/manifest.json` for hashes and exact
+provenance.
 
-Run delete-disfluency BF16 first, then:
+After running BF16, evaluate any prepared workflow over only its regenerated
+bridge window:
 
 ```bash
-docker exec -u "$(id -u):$(id -g)" ltx_retake bash \
-  "${RETAKE_DIR}/lpips_eval.sh"
-
-docker cp \
-  ltx_retake:/tmp/ltx_retake/delete_disfluency/lpips_results.json \
-  ./lpips_results.json
+for workflow in delete_disfluency add_word replace_word; do
+  docker exec -u "$(id -u):$(id -g)" ltx_retake bash \
+    "${RETAKE_DIR}/lpips_eval.sh" "${workflow}"
+done
 ```
 
-The evaluator extracts the tracked upstream golden from its Git LFS zip into a
-temporary container cache. If FP8 or NVFP4 output is also present, it adds BF16
-versus quantized comparisons to the same JSON file.
+The bridge windows are `[89, 118)`, `[90, 135)`, and `[38, 75)` for delete,
+add, and replace respectively. Results are written to each workflow output
+directory as `lpips_results.json`. If FP8 or NVFP4 output is also present, the
+same result file includes BF16-versus-quantized comparisons.
 
 ## Prepared inputs
 
-| Workflow | Input | Frames / resolution | Retake window |
-|---|---|---|---|
-| `delete_disfluency` | `delete_disfluency_retake_input.mp4` | 209 / 704×1280 at 30 fps | `[2.9667, 3.9333)` |
-| `add_word` | `add_word_retake_input.mp4` | 225 / 1920×1088 at 29.97 fps | `[3.0030, 4.5045)` |
-| `replace_word` | `replace_word_retake_input.mp4` | 113 / 1920×1088 at 29.97 fps | `[1.2679333, 2.5025)` |
+| Workflow | Input | Golden reference | Frames / resolution | Retake window |
+|---|---|---|---|---|
+| `delete_disfluency` | `delete_disfluency_retake_input.mp4` | `golden_reference/delete_disfluency_retake_output.mp4` | 209 / 704×1280 at 30 fps | `[2.9667, 3.9333)` |
+| `add_word` | `add_word_retake_input.mp4` | `golden_reference/add_word_retake_output.mp4` | 225 / 1920×1088 at 29.97 fps | `[3.0030, 4.5045)` |
+| `replace_word` | `replace_word_retake_input.mp4` | `golden_reference/replace_word_retake_output.mp4` | 113 / 1920×1088 at 29.97 fps | `[1.2679333, 2.5025)` |
 
 `retake_inputs.json` records the source cases, media metadata, timestamps, and
 SHA-256 checksums. The add/replace inputs use the first matching cases from
@@ -308,8 +310,8 @@ Common failures:
   quantized recipe.
 - **FlashInfer build cannot fetch sources:** allow GitHub access or provide a
   mounted `FLASHINFER_SHARED_ARCHIVE`.
-- **LPIPS golden is invalid or missing:** fetch the Git LFS object for
-  `visual_gen_lpips_golden_media.zip` on the host.
+- **LPIPS golden is invalid or missing:** fetch the Git LFS objects under
+  `examples/visual_gen/ltx_retake/golden_reference/` on the host.
 
 ## Files
 
@@ -320,7 +322,8 @@ Common failures:
 | `setup_sm120_env.sh` | Install the native overlay/dependencies, build pinned FlashInfer, and preflight Blackwell SM120. |
 | `run_recipes.sh` | Run a prepared workflow or customer-prepared input with selected recipes. |
 | `run_nvfp4.sh` | Run the tuned SM120 NVFP4 recipe for all or selected prepared workflows. |
+| `golden_reference/` | Upstream `LTX2.3-eval` retake outputs and provenance manifest for all three prepared workflows. |
 | `export_prompt_conditioning.py` | Rebuild and validate the default-prompt conditioning cache. |
 | `default_prompt_conditioning.safetensors` | Git LFS artifact containing the tested default prompt's post-connector tensors. |
-| `lpips_eval.sh` | Compare bundled delete-disfluency output with the upstream golden. |
+| `lpips_eval.sh` | Compare any bundled workflow output with its upstream golden. |
 | `Dockerfile`, `entrypoint.sh` | Thin image layer and host-user entrypoint. |
