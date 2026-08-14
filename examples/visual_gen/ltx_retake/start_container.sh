@@ -14,6 +14,7 @@
 #
 # Env overrides:
 #   LTX_CHECKPOINT       absolute path to the LTX-2.3 checkpoint (required)
+#   LTX_LORA             absolute path to the TalkVid LoRA (required)
 #   LTX_PROMPT_CONDITIONING absolute path to a default-prompt cache (bundled default)
 #   LTX_TEXT_ENCODER     absolute Gemma directory (required only for custom prompts/fallback)
 #   LTX_CONTAINER_NAME   container name           (default ltx_retake)
@@ -35,6 +36,7 @@ NAME="${LTX_CONTAINER_NAME:-ltx_retake}"
 IMAGE="${LTX_IMAGE:-ltx-retake:rc22}"
 BASE_IMAGE="${LTX_BASE_IMAGE:-${DEFAULT_BASE_IMAGE_DIGEST}}"
 CHECKPOINT="${LTX_CHECKPOINT:-}"
+LORA="${LTX_LORA:-}"
 TEXT_ENCODER="${LTX_TEXT_ENCODER:-}"
 PROMPT_CONDITIONING="${LTX_PROMPT_CONDITIONING:-${SCRIPT_DIR}/default_prompt_conditioning.safetensors}"
 LTX_MOUNTS="${LTX_MOUNTS:-}"
@@ -51,6 +53,9 @@ prompt_cache_ready() {
 [ -n "${CHECKPOINT}" ] || die "set LTX_CHECKPOINT to the absolute host path of the LTX-2.3 checkpoint"
 case "${CHECKPOINT}" in /*) ;; *) die "LTX_CHECKPOINT must be an absolute path: ${CHECKPOINT}" ;; esac
 [ -f "${CHECKPOINT}" ] || die "checkpoint file does not exist: ${CHECKPOINT}"
+[ -n "${LORA}" ] || die "set LTX_LORA to the absolute host path of the TalkVid LoRA"
+case "${LORA}" in /*) ;; *) die "LTX_LORA must be an absolute path: ${LORA}" ;; esac
+[ -e "${LORA}" ] || die "TalkVid LoRA path does not exist: ${LORA}"
 case "${PROMPT_CONDITIONING}" in
   /*) ;;
   *) die "LTX_PROMPT_CONDITIONING must be an absolute path: ${PROMPT_CONDITIONING}" ;;
@@ -96,6 +101,7 @@ args=(
   -e "HOME=/tmp/ltx_retake_home"
   -e "TRTLLM_REPO=${TRTLLM_REPO}"
   -e "LTX_CHECKPOINT=${CHECKPOINT}"
+  -e "LTX_LORA=${LORA}"
   -e "LTX_PROMPT_CONDITIONING=${PROMPT_CONDITIONING}"
   # Do not use an NFS checkout as the OCI working directory: root-squashed NFS
   # can reject the runtime's pre-entrypoint chdir. Scripts are invoked by their
@@ -117,6 +123,7 @@ add_mount() {
 }
 add_mount "${TRTLLM_REPO}"
 add_mount "$(dirname "${CHECKPOINT}")"
+add_mount "${LORA}"
 if [ -n "${TEXT_ENCODER}" ]; then
   add_mount "${TEXT_ENCODER}"
 fi

@@ -475,6 +475,8 @@ def main() -> None:
         recipe += f"+fp8@{sorted(set(args.fp8_linear_step))}"
     if args.nvfp4_attn:
         recipe += "+nvfp4attn"
+    if args.lora:
+        recipe += "+lora@1.0"
     print(f"[retake] building native retake pipeline ({recipe})...", flush=True)
     pipe = _build_retake_pipeline(
         args.checkpoint,

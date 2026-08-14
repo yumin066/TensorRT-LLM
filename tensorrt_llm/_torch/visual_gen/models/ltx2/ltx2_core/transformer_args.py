@@ -282,18 +282,36 @@ class MultiModalTransformerArgsPreprocessor:
         static_mask: torch.Tensor | None,
         static_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe: tuple[torch.Tensor, torch.Tensor],
+        cross_modality: Modality | None = None,
     ) -> TransformerArgs:
-        """Build TransformerArgs for one denoise step with pre-computed static outputs."""
+        """Build one denoise step using own-modality scale/shift and cross-modality gating."""
         transformer_args = self.simple_preprocessor.prepare(
             modality,
             static_context=static_context,
             static_mask=static_mask,
             static_pe=static_pe,
         )
+        if cross_modality is None:
+            return transformer_args
+        batch_size = transformer_args.x.shape[0]
+        cross_modality_sigma = cross_modality.sigma
+        if cross_modality_sigma is None:
+            # Preserve scalar-timestep callers from before Modality carried an
+            # explicit sigma. Masked per-token timesteps are ambiguous and must
+            # provide the upstream-compatible scalar sigma explicitly.
+            if cross_modality.timesteps.ndim != 1:
+                raise ValueError("cross modality must provide a per-batch sigma")
+            cross_modality_sigma = cross_modality.timesteps
+        if cross_modality_sigma.ndim > 1 or cross_modality_sigma.numel() != batch_size:
+            raise ValueError(
+                "cross modality sigma must be scalar per batch: "
+                f"got shape {tuple(cross_modality_sigma.shape)} for batch size {batch_size}"
+            )
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
-            timestep=modality.timesteps,
+            modality_timesteps=modality.timesteps,
+            cross_modality_sigma=cross_modality_sigma,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
-            batch_size=transformer_args.x.shape[0],
+            batch_size=batch_size,
             hidden_dtype=modality.latent.dtype,
         )
         return replace(
@@ -305,26 +323,36 @@ class MultiModalTransformerArgsPreprocessor:
 
     def _prepare_cross_attention_timestep(
         self,
-        timestep: torch.Tensor,
+        modality_timesteps: torch.Tensor,
+        cross_modality_sigma: torch.Tensor,
         timestep_scale_multiplier: int,
         batch_size: int,
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        timestep = timestep * timestep_scale_multiplier
+        modality_timesteps = modality_timesteps * timestep_scale_multiplier
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
         scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            timestep.flatten(), hidden_dtype=hidden_dtype
+            modality_timesteps.flatten(), hidden_dtype=hidden_dtype
         )
         scale_shift_timestep = scale_shift_timestep.view(
             batch_size, -1, scale_shift_timestep.shape[-1]
         )
 
         gate_noise_timestep, _ = self.cross_gate_adaln(
-            timestep.flatten() * av_ca_factor, hidden_dtype=hidden_dtype
+            (cross_modality_sigma * timestep_scale_multiplier * av_ca_factor).flatten(),
+            hidden_dtype=hidden_dtype,
         )
         gate_noise_timestep = gate_noise_timestep.view(
             batch_size, -1, gate_noise_timestep.shape[-1]
         )
+        if gate_noise_timestep.shape[1] != scale_shift_timestep.shape[1]:
+            # The upstream gate is scalar per batch and broadcasts over the
+            # modality tokens. Native fused AdaLN kernels require gate and
+            # scale/shift modulators to have the same row count, so materialize
+            # that broadcast only for masked per-token timesteps.
+            gate_noise_timestep = gate_noise_timestep.expand(
+                -1, scale_shift_timestep.shape[1], -1
+            ).contiguous()
 
         return scale_shift_timestep, gate_noise_timestep

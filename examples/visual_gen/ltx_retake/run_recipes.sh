@@ -9,12 +9,13 @@
 # Workflows: delete_disfluency, add_word, replace_word.
 # Recipes default to bf16. FP8/NVFP4 are opt-in Blackwell recipes.
 #
-# Env overrides: LTX_CHECKPOINT, LTX_PROMPT_CONDITIONING, LTX_TEXT_ENCODER,
-#                LTX_PROMPT, LTX_START, LTX_END, OUT_DIR.
+# Env overrides: LTX_CHECKPOINT, LTX_LORA, LTX_PROMPT_CONDITIONING,
+#                LTX_TEXT_ENCODER, LTX_PROMPT, LTX_START, LTX_END, OUT_DIR.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRTLLM_REPO="${TRTLLM_REPO:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 CKPT="${LTX_CHECKPOINT:-}"
+LORA="${LTX_LORA:-}"
 GEMMA="${LTX_TEXT_ENCODER:-}"
 PROMPT_CONDITIONING="${LTX_PROMPT_CONDITIONING:-${SCRIPT_DIR}/default_prompt_conditioning.safetensors}"
 INPUT="${1:?usage: run_recipes.sh <workflow|source.mp4> [recipe ...]}"
@@ -33,6 +34,9 @@ prompt_cache_ready() {
 [ -n "${CKPT}" ] || die "set LTX_CHECKPOINT to the checkpoint path"
 case "${CKPT}" in /*) ;; *) die "LTX_CHECKPOINT must be an absolute path: ${CKPT}" ;; esac
 [ -f "${CKPT}" ] || die "checkpoint file does not exist: ${CKPT}"
+[ -n "${LORA}" ] || die "set LTX_LORA to the TalkVid LoRA path"
+case "${LORA}" in /*) ;; *) die "LTX_LORA must be an absolute path: ${LORA}" ;; esac
+[ -e "${LORA}" ] || die "TalkVid LoRA path does not exist: ${LORA}"
 case "${PROMPT_CONDITIONING}" in
   /*) ;;
   *) die "LTX_PROMPT_CONDITIONING must be an absolute path: ${PROMPT_CONDITIONING}" ;;
@@ -137,6 +141,7 @@ for name in "${RECIPES[@]}"; do
   echo "======== ${INPUT} / ${name} start $(date +%H:%M:%S) ========"
   python3 "$EX" \
     --checkpoint "$CKPT" \
+    --lora "$LORA" \
     --prompt-conditioning-cache "$PROMPT_CONDITIONING" \
     "${TEXT_ENCODER_ARGS[@]}" "${PROMPT_ARGS[@]}" \
     --source "$SRC" --output "${OUT_DIR}/retake_${name}.mp4" \

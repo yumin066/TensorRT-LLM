@@ -30,11 +30,11 @@
       "input": "../delete_disfluency_retake_input.mp4",
       "input_sha256": "269ca85b7e326c60b8f193ec71f78b005dbf2a5eefd9d1436f3eafe2868bdc58",
       "output": "delete_disfluency_retake_output.mp4",
-      "output_sha256": "fe3ee919ceffa1cc9cee7a0cd96f4c060b04969555d3adc66839a9deece249c7",
-      "output_size_bytes": 2295367,
+      "output_sha256": "cea03e74fc6b6d90bcc39a6be5aebec854301efc049d82671cfc3103e08bd9f4",
+      "output_size_bytes": 2284592,
       "retake_window_seconds": [
-        2.966666666666667,
-        3.933333333333333
+        2.9667,
+        3.9333
       ],
       "bridge_frame_range": [
         89,

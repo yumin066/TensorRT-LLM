@@ -2457,6 +2457,7 @@ class LTXModel(BaseDiffusionModel):
                 text_cache.video_mask,
                 text_cache.video_pe,
                 text_cache.video_cross_pe,
+                cross_modality=audio,
             )
             if video is not None
             else None
@@ -2469,6 +2470,7 @@ class LTXModel(BaseDiffusionModel):
                 text_cache.audio_mask,
                 text_cache.audio_pe,
                 text_cache.audio_cross_pe,
+                cross_modality=video,
             )
             if audio is not None
             else None

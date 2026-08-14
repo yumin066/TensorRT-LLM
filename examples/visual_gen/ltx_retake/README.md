@@ -38,7 +38,8 @@ time to select which GPU is visible.
 - Access to the pinned TensorRT-LLM rc22 image in NGC. Authenticate with
   `docker login nvcr.io` before running the start script.
 - This complete TensorRT-LLM checkout. Run commands from its repository root.
-- The approved LTX-2.3 22B distilled checkpoint on the host. A Gemma
+- The approved LTX-2.3 22B distilled checkpoint and TalkVid identity LoRA on
+  the host. A Gemma
   text-encoder bundle is additionally required for custom prompts or as a
   fallback when the bundled prompt-conditioning cache is unavailable.
   This package intentionally does not download model weights.
@@ -49,11 +50,13 @@ time to select which GPU is visible.
   references, and default prompt conditioning:
   `git lfs pull --include='examples/visual_gen/ltx_retake/*_retake_input.mp4,examples/visual_gen/ltx_retake/golden_reference/*.mp4,examples/visual_gen/ltx_retake/default_prompt_conditioning.safetensors'`.
 
-A default-prompt run only needs the LTX checkpoint. A custom-prompt layout is:
+A default-prompt run needs the LTX checkpoint and TalkVid LoRA. A
+custom-prompt layout is:
 
 ```text
 /absolute/path/to/models/
 ├── ltx-2.3-22b-distilled.safetensors
+├── talkvid-id-lora.safetensors
 └── gemma/
     ├── config.json
     ├── model*.safetensors
@@ -62,6 +65,8 @@ A default-prompt run only needs the LTX checkpoint. A custom-prompt layout is:
 
 The tested LTX checkpoint SHA-256 is
 `b33b7fe4bbfe084f484be4aaf90b0f1d95dca20d403ac4c0e037eb8c4f0af7cc`.
+The tested TalkVid LoRA SHA-256 is
+`e5af73441743b4852f228b03e444888dff3da80d2666033af2367ab7bda6d8b9`.
 
 ## Quick start: H200 BF16
 
@@ -73,6 +78,7 @@ model variables into the container.
 cd /absolute/path/to/TensorRT-LLM
 
 export LTX_CHECKPOINT=/absolute/path/to/models/ltx-2.3-22b-distilled.safetensors
+export LTX_LORA=/absolute/path/to/models/talkvid-id-lora.safetensors
 RETAKE_DIR="$PWD/examples/visual_gen/ltx_retake"
 
 docker login nvcr.io
@@ -268,6 +274,7 @@ SHA-256 checksums. The add/replace inputs use the first matching cases from
 | Variable | Purpose | Default |
 |---|---|---|
 | `LTX_CHECKPOINT` | Absolute LTX checkpoint path | Required |
+| `LTX_LORA` | Absolute TalkVid identity-LoRA path; fused at strength 1.0 | Required |
 | `LTX_PROMPT_CONDITIONING` | Absolute default-prompt conditioning cache | Bundled cache |
 | `LTX_TEXT_ENCODER` | Absolute Gemma directory | Custom prompts/fallback only |
 | `LTX_CONTAINER_NAME` | Container name | `ltx_retake` |
@@ -299,9 +306,9 @@ Common failures:
 
 - **NGC pull denied:** authenticate to `nvcr.io` with an account entitled to
   the pinned TensorRT-LLM image.
-- **Model path error:** set `LTX_CHECKPOINT` and, for custom prompts,
-  `LTX_TEXT_ENCODER` to absolute existing host paths before starting the
-  container. They are validated before any build.
+- **Model path error:** set `LTX_CHECKPOINT`, `LTX_LORA`, and, for custom
+  prompts, `LTX_TEXT_ENCODER` to absolute existing host paths before starting
+  the container. They are validated before any build.
 - **Prompt-conditioning mismatch:** fetch the Git LFS cache matching the tested
   checkpoint, rebuild it with the exporter, or provide `LTX_TEXT_ENCODER` for
   live Gemma fallback.
