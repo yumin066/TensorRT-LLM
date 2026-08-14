@@ -9,14 +9,14 @@
 # Workflows: delete_disfluency, add_word, replace_word.
 # Recipes default to bf16. FP8/NVFP4 are opt-in Blackwell recipes.
 #
-# Env overrides: LTX_CHECKPOINT, LTX_TEXT_ENCODER, LTX_PROMPT, LTX_START,
-#                LTX_END, OUT_DIR.
+# Env overrides: LTX_CHECKPOINT, LTX_PROMPT_CONDITIONING, LTX_TEXT_ENCODER,
+#                LTX_PROMPT, LTX_START, LTX_END, OUT_DIR.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRTLLM_REPO="${TRTLLM_REPO:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 CKPT="${LTX_CHECKPOINT:-}"
 GEMMA="${LTX_TEXT_ENCODER:-}"
-PROMPT="${LTX_PROMPT:-a person talking to the camera, natural head motion, clear speech}"
+PROMPT_CONDITIONING="${LTX_PROMPT_CONDITIONING:-${SCRIPT_DIR}/default_prompt_conditioning.safetensors}"
 INPUT="${1:?usage: run_recipes.sh <workflow|source.mp4> [recipe ...]}"
 shift
 RECIPES=("$@"); [ ${#RECIPES[@]} -eq 0 ] && RECIPES=(bf16)
@@ -26,12 +26,32 @@ die() {
   exit 2
 }
 
+prompt_cache_ready() {
+  [ -f "$1" ] && ! head -c 64 "$1" | LC_ALL=C grep -qF 'version https://git-lfs.github.com/spec/v1'
+}
+
 [ -n "${CKPT}" ] || die "set LTX_CHECKPOINT to the checkpoint path"
-[ -n "${GEMMA}" ] || die "set LTX_TEXT_ENCODER to the Gemma directory"
 case "${CKPT}" in /*) ;; *) die "LTX_CHECKPOINT must be an absolute path: ${CKPT}" ;; esac
-case "${GEMMA}" in /*) ;; *) die "LTX_TEXT_ENCODER must be an absolute path: ${GEMMA}" ;; esac
 [ -f "${CKPT}" ] || die "checkpoint file does not exist: ${CKPT}"
-[ -d "${GEMMA}" ] || die "text encoder directory does not exist: ${GEMMA}"
+case "${PROMPT_CONDITIONING}" in
+  /*) ;;
+  *) die "LTX_PROMPT_CONDITIONING must be an absolute path: ${PROMPT_CONDITIONING}" ;;
+esac
+if [ -n "${GEMMA}" ]; then
+  case "${GEMMA}" in /*) ;; *) die "LTX_TEXT_ENCODER must be an absolute path: ${GEMMA}" ;; esac
+  [ -d "${GEMMA}" ] || die "text encoder directory does not exist: ${GEMMA}"
+elif ! prompt_cache_ready "${PROMPT_CONDITIONING}"; then
+  die "prompt-conditioning cache is missing or still a Git LFS pointer; run git lfs pull or set LTX_TEXT_ENCODER for Gemma fallback"
+fi
+
+PROMPT_ARGS=()
+if [ -n "${LTX_PROMPT+x}" ]; then
+  PROMPT_ARGS=(--prompt "${LTX_PROMPT}")
+fi
+TEXT_ENCODER_ARGS=()
+if [ -n "${GEMMA}" ]; then
+  TEXT_ENCODER_ARGS=(--text-encoder "${GEMMA}")
+fi
 
 case "${INPUT}" in
   delete_disfluency)
@@ -116,9 +136,11 @@ for name in "${RECIPES[@]}"; do
   esac
   echo "======== ${INPUT} / ${name} start $(date +%H:%M:%S) ========"
   python3 "$EX" \
-    --checkpoint "$CKPT" --text-encoder "$GEMMA" \
+    --checkpoint "$CKPT" \
+    --prompt-conditioning-cache "$PROMPT_CONDITIONING" \
+    "${TEXT_ENCODER_ARGS[@]}" "${PROMPT_ARGS[@]}" \
     --source "$SRC" --output "${OUT_DIR}/retake_${name}.mp4" \
-    --start "$START" --end "$END" --prompt "$PROMPT" "${args[@]}"
+    --start "$START" --end "$END" "${args[@]}"
   echo "output: ${OUT_DIR}/retake_${name}.mp4"
   echo "======== ${INPUT} / ${name} end $(date +%H:%M:%S) ========"
 done

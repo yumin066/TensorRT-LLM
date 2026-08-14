@@ -81,6 +81,7 @@ ad-test-workspace/
 
 # build/debug
 *.safetensors
+!examples/visual_gen/ltx_retake/default_prompt_conditioning.safetensors
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch

@@ -4,8 +4,9 @@
 
 This pipeline keeps a resident retake model for ``trtllm-serve``. A native
 ``LTX2Pipeline`` companion shares the retake pipeline's transformer and provides
-the VAE, scheduler, Gemma text encoder, and connectors. Retake generalizes the
-native image-to-video mask to condition both sides of the regenerated window.
+the VAE and scheduler. It either loads Gemma plus the LTX connectors for a live
+prompt or consumes precomputed post-connector conditioning. Retake generalizes
+the native image-to-video mask to condition both sides of the regenerated window.
 
 Source video/audio decode, stream metadata, audio/video VAE encode, diffusion,
 and VAE decode all use TensorRT-LLM's native LTX-2 implementation. PyAV is the
@@ -20,6 +21,7 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput, RetakeStageTimer
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -37,6 +39,11 @@ from .pipeline_ltx2 import (
     _find_safetensors_files,
     _load_ltx2_transformer_weights,
     build_ltx2_transformer,
+)
+from .retake_prompt_conditioning import (
+    DEFAULT_RETAKE_MAX_SEQUENCE_LENGTH,
+    RetakePromptConditioning,
+    normalize_retake_prompt,
 )
 
 # Distilled retake noise schedule (8 Euler steps).
@@ -280,8 +287,9 @@ class _NativeLTX2Companion(LTX2Pipeline):
 
     Constructed by :class:`LTX2RetakePipeline` so the native retake pre/post
     path reuses the native video VAE encoder/decoder, video patchifier,
-    scheduler, Gemma text encoder, and connectors while the masked denoise runs
-    on the retake pipeline's already-built native transformer. The transformer
+    and scheduler while the masked denoise runs on the retake pipeline's
+    already-built native transformer. Prompt handling either uses precomputed
+    conditioning or loads Gemma and the native connectors. The transformer
     instance is shared (no second transformer is constructed and no transformer
     weights are loaded twice), and its CUDA-graph wrapping is owned by the retake
     pipeline, so this companion neither builds nor re-wraps it.
@@ -314,6 +322,7 @@ class LTX2RetakePipeline(BasePipeline):
         self._native = None
         self._decode_video_by_frame = None
         self._decode_audio_from_file = None
+        self._prompt_conditioning: Optional[RetakePromptConditioning] = None
         super().__init__(pipeline_config)
 
     @property
@@ -445,27 +454,42 @@ class LTX2RetakePipeline(BasePipeline):
         skip_components: Optional[list] = None,
         *,
         text_encoder_path: str = "",
+        prompt_conditioning: Optional[RetakePromptConditioning] = None,
         **kwargs,
     ) -> None:
         self._device = device
         self._checkpoint_dir = checkpoint_dir
-        if not text_encoder_path:
+        self._prompt_conditioning = prompt_conditioning
+        if prompt_conditioning is None and not text_encoder_path:
             raise ValueError(
-                "LTX-2 retake workflow requires pipeline_config.text_encoder_path "
-                "to point at the Gemma text encoder directory."
+                "LTX-2 retake requires either precomputed prompt conditioning or "
+                "pipeline_config.text_encoder_path pointing at the Gemma text encoder."
             )
-        self._load_native_retake_components(checkpoint_dir, device, text_encoder_path)
+        self._load_native_retake_components(
+            checkpoint_dir,
+            device,
+            text_encoder_path,
+            skip_components=skip_components,
+            use_prompt_conditioning=prompt_conditioning is not None,
+        )
 
     def _load_native_retake_components(
-        self, checkpoint_dir: str, device: torch.device, text_encoder_path: str
+        self,
+        checkpoint_dir: str,
+        device: torch.device,
+        text_encoder_path: str,
+        *,
+        skip_components: Optional[list] = None,
+        use_prompt_conditioning: bool = False,
     ) -> None:
         """Load the native pre/post companion and source-media readers.
 
         Builds a native ``LTX2Pipeline`` that shares this pipeline's native
         transformer (so no second transformer is constructed and no transformer
         weights are loaded twice) and loads its native video VAE encoder/decoder,
-        patchifier, scheduler, Gemma text encoder, and connectors. Source video,
-        metadata, and audio are decoded by the native PyAV readers.
+        patchifier, and scheduler. Gemma and the native connectors are loaded only
+        for live prompt encoding. Source video, metadata, and audio are decoded by
+        the native PyAV readers.
         """
         from .ltx2_core.media_io import (
             decode_audio_from_file,
@@ -477,21 +501,34 @@ class LTX2RetakePipeline(BasePipeline):
         self._decode_video_by_frame = decode_video_by_frame
         self._decode_audio_from_file = decode_audio_from_file
 
+        text_source = (
+            "precomputed prompt conditioning" if use_prompt_conditioning else text_encoder_path
+        )
         logger.info(
             "Loading LTX-2 native retake pre/post components "
-            f"(checkpoint={checkpoint_dir}, text_encoder={text_encoder_path})"
+            f"(checkpoint={checkpoint_dir}, text_source={text_source})"
         )
         native = _NativeLTX2Companion(self.pipeline_config, self.transformer)
         # The native retake path is video-only: it uses the video VAE encoder/
-        # decoder, the text encoder + video/audio embedding connectors, and the
-        # scheduler, but never the audio VAE decoder or the vocoder. Skip loading
-        # those so retake neither wastes memory on them nor depends on their
-        # checkpoint-specific config parity.
+        # decoder and scheduler, but never the audio VAE decoder or vocoder.
+        # Live prompts additionally use Gemma plus the video/audio text connectors;
+        # cached prompts skip all three. Avoid loading unused components so retake
+        # neither wastes memory nor depends on their checkpoint-specific config.
+        native_skip_components = list(skip_components or [])
+        native_skip_components.extend(["audio_vae", "vocoder"])
+        if use_prompt_conditioning:
+            native_skip_components.extend(
+                [
+                    PipelineComponent.TOKENIZER,
+                    PipelineComponent.TEXT_ENCODER,
+                    "connectors",
+                ]
+            )
         native.load_standard_components(
             checkpoint_dir,
             device,
             text_encoder_path=text_encoder_path,
-            skip_components=["audio_vae", "vocoder"],
+            skip_components=list(dict.fromkeys(native_skip_components)),
         )
         # Derived attribute used to build the video latent shape; normally set by
         # LTX2Pipeline.post_load_weights, which we skip to avoid re-running the
@@ -557,14 +594,47 @@ class LTX2RetakePipeline(BasePipeline):
     # Native retake pre/post runtime path
     # ------------------------------------------------------------------
 
+    def _prepare_prompt_conditioning(
+        self,
+        native: LTX2Pipeline,
+        prompt: str,
+        max_sequence_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return cached default conditioning or encode a request with Gemma."""
+        if self._prompt_conditioning is not None:
+            cached_prompt = self._prompt_conditioning.prompt
+            normalized_prompt = normalize_retake_prompt(prompt)
+            if normalized_prompt != cached_prompt:
+                raise ValueError(
+                    "The loaded retake prompt conditioning does not match the request: "
+                    f"cache={cached_prompt!r}, request={normalized_prompt!r}"
+                )
+            if max_sequence_length != self._prompt_conditioning.max_sequence_length:
+                raise ValueError(
+                    "The loaded retake prompt conditioning uses a different max sequence "
+                    f"length: cache={self._prompt_conditioning.max_sequence_length}, "
+                    f"request={max_sequence_length}"
+                )
+            logger.info("Using precomputed LTX-2 retake prompt conditioning.")
+            return self._prompt_conditioning.tensors(device, dtype)
+
+        prompt_embeds, prompt_attention_mask = native._encode_prompt(
+            prompt,
+            num_videos_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+        )
+        return native._process_connectors(prompt_embeds, prompt_attention_mask)
+
     def _run_native_pre_post_retake(
         self, req, extra, video_path, start_time, end_time, prompt, timer=None
     ):
         """Run native source encode, masked denoise, and full-clip decode.
 
         Reuses the native ``LTX2Pipeline`` machinery (video VAE encoder/decoder,
-        video patchifier, scheduler, Gemma text encoder + connectors, and the
-        masked-denoise entry :meth:`LTX2Pipeline._masked_transformer_step`) with
+        video patchifier, scheduler, prompt conditioning, and the masked-denoise
+        entry :meth:`LTX2Pipeline._masked_transformer_step`) with
         retake-specific inputs: initial latents seeded from the encoded source,
         a two-sided ``denoise_mask`` conditioning the leading + trailing context
         while regenerating the middle window, and a two-sided ``clean_latent``
@@ -666,15 +736,12 @@ class LTX2RetakePipeline(BasePipeline):
             video_shape, cond_latent_frame_ranges=conditioned_latent_ranges
         )
 
-        # ---- 4. Native prompt encode + connectors + text cache ----------
-        max_sequence_length = getattr(req.params, "max_sequence_length", None) or 1024
-        prompt_embeds, prompt_attention_mask = native._encode_prompt(
-            prompt,
-            num_videos_per_prompt=1,
-            max_sequence_length=max_sequence_length,
+        # ---- 4. Native prompt conditioning + text cache -----------------
+        max_sequence_length = (
+            getattr(req.params, "max_sequence_length", None) or DEFAULT_RETAKE_MAX_SEQUENCE_LENGTH
         )
-        video_embeds, audio_embeds, connector_mask = native._process_connectors(
-            prompt_embeds, prompt_attention_mask
+        video_embeds, audio_embeds, connector_mask = self._prepare_prompt_conditioning(
+            native, prompt, max_sequence_length, device, dtype
         )
 
         video_positions = native.video_patchifier.get_patch_grid_bounds(video_shape, device=device)
@@ -714,12 +781,12 @@ class LTX2RetakePipeline(BasePipeline):
             dtype=dtype,
         )
 
-        # Prepare the resident FP8 transformer's own text
-        # cache (prepare_text_cache runs the model's quantized cross-attention
-        # context) while both transformers are resident, then offload the Gemma
-        # text encoder to CPU. Gemma is only used for the prompt encode above; the
-        # single-process retake frees its ~24GB so the NVFP4 + FP8 transformers
-        # fit alongside the denoise activations.
+        # Prepare the resident FP8 transformer's own text cache while both
+        # transformers are resident. If this request used live Gemma encoding,
+        # offload Gemma after the text caches are built so the NVFP4 + FP8
+        # transformers fit alongside the denoise activations. Cached prompts have
+        # no text encoder to offload. Keep this condition tied to the resident FP8
+        # transformer; NVFP4 by itself does not trigger offload.
         fp8_step_tf = getattr(native, "_fp8_step_transformer", None)
         if fp8_step_tf is not None:
             native._fp8_step_text_cache = fp8_step_tf.prepare_text_cache(

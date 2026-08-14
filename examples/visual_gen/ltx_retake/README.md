@@ -3,8 +3,10 @@
 This directory is the customer runbook for the native TensorRT-LLM LTX-2.3
 retake workflow. Given a prepared `retake_input.mp4` and a half-open retake
 window `[start, end)`, it produces a complete `retake_output.mp4` with native
-TensorRT-LLM VAE encode/decode, Gemma text encoding, and LTX diffusion. It does
-not import the third-party LTX pipeline.
+TensorRT-LLM VAE encode/decode and LTX diffusion. The bundled default prompt
+uses precomputed native Gemma + LTX-connector conditioning; a custom prompt
+loads Gemma and encodes it at runtime. It does not import the third-party LTX
+pipeline.
 
 The three bundled inputs exercise delete-disfluency, add-word, and replace-word
 retake. `run_recipes.sh` selects their input video and timestamps by workflow
@@ -36,16 +38,18 @@ time to select which GPU is visible.
 - Access to the pinned TensorRT-LLM rc22 image in NGC. Authenticate with
   `docker login nvcr.io` before running the start script.
 - This complete TensorRT-LLM checkout. Run commands from its repository root.
-- The approved LTX-2.3 22B distilled checkpoint and Gemma text-encoder bundle
-  on the host. This package intentionally does not download model weights.
+- The approved LTX-2.3 22B distilled checkpoint on the host. A Gemma
+  text-encoder bundle is additionally required for custom prompts or as a
+  fallback when the bundled prompt-conditioning cache is unavailable.
+  This package intentionally does not download model weights.
 - Internet access to the package index during setup. The SM120 setup also needs
   GitHub access to build pinned FlashInfer PR #4272. An air-gapped FlashInfer
   source archive can be supplied with `FLASHINFER_SHARED_ARCHIVE`.
 - Git LFS content available for the bundled retake inputs. If LPIPS evaluation
   is required, fetch its golden archive at the same time:
-  `git lfs pull --include='examples/visual_gen/ltx_retake/*_retake_input.mp4,tests/integration/defs/examples/visual_gen/golden/visual_gen_lpips/visual_gen_lpips_golden_media.zip'`.
+  `git lfs pull --include='examples/visual_gen/ltx_retake/*_retake_input.mp4,examples/visual_gen/ltx_retake/default_prompt_conditioning.safetensors,tests/integration/defs/examples/visual_gen/golden/visual_gen_lpips/visual_gen_lpips_golden_media.zip'`.
 
-A typical model layout is:
+A default-prompt run only needs the LTX checkpoint. A custom-prompt layout is:
 
 ```text
 /absolute/path/to/models/
@@ -69,7 +73,6 @@ model variables into the container.
 cd /absolute/path/to/TensorRT-LLM
 
 export LTX_CHECKPOINT=/absolute/path/to/models/ltx-2.3-22b-distilled.safetensors
-export LTX_TEXT_ENCODER=/absolute/path/to/models/gemma
 RETAKE_DIR="$PWD/examples/visual_gen/ltx_retake"
 
 docker login nvcr.io
@@ -180,6 +183,51 @@ docker cp \
 `LTX_START` must be smaller than `LTX_END`; both are measured in seconds and
 describe the half-open interval `[start, end)` in this specific input video.
 
+The command above uses the bundled default-prompt conditioning and does not
+load Gemma. To use a custom prompt, set and mount Gemma when first starting the
+container. If the default-prompt container already exists, recreate it
+explicitly with `LTX_REPLACE_CONTAINER=1`:
+
+```bash
+export LTX_TEXT_ENCODER=/absolute/path/to/models/gemma
+export LTX_REPLACE_CONTAINER=1  # omit this for the initial container start
+bash "${RETAKE_DIR}/start_container.sh"
+unset LTX_REPLACE_CONTAINER
+
+docker exec -u "$(id -u):$(id -g)" \
+  -e LTX_PROMPT='a presenter explaining a product to the camera' \
+  -e LTX_START=3.0 -e LTX_END=4.5 \
+  -e OUT_DIR=/tmp/ltx_retake/custom_prompt \
+  ltx_retake bash "${RETAKE_DIR}/run_recipes.sh" \
+  /absolute/path/to/customer_media/retake_input.mp4 bf16
+```
+
+If the default cache is missing or does not match the checkpoint, the runner
+falls back to Gemma when `LTX_TEXT_ENCODER` is available; otherwise it fails
+before loading the diffusion transformer.
+
+## Rebuild the default prompt conditioning
+
+The checked-in cache is tied to the tested checkpoint SHA-256 above. Rebuild it
+only when changing the default prompt, Gemma bundle, tokenizer, or LTX
+checkpoint. Run on a CUDA GPU with enough memory for Gemma and the text
+connectors:
+
+```bash
+python3 "${RETAKE_DIR}/export_prompt_conditioning.py" \
+  --checkpoint "${LTX_CHECKPOINT}" \
+  --text-encoder "${LTX_TEXT_ENCODER}" \
+  --text-encoder-id google/gemma-3-12b-it-qat-q4_0-unquantized \
+  --checkpoint-sha256 b33b7fe4bbfe084f484be4aaf90b0f1d95dca20d403ac4c0e037eb8c4f0af7cc \
+  --output "${RETAKE_DIR}/default_prompt_conditioning.safetensors"
+```
+
+The exporter saves `video_embeds`, `audio_embeds`, and `connector_mask`, then
+reloads them and requires bitwise equality before succeeding. Runtime cache
+selection uses a fast checkpoint fingerprint (shard sizes and safetensors
+configuration metadata); the full SHA-256 remains recorded for audit without
+re-reading the 46 GB checkpoint at every invocation.
+
 ## Delete-disfluency LPIPS evaluation
 
 `lpips_eval.sh` is specific to the bundled delete-disfluency case because its
@@ -218,7 +266,8 @@ SHA-256 checksums. The add/replace inputs use the first matching cases from
 | Variable | Purpose | Default |
 |---|---|---|
 | `LTX_CHECKPOINT` | Absolute LTX checkpoint path | Required |
-| `LTX_TEXT_ENCODER` | Absolute Gemma directory | Required |
+| `LTX_PROMPT_CONDITIONING` | Absolute default-prompt conditioning cache | Bundled cache |
+| `LTX_TEXT_ENCODER` | Absolute Gemma directory | Custom prompts/fallback only |
 | `LTX_CONTAINER_NAME` | Container name | `ltx_retake` |
 | `LTX_IMAGE` | Locally built delivery image tag | `ltx-retake:rc22` |
 | `LTX_BASE_IMAGE` | Base container reference | Pinned tested rc22 digest |
@@ -248,8 +297,12 @@ Common failures:
 
 - **NGC pull denied:** authenticate to `nvcr.io` with an account entitled to
   the pinned TensorRT-LLM image.
-- **Model path error:** set both model variables to absolute existing host
-  paths before starting the container. They are validated before any build.
+- **Model path error:** set `LTX_CHECKPOINT` and, for custom prompts,
+  `LTX_TEXT_ENCODER` to absolute existing host paths before starting the
+  container. They are validated before any build.
+- **Prompt-conditioning mismatch:** fetch the Git LFS cache matching the tested
+  checkpoint, rebuild it with the exporter, or provide `LTX_TEXT_ENCODER` for
+  live Gemma fallback.
 - **CUDA out of memory:** use H200 for the bundled full-resolution BF16 cases,
   reduce input resolution in upstream preprocessing, or use a validated SM120
   quantized recipe.
@@ -267,5 +320,7 @@ Common failures:
 | `setup_sm120_env.sh` | Install the native overlay/dependencies, build pinned FlashInfer, and preflight Blackwell SM120. |
 | `run_recipes.sh` | Run a prepared workflow or customer-prepared input with selected recipes. |
 | `run_nvfp4.sh` | Run the tuned SM120 NVFP4 recipe for all or selected prepared workflows. |
+| `export_prompt_conditioning.py` | Rebuild and validate the default-prompt conditioning cache. |
+| `default_prompt_conditioning.safetensors` | Git LFS artifact containing the tested default prompt's post-connector tensors. |
 | `lpips_eval.sh` | Compare bundled delete-disfluency output with the upstream golden. |
 | `Dockerfile`, `entrypoint.sh` | Thin image layer and host-user entrypoint. |

@@ -911,6 +911,7 @@ class LTX2Pipeline(BasePipeline):
         skip_components: Optional[list] = None,
         *,
         text_encoder_path: str = "",
+        prefetch_safetensors: bool = True,
         **kwargs,
     ) -> None:
         """Load all non-transformer components.
@@ -930,6 +931,9 @@ class LTX2Pipeline(BasePipeline):
             text_encoder_path: Path to the Gemma3 model directory.
                 Must contain model weights (``model*.safetensors``),
                 tokenizer files, and ``preprocessor_config.json``.
+            prefetch_safetensors: Warm the complete checkpoint in the host page
+                cache before component loading. Connector-only export disables
+                this because it reads only a small subset of a monolithic file.
         """
         skip_components = skip_components or []
         dtype = self.pipeline_config.torch_dtype
@@ -966,7 +970,8 @@ class LTX2Pipeline(BasePipeline):
         # --- Resolve native config ----------------------------------------
         native_config = self.pipeline_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
-        _prefetch_ltx2_safetensors_files(sft_paths)
+        if prefetch_safetensors:
+            _prefetch_ltx2_safetensors_files(sft_paths)
 
         if native_config is None and sft_paths:
             native_config = _read_safetensors_config(sft_paths[0])

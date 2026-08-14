@@ -71,9 +71,10 @@ LTX2_LPIPS_THRESHOLD = 0.05
 LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
 
 # LTX-2.3 native retake (delete-disfluency). The source lives in the regular
-# golden-media archive; model paths remain environment-configurable because the
-# 22B checkpoint and Gemma are not test artifacts. The existing retake golden is
-# an upstream reference and is intentionally not used as a native pixel oracle.
+# golden-media archive; the 22B checkpoint remains environment-configurable and
+# the default prompt conditioning ships with the example. The existing retake
+# golden is an upstream reference and is intentionally not used as a native
+# pixel oracle.
 LTX2_RETAKE_START_SECONDS = 2.9667
 LTX2_RETAKE_END_SECONDS = 3.9333
 LTX2_RETAKE_EXPECTED_FRAMES = 209
@@ -83,7 +84,13 @@ LTX2_RETAKE_EXPECTED_FPS = 30.0
 LTX2_RETAKE_EXPECTED_AUDIO_RATE = 48000
 LTX2_RETAKE_CHECKPOINT_SUBPATH = ("LTX-2.3", "ltx-2.3-22b-distilled.safetensors")
 LTX2_RETAKE_CHECKPOINT_ENV = "LTX2_RETAKE_CHECKPOINT"
-LTX2_RETAKE_TEXT_ENCODER_ENV = "LTX2_RETAKE_TEXT_ENCODER"
+LTX2_RETAKE_PROMPT_CONDITIONING = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "visual_gen",
+    "ltx_retake",
+    "default_prompt_conditioning.safetensors",
+)
 
 WAN21_LPIPS_PROMPT = "A cat sitting on a windowsill"
 WAN21_LPIPS_NEGATIVE_PROMPT = None
@@ -1042,10 +1049,10 @@ def _generate_ltx2_retake_native_bf16_video(tmp_path, output_path):
         *LTX2_RETAKE_CHECKPOINT_SUBPATH
     )
     _skip_if_missing(checkpoint, "LTX-2.3 retake checkpoint")
-    text_encoder = os.environ.get(LTX2_RETAKE_TEXT_ENCODER_ENV)
-    if not text_encoder:
-        pytest.skip(f"set {LTX2_RETAKE_TEXT_ENCODER_ENV} to the Gemma3 model directory")
-    _skip_if_missing(text_encoder, "LTX-2.3 Gemma text encoder", is_dir=True)
+    _skip_if_missing(
+        LTX2_RETAKE_PROMPT_CONDITIONING,
+        "LTX-2.3 default retake prompt conditioning",
+    )
 
     example = os.path.join(REPO_ROOT, "examples", "visual_gen", "ltx2_retake_e2e.py")
     check_call(
@@ -1054,8 +1061,8 @@ def _generate_ltx2_retake_native_bf16_video(tmp_path, output_path):
             example,
             "--checkpoint",
             checkpoint,
-            "--text-encoder",
-            text_encoder,
+            "--prompt-conditioning-cache",
+            LTX2_RETAKE_PROMPT_CONDITIONING,
             "--source",
             str(source),
             "--output",

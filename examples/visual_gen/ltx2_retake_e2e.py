@@ -31,26 +31,35 @@ Example::
 
     python examples/visual_gen/ltx2_retake_e2e.py \\
         --checkpoint /path/to/ltx-2.3-22b-distilled.safetensors \\
-        --text-encoder /path/to/gemma-3-12b-it \\
         --source retake_input.mp4 --output retake_output.mp4 \\
         --start "$RETAKE_START" --end "$RETAKE_END" \\
         --prompt "a person talking to the camera, natural head motion, clear speech"
 
+The bundled default-prompt conditioning skips Gemma loading and encoding. Pass
+``--text-encoder`` when using a custom prompt or as a fallback when the cache is
+unavailable or incompatible with the checkpoint.
+
 ``--start`` and ``--end`` intentionally have no defaults: every caller must
 provide the window associated with its own ``retake_input.mp4``.
 
-Note: the full-resolution 22B retake (source + Gemma text encoder + 22B
-transformer resident) needs a large-memory GPU (e.g. H200 141GB); an 80GB GPU
-can OOM at full resolution.
+Note: the full-resolution 22B retake needs a large-memory GPU (e.g. H200
+141GB); custom prompts additionally keep Gemma resident unless a resident FP8
+step transformer triggers the existing offload path. An 80GB GPU can OOM at
+full resolution.
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
+
+_DEFAULT_PROMPT_CONDITIONING = (
+    Path(__file__).resolve().parent / "ltx_retake" / "default_prompt_conditioning.safetensors"
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -63,8 +72,19 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--text-encoder",
-        required=True,
-        help="Gemma3 text encoder directory (config.json + model*.safetensors + tokenizer).",
+        default=None,
+        help=(
+            "Gemma3 text encoder directory. Required for a custom prompt and used "
+            "as fallback if the default-prompt conditioning cache is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-conditioning-cache",
+        default=str(_DEFAULT_PROMPT_CONDITIONING),
+        help=(
+            "Safetensors cache for the default prompt's post-connector conditioning. "
+            "Ignored for a custom prompt."
+        ),
     )
     parser.add_argument("--source", required=True, help="Source video to retake (.mp4).")
     parser.add_argument("--output", required=True, help="Output decoded retake video (.mp4).")
@@ -94,7 +114,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="a person talking to the camera, natural head motion, clear speech",
+        default=_default_retake_prompt(),
         help="Text prompt for the regenerated window.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -145,11 +165,79 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _default_retake_prompt() -> str:
+    from tensorrt_llm._torch.visual_gen.models.ltx2.retake_prompt_conditioning import (
+        DEFAULT_RETAKE_PROMPT,
+    )
+
+    return DEFAULT_RETAKE_PROMPT
+
+
+def _resolve_prompt_conditioning(args: argparse.Namespace):
+    """Select cached default conditioning or the live Gemma fallback."""
+    from safetensors import SafetensorError
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2.retake_prompt_conditioning import (
+        DEFAULT_RETAKE_MAX_SEQUENCE_LENGTH,
+        checkpoint_fingerprint,
+        is_default_retake_prompt,
+        load_retake_prompt_conditioning,
+    )
+
+    if is_default_retake_prompt(args.prompt) and args.prompt_conditioning_cache:
+        cache_path = Path(args.prompt_conditioning_cache)
+        if cache_path.is_file():
+            try:
+                print(
+                    f"[retake] validating prompt conditioning: {cache_path}",
+                    flush=True,
+                )
+                conditioning = load_retake_prompt_conditioning(
+                    cache_path,
+                    expected_prompt=args.prompt,
+                    expected_max_sequence_length=DEFAULT_RETAKE_MAX_SEQUENCE_LENGTH,
+                    expected_checkpoint_fingerprint=checkpoint_fingerprint(args.checkpoint),
+                )
+                print(
+                    f"[retake] using precomputed prompt conditioning: {cache_path}",
+                    flush=True,
+                )
+                return conditioning
+            except (OSError, SafetensorError, ValueError) as error:
+                if not args.text_encoder:
+                    raise RuntimeError(
+                        "The default-prompt conditioning cache is invalid and no "
+                        "--text-encoder was provided for fallback."
+                    ) from error
+                print(
+                    "[retake] WARNING: prompt-conditioning cache is unusable; "
+                    f"falling back to Gemma ({error})",
+                    flush=True,
+                )
+        elif not args.text_encoder:
+            raise FileNotFoundError(
+                "The default-prompt conditioning cache is missing and no --text-encoder "
+                f"was provided for fallback: {cache_path}"
+            )
+
+    if not args.text_encoder:
+        raise ValueError(
+            "--text-encoder is required when the prompt is not served by a valid "
+            "prompt-conditioning cache."
+        )
+    text_encoder_path = Path(args.text_encoder)
+    if not text_encoder_path.is_dir():
+        raise FileNotFoundError(f"Gemma text encoder directory does not exist: {text_encoder_path}")
+    print(f"[retake] using live Gemma text encoding: {text_encoder_path}", flush=True)
+    return None
+
+
 def _build_retake_pipeline(
     checkpoint: str,
-    text_encoder: str,
+    text_encoder: str | None,
     device: torch.device,
     lora,
+    prompt_conditioning=None,
     quant_algo=None,
     fp8_linear_steps=None,
     nvfp4_attn=False,
@@ -202,7 +290,12 @@ def _build_retake_pipeline(
     pipeline_config.cuda_graph.enable = False
 
     pipe = LTX2RetakePipeline(pipeline_config)
-    pipe.load_standard_components(checkpoint, device, text_encoder_path=text_encoder)
+    pipe.load_standard_components(
+        checkpoint,
+        device,
+        text_encoder_path=text_encoder or "",
+        prompt_conditioning=prompt_conditioning,
+    )
     pipe.load_weights(pipe.load_transformer_weights(checkpoint))
     pipe.post_load_weights()
     if nvfp4_attn:
@@ -375,6 +468,7 @@ def main() -> None:
     if args.start >= args.end:
         raise ValueError(f"--start ({args.start}) must be < --end ({args.end}).")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prompt_conditioning = _resolve_prompt_conditioning(args)
 
     recipe = args.quant_algo or "bf16"
     if args.fp8_linear_step:
@@ -387,7 +481,8 @@ def main() -> None:
         args.text_encoder,
         device,
         args.lora,
-        args.quant_algo,
+        prompt_conditioning=prompt_conditioning,
+        quant_algo=args.quant_algo,
         fp8_linear_steps=args.fp8_linear_step,
         nvfp4_attn=args.nvfp4_attn,
     )

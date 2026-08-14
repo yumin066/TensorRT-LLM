@@ -14,7 +14,8 @@
 #
 # Env overrides:
 #   LTX_CHECKPOINT       absolute path to the LTX-2.3 checkpoint (required)
-#   LTX_TEXT_ENCODER     absolute path to the Gemma directory (required)
+#   LTX_PROMPT_CONDITIONING absolute path to a default-prompt cache (bundled default)
+#   LTX_TEXT_ENCODER     absolute Gemma directory (required only for custom prompts/fallback)
 #   LTX_CONTAINER_NAME   container name           (default ltx_retake)
 #   LTX_IMAGE            built delivery image tag (default ltx-retake:rc22)
 #   LTX_BASE_IMAGE       base image ref           (default: the pinned digest)
@@ -35,6 +36,7 @@ IMAGE="${LTX_IMAGE:-ltx-retake:rc22}"
 BASE_IMAGE="${LTX_BASE_IMAGE:-${DEFAULT_BASE_IMAGE_DIGEST}}"
 CHECKPOINT="${LTX_CHECKPOINT:-}"
 TEXT_ENCODER="${LTX_TEXT_ENCODER:-}"
+PROMPT_CONDITIONING="${LTX_PROMPT_CONDITIONING:-${SCRIPT_DIR}/default_prompt_conditioning.safetensors}"
 LTX_MOUNTS="${LTX_MOUNTS:-}"
 
 die() {
@@ -42,12 +44,26 @@ die() {
   exit 2
 }
 
+prompt_cache_ready() {
+  [ -f "$1" ] && ! head -c 64 "$1" | LC_ALL=C grep -qF 'version https://git-lfs.github.com/spec/v1'
+}
+
 [ -n "${CHECKPOINT}" ] || die "set LTX_CHECKPOINT to the absolute host path of the LTX-2.3 checkpoint"
-[ -n "${TEXT_ENCODER}" ] || die "set LTX_TEXT_ENCODER to the absolute host path of the Gemma directory"
 case "${CHECKPOINT}" in /*) ;; *) die "LTX_CHECKPOINT must be an absolute path: ${CHECKPOINT}" ;; esac
-case "${TEXT_ENCODER}" in /*) ;; *) die "LTX_TEXT_ENCODER must be an absolute path: ${TEXT_ENCODER}" ;; esac
 [ -f "${CHECKPOINT}" ] || die "checkpoint file does not exist: ${CHECKPOINT}"
-[ -d "${TEXT_ENCODER}" ] || die "text encoder directory does not exist: ${TEXT_ENCODER}"
+case "${PROMPT_CONDITIONING}" in
+  /*) ;;
+  *) die "LTX_PROMPT_CONDITIONING must be an absolute path: ${PROMPT_CONDITIONING}" ;;
+esac
+if [ -n "${TEXT_ENCODER}" ]; then
+  case "${TEXT_ENCODER}" in
+    /*) ;;
+    *) die "LTX_TEXT_ENCODER must be an absolute path: ${TEXT_ENCODER}" ;;
+  esac
+  [ -d "${TEXT_ENCODER}" ] || die "text encoder directory does not exist: ${TEXT_ENCODER}"
+elif ! prompt_cache_ready "${PROMPT_CONDITIONING}"; then
+  die "prompt-conditioning cache is missing or still a Git LFS pointer; run git lfs pull or set LTX_TEXT_ENCODER for Gemma fallback"
+fi
 
 replace_existing=0
 if docker container inspect "${NAME}" >/dev/null 2>&1; then
@@ -80,12 +96,15 @@ args=(
   -e "HOME=/tmp/ltx_retake_home"
   -e "TRTLLM_REPO=${TRTLLM_REPO}"
   -e "LTX_CHECKPOINT=${CHECKPOINT}"
-  -e "LTX_TEXT_ENCODER=${TEXT_ENCODER}"
+  -e "LTX_PROMPT_CONDITIONING=${PROMPT_CONDITIONING}"
   # Do not use an NFS checkout as the OCI working directory: root-squashed NFS
   # can reject the runtime's pre-entrypoint chdir. Scripts are invoked by their
   # absolute mounted paths instead.
   -w /tmp
 )
+if [ -n "${TEXT_ENCODER}" ]; then
+  args+=( -e "LTX_TEXT_ENCODER=${TEXT_ENCODER}" )
+fi
 # Always mount this checkout and both model locations, plus configured extras.
 mount_seen=" "
 add_mount() {
@@ -98,7 +117,13 @@ add_mount() {
 }
 add_mount "${TRTLLM_REPO}"
 add_mount "$(dirname "${CHECKPOINT}")"
-add_mount "${TEXT_ENCODER}"
+if [ -n "${TEXT_ENCODER}" ]; then
+  add_mount "${TEXT_ENCODER}"
+fi
+case "${PROMPT_CONDITIONING}" in
+  "${TRTLLM_REPO}"/*) ;;
+  *) add_mount "${PROMPT_CONDITIONING}" ;;
+esac
 if [ -n "${LTX_MOUNTS}" ]; then
   read -r -a extra_mounts <<< "${LTX_MOUNTS}"
   for path in "${extra_mounts[@]}"; do add_mount "${path}"; done
