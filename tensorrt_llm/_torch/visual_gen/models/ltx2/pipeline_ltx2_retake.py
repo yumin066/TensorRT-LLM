@@ -693,8 +693,8 @@ class LTX2RetakePipeline(BasePipeline):
         )
         if timer is not None:
             timer.mark("vae_encode")
-        # Keep the encoder result in the model dtype. The initial noise blend
-        # below widens it to float32 without losing any BF16 values.
+        # Match upstream GaussianNoiser: source latents and sampled noise both
+        # start in the model dtype, while the blend/math path widens internally.
         source_window_latents = native._encode_video_window(source_norm_5d, _RETAKE_TILING_CONFIG)
         if timer is not None:
             timer.mark("conditioning")
@@ -710,7 +710,7 @@ class LTX2RetakePipeline(BasePipeline):
             video_shape.to_torch_shape(),
             generator=generator,
             device=device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
         initial_latents = _init_retake_latents(
             noise_latents, source_window_latents, conditioned_latent_ranges
@@ -817,9 +817,7 @@ class LTX2RetakePipeline(BasePipeline):
             _sigs = scheduler.sigmas.float()
             # Requantize the audio state to the model dtype after every Euler step.
             a_clean = audio_clean_latents.to(dtype)
-            _an = torch.randn(
-                a_clean.shape, generator=generator, device=device, dtype=torch.float32
-            )
+            _an = torch.randn(a_clean.shape, generator=generator, device=device, dtype=dtype)
             a_cur = (_an * _sigs[0] + a_clean.float() * (1.0 - _sigs[0])).to(dtype)
             _traj = [a_cur]
             for _i in range(num_steps):
