@@ -130,35 +130,38 @@ def _retake_conditioned_latent_ranges(
     return cond_ranges
 
 
-def _init_retake_latents(
+def _init_retake_patchified_latents(
     noise_latents: torch.Tensor,
     source_latents: torch.Tensor,
-    cond_latent_ranges: list,
+    denoise_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Initialize native retake video latents for the two-sided window.
+    """Initialize retake latents in upstream's patchified token layout.
 
-    Both tensors are ``(B, C, T_lat, H, W)`` and must share shape. The conditioned
-    context latent frames (``cond_latent_ranges`` from
-    :func:`_retake_conditioned_latent_ranges`) are taken from ``source_latents``
-    (the ``_encode_video_window`` output); every other latent frame — the
-    regenerated middle window — keeps the seeded ``noise_latents``. Returns a new
-    tensor; inputs are unmodified. Ranges are clamped to ``[0, T_lat]``.
+    Upstream ``GaussianNoiser`` samples noise after ``VideoLatentTools`` has
+    patchified ``(B, C, T, H, W)`` latents into ``(B, tokens, C)``. Sampling in
+    5D and then patchifying produces a different seeded random field because the
+    memory order changes. Keep this helper in patchified space so seed 42 means
+    the same thing as in the upstream retake pipeline.
     """
-    if noise_latents.dim() != 5:
-        raise ValueError(f"expected (B, C, T, H, W) latents; got {tuple(noise_latents.shape)}")
     if noise_latents.shape != source_latents.shape:
         raise ValueError(
             f"noise/source latent shape mismatch: {tuple(noise_latents.shape)} vs "
             f"{tuple(source_latents.shape)}"
         )
-    out = noise_latents.clone()
-    total_latent = noise_latents.shape[2]
-    for start_frame, end_frame in cond_latent_ranges:
-        start_frame = max(0, start_frame)
-        end_frame = min(total_latent, end_frame)
-        if end_frame > start_frame:
-            out[:, :, start_frame:end_frame] = source_latents[:, :, start_frame:end_frame]
-    return out
+    if denoise_mask.dim() == 2:
+        mask = denoise_mask.unsqueeze(-1)
+    elif denoise_mask.dim() == 3:
+        mask = denoise_mask
+    else:
+        raise ValueError(f"expected denoise mask rank 2 or 3, got {tuple(denoise_mask.shape)}")
+    if mask.shape[:2] != source_latents.shape[:2] or mask.shape[-1] != 1:
+        raise ValueError(
+            f"denoise mask shape {tuple(denoise_mask.shape)} is not compatible with "
+            f"patchified latents {tuple(source_latents.shape)}"
+        )
+    return torch.lerp(source_latents.float(), noise_latents.float(), mask.float()).to(
+        source_latents.dtype
+    )
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:
@@ -706,35 +709,26 @@ class LTX2RetakePipeline(BasePipeline):
                 f"{expected_latent_shape}; check source resolution/frame count."
             )
 
+        denoise_mask = native._build_denoise_mask(
+            video_shape, cond_latent_frame_ranges=conditioned_latent_ranges
+        )
+        source_patch_latents = native.video_patchifier.patchify(source_window_latents)
         noise_latents = torch.randn(
-            video_shape.to_torch_shape(),
+            source_patch_latents.shape,
             generator=generator,
             device=device,
             dtype=dtype,
         )
-        initial_latents = _init_retake_latents(
-            noise_latents, source_window_latents, conditioned_latent_ranges
-        )
         # Denoising carries the latent in the model dtype and requantizes it at
         # every Euler step; retaining the float32 blend would change the trajectory.
-        latents = native.video_patchifier.patchify(initial_latents).to(dtype)
+        latents = _init_retake_patchified_latents(
+            noise_latents, source_patch_latents, denoise_mask
+        ).to(dtype)
 
-        # The conditioned x0 target follows the encoded source dtype, not the
-        # float32 noise dtype.
-        clean_5d = torch.zeros_like(source_window_latents)
-        total_latent = video_shape.frames
-        for start_frame, end_frame in conditioned_latent_ranges:
-            start_frame = max(0, start_frame)
-            end_frame = min(total_latent, end_frame)
-            if end_frame > start_frame:
-                clean_5d[:, :, start_frame:end_frame] = source_window_latents[
-                    :, :, start_frame:end_frame
-                ]
-        clean_latent = native.video_patchifier.patchify(clean_5d)
-
-        denoise_mask = native._build_denoise_mask(
-            video_shape, cond_latent_frame_ranges=conditioned_latent_ranges
-        )
+        # Match upstream's clean_latent: the full encoded source in patchified
+        # layout. Tokens with denoise_mask=1 ignore it; conditioned tokens use it
+        # in post_process_latent after every transformer prediction.
+        clean_latent = source_patch_latents
 
         # ---- 4. Native prompt conditioning + text cache -----------------
         max_sequence_length = (
