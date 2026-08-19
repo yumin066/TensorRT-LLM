@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,153 @@ class LTX2RetakeResult:
     has_audio: bool
     audio_sample_rate: int | None
     stage_timings: dict[str, float] | None
+
+
+class LTX2RetakeEngine:
+    """Persistent native LTX-2 retake engine.
+
+    Build this once with :meth:`from_pretrained`, then call :meth:`retake` for
+    warmup and measured requests. The model, LoRA, quantization recipe, prompt
+    conditioning, and native retake pipeline remain resident across requests.
+    """
+
+    def __init__(self, pipe, *, prompt: str, num_inference_steps: int = 8):
+        if num_inference_steps != 8:
+            raise ValueError(
+                "native LTX-2 retake currently supports the distilled 8-step schedule only"
+            )
+        self._pipe = pipe
+        self._prompt = prompt
+        self._num_inference_steps = num_inference_steps
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        *,
+        checkpoint: str,
+        prompt: str | None = None,
+        text_encoder: str | None = None,
+        prompt_conditioning_cache: str | None = None,
+        lora: str | None = None,
+        lora_strength: float = 1.0,
+        quant_algo: str | None = None,
+        nvfp4_attn: bool = False,
+        fp8_linear_steps: list[int] | tuple[int, ...] | None = None,
+        num_inference_steps: int = 8,
+        device: torch.device | str | None = None,
+    ) -> "LTX2RetakeEngine":
+        if num_inference_steps != 8:
+            raise ValueError(
+                "native LTX-2 retake currently supports the distilled 8-step schedule only"
+            )
+
+        prompt = prompt or _default_retake_prompt()
+        device = (
+            torch.device(device)
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        args = SimpleNamespace(
+            checkpoint=checkpoint,
+            prompt=prompt,
+            text_encoder=text_encoder,
+            prompt_conditioning_cache=prompt_conditioning_cache,
+        )
+        prompt_conditioning = _resolve_prompt_conditioning(args)
+        recipe = _recipe_label(quant_algo, fp8_linear_steps, nvfp4_attn, lora, lora_strength)
+        print(f"[retake] building persistent native retake pipeline ({recipe})...", flush=True)
+        pipe = _build_retake_pipeline(
+            checkpoint,
+            text_encoder,
+            device,
+            lora,
+            lora_strength=lora_strength,
+            prompt_conditioning=prompt_conditioning,
+            quant_algo=quant_algo,
+            fp8_linear_steps=fp8_linear_steps,
+            nvfp4_attn=nvfp4_attn,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print("[retake] persistent pipeline ready", flush=True)
+        return cls(pipe, prompt=prompt, num_inference_steps=num_inference_steps)
+
+    def retake(
+        self,
+        *,
+        source: str,
+        output: str,
+        start: float,
+        end: float,
+        prompt: str | None = None,
+        seed: int = 42,
+        num_inference_steps: int | None = None,
+        dump_frames: str | None = None,
+    ) -> LTX2RetakeResult:
+        """Run one hot retake request and write the full retake clip to ``output``."""
+        if start >= end:
+            raise ValueError(f"start ({start}) must be < end ({end}).")
+        steps = self._num_inference_steps if num_inference_steps is None else num_inference_steps
+        if steps != 8:
+            raise ValueError(
+                "native LTX-2 retake currently supports the distilled 8-step schedule only"
+            )
+
+        args = SimpleNamespace(
+            source=source,
+            output=output,
+            start=start,
+            end=end,
+            prompt=prompt or self._prompt,
+            seed=seed,
+            num_inference_steps=steps,
+        )
+        print("[retake] running infer...", flush=True)
+        infer_t0 = time.perf_counter()
+        out = self._pipe.infer(_make_request(args))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        infer_wall = time.perf_counter() - infer_t0
+
+        video = out.video
+        if video is None or video.dim() != 5:
+            raise RuntimeError("retake pipeline did not produce a video tensor")
+        print(
+            f"[retake] video={tuple(video.shape)} fps={out.frame_rate} "
+            f"stage_timings={out.stage_timings}",
+            flush=True,
+        )
+
+        if dump_frames:
+            torch.save({"video": video.cpu(), "frame_rate": float(out.frame_rate)}, dump_frames)
+            print(f"[retake] dumped pre-encode frames to {dump_frames}", flush=True)
+
+        encode_t0 = time.perf_counter()
+        num_frames = _save_video(
+            video,
+            float(out.frame_rate),
+            output,
+            audio=out.audio,
+            audio_sample_rate=out.audio_sample_rate,
+        )
+        mp4_encode_mux = time.perf_counter() - encode_t0
+        has_audio = out.audio is not None and out.audio_sample_rate is not None
+        print(
+            f"[retake] saved {output} ({num_frames} frames, "
+            f"audio={'yes @ ' + str(out.audio_sample_rate) + ' Hz' if has_audio else 'none'})",
+            flush=True,
+        )
+        stage_timings = dict(out.stage_timings or {})
+        stage_timings.setdefault("infer_wall", infer_wall)
+        stage_timings.setdefault("mp4_encode_mux", mp4_encode_mux)
+        return LTX2RetakeResult(
+            output_path=output,
+            num_frames=num_frames,
+            frame_rate=float(out.frame_rate),
+            has_audio=bool(has_audio),
+            audio_sample_rate=out.audio_sample_rate,
+            stage_timings=stage_timings,
+        )
 
 
 def run_ltx2_retake(
@@ -47,94 +195,46 @@ def run_ltx2_retake(
     ``source`` is the retake input clip. ``start`` and ``end`` are local
     timestamps within that clip for the regenerated window.
     """
-    if start >= end:
-        raise ValueError(f"start ({start}) must be < end ({end}).")
-    if num_inference_steps != 8:
-        raise ValueError(
-            "native LTX-2 retake currently supports the distilled 8-step schedule only"
-        )
-
-    prompt = prompt or _default_retake_prompt()
-    device = (
-        torch.device(device)
-        if device is not None
-        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    args = SimpleNamespace(
+    trtllm_engine = LTX2RetakeEngine.from_pretrained(
         checkpoint=checkpoint,
+        prompt=prompt,
+        text_encoder=text_encoder,
+        prompt_conditioning_cache=prompt_conditioning_cache,
+        lora=lora,
+        lora_strength=lora_strength,
+        quant_algo=quant_algo,
+        fp8_linear_steps=list(fp8_linear_steps or []),
+        nvfp4_attn=nvfp4_attn,
+        num_inference_steps=num_inference_steps,
+        device=device,
+    )
+    return trtllm_engine.retake(
         source=source,
         output=output,
         start=start,
         end=end,
         prompt=prompt,
         seed=seed,
-        text_encoder=text_encoder,
-        prompt_conditioning_cache=prompt_conditioning_cache,
-        lora=lora,
-        lora_strength=lora_strength,
-        quant_algo=quant_algo,
-        fp8_linear_step=list(fp8_linear_steps or []),
-        nvfp4_attn=nvfp4_attn,
         num_inference_steps=num_inference_steps,
+        dump_frames=dump_frames,
     )
 
-    prompt_conditioning = _resolve_prompt_conditioning(args)
+
+def _recipe_label(
+    quant_algo: str | None,
+    fp8_linear_steps: list[int] | tuple[int, ...] | None,
+    nvfp4_attn: bool,
+    lora: str | None,
+    lora_strength: float,
+) -> str:
     recipe = quant_algo or "bf16"
-    if args.fp8_linear_step:
-        recipe += f"+fp8@{sorted(set(args.fp8_linear_step))}"
+    if fp8_linear_steps:
+        recipe += f"+fp8@{sorted(set(fp8_linear_steps))}"
     if nvfp4_attn:
         recipe += "+nvfp4attn"
     if lora:
         recipe += f"+lora@{lora_strength}"
-    print(f"[retake] building native retake pipeline ({recipe})...", flush=True)
-    pipe = _build_retake_pipeline(
-        checkpoint,
-        text_encoder,
-        device,
-        lora,
-        lora_strength=lora_strength,
-        prompt_conditioning=prompt_conditioning,
-        quant_algo=quant_algo,
-        fp8_linear_steps=args.fp8_linear_step,
-        nvfp4_attn=nvfp4_attn,
-    )
-
-    print("[retake] loaded; running infer...", flush=True)
-    out = pipe.infer(_make_request(args))
-    video = out.video
-    if video is None or video.dim() != 5:
-        raise RuntimeError("retake pipeline did not produce a video tensor")
-    print(
-        f"[retake] video={tuple(video.shape)} fps={out.frame_rate} "
-        f"stage_timings={out.stage_timings}",
-        flush=True,
-    )
-
-    if dump_frames:
-        torch.save({"video": video.cpu(), "frame_rate": float(out.frame_rate)}, dump_frames)
-        print(f"[retake] dumped pre-encode frames to {dump_frames}", flush=True)
-
-    num_frames = _save_video(
-        video,
-        float(out.frame_rate),
-        output,
-        audio=out.audio,
-        audio_sample_rate=out.audio_sample_rate,
-    )
-    has_audio = out.audio is not None and out.audio_sample_rate is not None
-    print(
-        f"[retake] saved {output} ({num_frames} frames, "
-        f"audio={'yes @ ' + str(out.audio_sample_rate) + ' Hz' if has_audio else 'none'})",
-        flush=True,
-    )
-    return LTX2RetakeResult(
-        output_path=output,
-        num_frames=num_frames,
-        frame_rate=float(out.frame_rate),
-        has_audio=bool(has_audio),
-        audio_sample_rate=out.audio_sample_rate,
-        stage_timings=out.stage_timings,
-    )
+    return recipe
 
 
 def _default_retake_prompt() -> str:

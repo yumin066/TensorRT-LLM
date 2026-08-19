@@ -118,6 +118,43 @@ for workflow in delete_disfluency add_word replace_word; do
 done
 ```
 
+## Python hot API
+
+For service or hot-latency benchmarking, create one persistent retake engine and
+reuse it across requests. The first `retake()` call can be used as warmup; later
+calls use the same loaded model and pipeline.
+
+```python
+from tensorrt_llm._torch.visual_gen.models.ltx2 import LTX2RetakeEngine
+
+trtllm_engine = LTX2RetakeEngine.from_pretrained(
+    checkpoint="/path/to/models/ltx-2.3-22b-distilled.safetensors",
+    text_encoder="/path/to/models/gemma",
+    prompt_conditioning_cache="/path/to/default_prompt_conditioning.safetensors",
+    lora="/path/to/models/talkvid-id-lora.safetensors",
+    quant_algo="NVFP4",
+    nvfp4_attn=True,
+    fp8_linear_steps=[4, 7],
+)
+
+trtllm_engine.retake(
+    source="retake_input.mp4",
+    output="/tmp/warmup_retake_output.mp4",
+    start=2.9667,
+    end=3.9333,
+)
+result = trtllm_engine.retake(
+    source="retake_input.mp4",
+    output="retake_output.mp4",
+    start=2.9667,
+    end=3.9333,
+)
+print(result.stage_timings)
+```
+
+`run_ltx2_retake()` remains available as a one-shot convenience wrapper for CLI
+and simple scripts.
+
 ## Blackwell SM120 recipes
 
 Start the container with the same model variables, but run the SM120 setup:
