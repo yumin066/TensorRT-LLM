@@ -546,6 +546,15 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    pipeline: Optional[str] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Optional registered pipeline name. When set, this explicit pipeline "
+            "is used instead of checkpoint-based auto-detection."
+        ),
+    )
+
     revision: Optional[str] = Field(
         None,
         status="prototype",

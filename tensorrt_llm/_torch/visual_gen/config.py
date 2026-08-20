@@ -494,6 +494,22 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if value:
                 extra_attrs[key] = value
 
+        # LTX-2 retake is an independently registered pipeline over the same
+        # checkpoint format. Keep its optional component settings isolated
+        # from the existing LTX-2 generation/two-stage option handling above.
+        for key in (
+            "retake_lora_path",
+            "retake_lora_strength",
+            "retake_prompt_conditioning_path",
+            "retake_start_time",
+            "retake_end_time",
+            "retake_seed",
+            "retake_fp8_linear_steps",
+            "retake_attention_backend",
+        ):
+            if key in resolved_pipeline_config:
+                extra_attrs[key] = resolved_pipeline_config[key]
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
         component_config_dicts: Dict[str, Dict[str, Any]] = {}

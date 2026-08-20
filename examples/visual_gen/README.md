@@ -41,6 +41,32 @@ python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-
 python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 ```
 
+LTX-2.3 retake takes an edited source video and regenerates the requested time
+window while conditioning on the surrounding frames:
+
+```bash
+python models/ltx2_retake.py \
+  --model /path/to/ltx-2.3-22b-distilled.safetensors \
+  --visual_gen_args configs/ltx2-retake-1gpu.yaml \
+  --source /path/to/retake_input.mp4 \
+  --text_encoder_path /path/to/gemma-3-12b-it \
+  --prompt "a person talking to the camera"
+```
+
+The selected YAML configures the start/end time, seed, prompt-conditioning
+path, LoRA path, and LoRA strength. To use precomputed text conditioning, set
+`retake_prompt_conditioning_path` in `pipeline_config` and omit
+`--text_encoder_path` and `--prompt`. The FP8 and NVFP4 recipes are in
+`configs/ltx2-retake-*-1gpu.yaml`.
+
+Retake source-media decoding and audio conditioning need two optional packages:
+
+```bash
+pip install av
+pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
+  torchaudio==2.11.0+cpu
+```
+
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 
 Output: `.png` for image models; `.mp4` for video models when FFmpeg is installed (otherwise `.avi`).
