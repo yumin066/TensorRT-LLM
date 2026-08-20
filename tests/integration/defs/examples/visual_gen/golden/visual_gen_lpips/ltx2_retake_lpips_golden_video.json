@@ -1,0 +1,21 @@
+{
+  "video": "ltx2_retake_lpips_golden_video.mp4",
+  "model": "LTX-2.3 22B distilled retake",
+  "source": "LTX2.3-eval upstream delete-disfluency pipeline",
+  "workflow": "delete_disfluency",
+  "reference": "upstream retake baseline",
+  "input": "retake_input.mp4",
+  "start_time_seconds": 2.9667,
+  "end_time_seconds": 3.9333,
+  "bridge_window": [89, 118],
+  "num_frames": 209,
+  "height": 1280,
+  "width": 704,
+  "frame_rate": 30.0,
+  "num_inference_steps": 8,
+  "seed": 42,
+  "lpips_net": "alex",
+  "checkpoint": "ltx-2.3-22b-distilled.safetensors",
+  "checkpoint_sha256": "b33b7fe4bbfe084f484be4aaf90b0f1d95dca20d403ac4c0e037eb8c4f0af7cc",
+  "notes": "Native TensorRT-LLM output is expected to differ at the pixel level; compare the regenerated half-open frame window [89,118) with LPIPS."
+}

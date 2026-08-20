@@ -52,6 +52,9 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )
+LTX2_RETAKE_LPIPS_EVAL_SCRIPT = os.path.join(
+    REPO_ROOT, "scripts", "visualgen_eval", "ltx2_retake_lpips_score_eval.py"
+)
 VISUAL_GEN_LPIPS_GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden", "visual_gen_lpips")
 VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
     VISUAL_GEN_LPIPS_GOLDEN_DIR, "visual_gen_lpips_golden_media.zip"
@@ -69,6 +72,24 @@ LTX2_LPIPS_NUM_FRAMES = 49
 LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_THRESHOLD = 0.05
 LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
+
+# LTX-2.3 native retake (delete-disfluency). The source lives in the regular
+# golden-media archive; the 22B checkpoint remains environment-configurable and
+# precomputed prompt conditioning ships with the golden-media fixture. The retake
+# golden is an upstream quality reference, not a bit-identical pixel oracle.
+LTX2_RETAKE_START_SECONDS = 2.9667
+LTX2_RETAKE_END_SECONDS = 3.9333
+LTX2_RETAKE_EXPECTED_FRAMES = 209
+LTX2_RETAKE_EXPECTED_HEIGHT = 1280
+LTX2_RETAKE_EXPECTED_WIDTH = 704
+LTX2_RETAKE_EXPECTED_FPS = 30.0
+LTX2_RETAKE_EXPECTED_AUDIO_RATE = 48000
+LTX2_RETAKE_CHECKPOINT_SUBPATH = ("LTX-2.3", "ltx-2.3-22b-distilled.safetensors")
+LTX2_RETAKE_CHECKPOINT_ENV = "LTX2_RETAKE_CHECKPOINT"
+LTX2_RETAKE_LPIPS_FRAME_START = 89
+LTX2_RETAKE_LPIPS_FRAME_STOP = 118
+LTX2_RETAKE_LPIPS_THRESHOLD = 0.08
+LTX2_RETAKE_PROMPT_CONDITIONING = "default_prompt_conditioning.safetensors"
 
 WAN21_LPIPS_PROMPT = "A cat sitting on a windowsill"
 WAN21_LPIPS_NEGATIVE_PROMPT = None
@@ -519,6 +540,44 @@ def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, gen
     scores = json.loads(output_json.read_text(encoding="utf-8"))
     score = float(scores["mean_lpips_score"])
     print(f"\n[E2E {sample_id} LPIPS] score: {score:.6f}")
+    return score
+
+
+def _run_ltx2_retake_lpips_eval(tmp_path, reference_path, generated_path):
+    output_json = tmp_path / "ltx2_retake_lpips_results.json"
+    env = os.environ.copy()
+    env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    env["PYTHONPATH"] = (
+        f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else REPO_ROOT
+    )
+    with _lpips_deterministic_algorithms():
+        result = subprocess.run(
+            [
+                sys.executable,
+                LTX2_RETAKE_LPIPS_EVAL_SCRIPT,
+                "--reference-video",
+                str(reference_path),
+                "--generated-video",
+                str(generated_path),
+                "--frame-start",
+                str(LTX2_RETAKE_LPIPS_FRAME_START),
+                "--frame-stop",
+                str(LTX2_RETAKE_LPIPS_FRAME_STOP),
+                "--output-json",
+                str(output_json),
+                "--json",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if result.returncode != 0:
+        pytest.fail(f"LTX-2 retake LPIPS eval failed:\n{result.stdout}")
+    score = float(json.loads(output_json.read_text(encoding="utf-8"))["mean_lpips_score"])
+    print(f"\n[E2E ltx2_retake LPIPS] score: {score:.6f}")
     return score
 
 
@@ -1005,6 +1064,110 @@ def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_
         "ltx2_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+def _generate_ltx2_retake_native_bf16_video(tmp_path, output_path):
+    """Run the native delete-disfluency retake example and return its output."""
+    source = _golden_media_path(
+        tmp_path,
+        "retake_input.mp4",
+        "LTX-2.3 delete-disfluency retake input",
+    )
+    prompt_conditioning = _golden_media_path(
+        tmp_path,
+        LTX2_RETAKE_PROMPT_CONDITIONING,
+        "LTX-2.3 retake prompt conditioning",
+    )
+    checkpoint = os.environ.get(LTX2_RETAKE_CHECKPOINT_ENV) or _lpips_model_path(
+        *LTX2_RETAKE_CHECKPOINT_SUBPATH
+    )
+    _skip_if_missing(checkpoint, "LTX-2.3 retake checkpoint")
+    example = os.path.join(REPO_ROOT, "examples", "visual_gen", "models", "ltx2_retake.py")
+    config = os.path.join(REPO_ROOT, "examples", "visual_gen", "configs", "ltx2-retake-1gpu.yaml")
+    check_call(
+        [
+            sys.executable,
+            example,
+            "--model",
+            checkpoint,
+            "--visual_gen_args",
+            config,
+            "--prompt_conditioning_path",
+            str(prompt_conditioning),
+            "--source",
+            str(source),
+            "--output_path",
+            str(output_path),
+            "--start",
+            str(LTX2_RETAKE_START_SECONDS),
+            "--end",
+            str(LTX2_RETAKE_END_SECONDS),
+        ],
+        shell=False,
+    )
+    assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def ltx2_retake_bf16_video_path(_visual_gen_deps, llm_venv, tmp_path_factory):
+    output_path = _visual_gen_output_path(llm_venv, "ltx2_retake_bf16")
+    if os.path.isfile(output_path):
+        return output_path
+    work_dir = tmp_path_factory.mktemp("ltx2_retake")
+    return _generate_ltx2_retake_native_bf16_video(work_dir, output_path)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_retake_native_bf16_smoke(ltx2_retake_bf16_video_path):
+    """Native delete-disfluency smoke test; upstream pixels are not an oracle."""
+    import av
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2_retake.media_io import (
+        decode_video_by_frame,
+        get_videostream_metadata,
+    )
+
+    metadata = get_videostream_metadata(str(ltx2_retake_bf16_video_path))
+    assert metadata.frames == LTX2_RETAKE_EXPECTED_FRAMES
+    assert metadata.height == LTX2_RETAKE_EXPECTED_HEIGHT
+    assert metadata.width == LTX2_RETAKE_EXPECTED_WIDTH
+    assert metadata.fps == pytest.approx(LTX2_RETAKE_EXPECTED_FPS)
+    assert (
+        sum(1 for _ in decode_video_by_frame(str(ltx2_retake_bf16_video_path), torch.device("cpu")))
+        == LTX2_RETAKE_EXPECTED_FRAMES
+    )
+
+    container = av.open(str(ltx2_retake_bf16_video_path))
+    try:
+        audio_streams = list(container.streams.audio)
+        assert len(audio_streams) == 1
+        assert audio_streams[0].rate == LTX2_RETAKE_EXPECTED_AUDIO_RATE
+        assert audio_streams[0].codec_context.channels == 2
+    finally:
+        container.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_retake_native_bf16_lpips(request, tmp_path, ltx2_retake_bf16_video_path):
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_golden_video.mp4",
+        "LTX-2.3 upstream retake LPIPS golden video",
+    )
+    score = _run_ltx2_retake_lpips_eval(
+        tmp_path,
+        golden_path,
+        ltx2_retake_bf16_video_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_RETAKE_LPIPS_THRESHOLD,
+        ltx2_retake_bf16_video_path,
+        "ltx2_retake_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX2_RETAKE_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

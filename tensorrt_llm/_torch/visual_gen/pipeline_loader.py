@@ -120,13 +120,14 @@ class PipelineLoader:
         """
         user_pipeline_config = dict(self.args.pipeline_config)
 
+        # Explicit registry names take precedence over checkpoint auto-detection.
         # Detect _class_name from the resolved checkpoint, look up the
         # registry entry. If detection fails (or the class_name isn't
         # registered) leave the validation to AutoPipeline.from_config
         # so the user gets the existing "Unknown pipeline" error rather
         # than a confusing pipeline_config validation error.
         try:
-            class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+            class_name = self.args.pipeline or AutoPipeline._detect_from_checkpoint(checkpoint_dir)
         except ValueError:
             return user_pipeline_config
 
@@ -247,12 +248,13 @@ class PipelineLoader:
         # =====================================================================
         # STEP 2: Create Pipeline with MetaInit
         # Pipeline type is auto-detected from model_index.json
+        # unless VisualGenArgs.pipeline names a registered pipeline.
         # - Meta tensors (no GPU memory until materialization)
         # - If quant_config specifies FP8, Linear layers have FP8 weight buffers
         # =====================================================================
         logger.info("Creating pipeline with MetaInitMode")
         with MetaInitMode():
-            pipeline = AutoPipeline.from_config(config, checkpoint_dir)
+            pipeline = AutoPipeline.from_config(config, checkpoint_dir, self.args.pipeline)
 
         # Convert meta tensors to CUDA tensors
         self._materialize_meta_tensors(pipeline)

@@ -1,0 +1,347 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
+
+"""Build retake transformer arguments from modality and text conditioning inputs."""
+
+from dataclasses import dataclass, replace
+
+import torch
+
+from ..ltx2.ltx2_core.adaln import AdaLayerNormSingle
+from ..ltx2.ltx2_core.rope import (
+    LTXRopeType,
+    _generate_freq_grid_np,
+    _generate_freq_grid_pytorch,
+    precompute_freqs_cis,
+)
+from ..ltx2.ltx2_core.text_projection import PixArtAlphaTextProjection
+from .modality import Modality
+
+
+@dataclass(frozen=True)
+class TransformerArgs:
+    x: torch.Tensor
+    context: torch.Tensor
+    context_mask: torch.Tensor | None
+    timesteps: torch.Tensor
+    embedded_timestep: torch.Tensor
+    positional_embeddings: tuple[torch.Tensor, torch.Tensor]
+    cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | None
+    cross_scale_shift_timestep: torch.Tensor | None
+    cross_gate_timestep: torch.Tensor | None
+    enabled: bool
+    # Optional [B, S_full_padded] bool mask (True=valid, False=pad) for the
+    # audio modality when Ulysses padding is engaged (T_a padded to be
+    # divisible by ulysses_size). Identical across Ulysses ranks (full-seq).
+    # None when no padding is applied.
+    audio_padding_mask: torch.Tensor | None = None
+    # Per-step prompt AdaLN output [B, T, 2*dim] for text-KV modulation.
+    prompt_timestep: torch.Tensor | None = None
+
+
+class TransformerArgsPreprocessor:
+    """Converts a Modality into TransformerArgs for transformer blocks.
+
+    Handles: patchify projection, AdaLN timestep embedding,
+    caption projection, attention mask preparation, and RoPE generation.
+    """
+
+    def __init__(
+        self,
+        patchify_proj: torch.nn.Module,
+        adaln: AdaLayerNormSingle,
+        caption_projection: PixArtAlphaTextProjection,
+        inner_dim: int,
+        max_pos: list[int],
+        num_attention_heads: int,
+        use_middle_indices_grid: bool,
+        timestep_scale_multiplier: int,
+        double_precision_rope: bool,
+        positional_embedding_theta: float,
+        rope_type: LTXRopeType,
+        prompt_adaln: AdaLayerNormSingle | None = None,
+    ) -> None:
+        self.patchify_proj = patchify_proj
+        self.adaln = adaln
+        self.caption_projection = caption_projection
+        self.inner_dim = inner_dim
+        self.max_pos = max_pos
+        self.num_attention_heads = num_attention_heads
+        self.use_middle_indices_grid = use_middle_indices_grid
+        self.timestep_scale_multiplier = timestep_scale_multiplier
+        self.double_precision_rope = double_precision_rope
+        self.positional_embedding_theta = positional_embedding_theta
+        self.rope_type = rope_type
+        self.prompt_adaln = prompt_adaln
+        self._freq_grid_cache: dict = {}
+
+    def _prepare_timestep(
+        self,
+        timestep: torch.Tensor,
+        batch_size: int,
+        hidden_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        timestep = timestep * self.timestep_scale_multiplier
+        timestep, embedded_timestep = self.adaln(timestep.flatten(), hidden_dtype=hidden_dtype)
+        timestep = timestep.view(batch_size, -1, timestep.shape[-1])
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
+        return timestep, embedded_timestep
+
+    def _prepare_context(
+        self,
+        context: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size = context.shape[0]
+        context = self.caption_projection(context.contiguous())
+        context = context.view(batch_size, -1, self.inner_dim)
+        return context, attention_mask
+
+    def _prepare_attention_mask(
+        self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        if attention_mask is None or torch.is_floating_point(attention_mask):
+            return attention_mask
+        return (attention_mask - 1).to(x_dtype).reshape(
+            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
+        ) * torch.finfo(x_dtype).max
+
+    def _prepare_positional_embeddings(
+        self,
+        positions: torch.Tensor | None,
+        inner_dim: int,
+        max_pos: list[int],
+        use_middle_indices_grid: bool,
+        num_attention_heads: int,
+        x_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        # Text context (Gemma output) has no positional encoding — skip RoPE.
+        if positions is None:
+            return None
+        freq_grid_generator = (
+            _generate_freq_grid_np if self.double_precision_rope else _generate_freq_grid_pytorch
+        )
+        return precompute_freqs_cis(
+            positions,
+            dim=inner_dim,
+            out_dtype=x_dtype,
+            theta=self.positional_embedding_theta,
+            max_pos=max_pos,
+            use_middle_indices_grid=use_middle_indices_grid,
+            num_attention_heads=num_attention_heads,
+            rope_type=self.rope_type,
+            freq_grid_generator=freq_grid_generator,
+            freq_grid_cache=self._freq_grid_cache,
+        )
+
+    def prepare_text_cache(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor], None]:
+        """Compute step-invariant outputs: (context, mask, PE, cross_PE).
+
+        Called once before the denoise loop.  Does not require latent data.
+        Returns cross_PE=None (only MultiModal subclass produces it).
+        """
+        context, attention_mask = self._prepare_context(context, context_mask)
+        attention_mask = self._prepare_attention_mask(attention_mask, dtype)
+        pe = self._prepare_positional_embeddings(
+            positions=positions,
+            inner_dim=self.inner_dim,
+            max_pos=self.max_pos,
+            use_middle_indices_grid=self.use_middle_indices_grid,
+            num_attention_heads=self.num_attention_heads,
+            x_dtype=dtype,
+        )
+        return context, attention_mask, pe, None
+
+    def prepare(
+        self,
+        modality: Modality,
+        static_context: torch.Tensor,
+        static_mask: torch.Tensor | None,
+        static_pe: tuple[torch.Tensor, torch.Tensor],
+    ) -> TransformerArgs:
+        """Build ``TransformerArgs`` for one denoise step."""
+        x = self.patchify_proj(modality.latent.contiguous())
+        timestep, embedded_timestep = self._prepare_timestep(
+            modality.timesteps, x.shape[0], modality.latent.dtype
+        )
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            if modality.sigma is None:
+                raise ValueError("cross-attention AdaLN requires a per-batch modality sigma")
+            raw_ts = modality.sigma * self.timestep_scale_multiplier  # (B,)
+            pt, _ = self.prompt_adaln(raw_ts, hidden_dtype=modality.latent.dtype)
+            prompt_timestep = pt.unsqueeze(1)  # (B, 1, 2*dim) — broadcasts over text tokens
+
+        return TransformerArgs(
+            x=x,
+            context=static_context,
+            context_mask=static_mask,
+            timesteps=timestep,
+            embedded_timestep=embedded_timestep,
+            positional_embeddings=static_pe,
+            cross_positional_embeddings=None,
+            cross_scale_shift_timestep=None,
+            cross_gate_timestep=None,
+            enabled=modality.enabled,
+            prompt_timestep=prompt_timestep,
+        )
+
+
+class MultiModalTransformerArgsPreprocessor:
+    """Extends TransformerArgsPreprocessor with cross-modal (AV) attention args."""
+
+    def __init__(
+        self,
+        patchify_proj: torch.nn.Module,
+        adaln: AdaLayerNormSingle,
+        caption_projection: PixArtAlphaTextProjection,
+        cross_scale_shift_adaln: AdaLayerNormSingle,
+        cross_gate_adaln: AdaLayerNormSingle,
+        inner_dim: int,
+        max_pos: list[int],
+        num_attention_heads: int,
+        cross_pe_max_pos: int,
+        use_middle_indices_grid: bool,
+        audio_cross_attention_dim: int,
+        timestep_scale_multiplier: int,
+        double_precision_rope: bool,
+        positional_embedding_theta: float,
+        rope_type: LTXRopeType,
+        av_ca_timestep_scale_multiplier: int,
+        prompt_adaln: AdaLayerNormSingle | None = None,
+    ) -> None:
+        self.simple_preprocessor = TransformerArgsPreprocessor(
+            patchify_proj=patchify_proj,
+            adaln=adaln,
+            caption_projection=caption_projection,
+            inner_dim=inner_dim,
+            max_pos=max_pos,
+            num_attention_heads=num_attention_heads,
+            use_middle_indices_grid=use_middle_indices_grid,
+            timestep_scale_multiplier=timestep_scale_multiplier,
+            double_precision_rope=double_precision_rope,
+            positional_embedding_theta=positional_embedding_theta,
+            rope_type=rope_type,
+            prompt_adaln=prompt_adaln,
+        )
+        self.cross_scale_shift_adaln = cross_scale_shift_adaln
+        self.cross_gate_adaln = cross_gate_adaln
+        self.cross_pe_max_pos = cross_pe_max_pos
+        self.audio_cross_attention_dim = audio_cross_attention_dim
+        self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
+
+    def prepare_text_cache(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        """Compute step-invariant outputs including cross-PE.
+
+        Returns (context, mask, pe, cross_pe).
+        """
+        sp = self.simple_preprocessor
+        context, mask, pe, _ = sp.prepare_text_cache(context, context_mask, positions, dtype)
+        cross_pe = (
+            sp._prepare_positional_embeddings(
+                positions=positions[:, 0:1, :],
+                inner_dim=self.audio_cross_attention_dim,
+                max_pos=[self.cross_pe_max_pos],
+                use_middle_indices_grid=True,
+                num_attention_heads=sp.num_attention_heads,
+                x_dtype=dtype,
+            )
+            if positions is not None
+            else None
+        )
+        return context, mask, pe, cross_pe
+
+    def prepare(
+        self,
+        modality: Modality,
+        static_context: torch.Tensor,
+        static_mask: torch.Tensor | None,
+        static_pe: tuple[torch.Tensor, torch.Tensor],
+        static_cross_pe: tuple[torch.Tensor, torch.Tensor],
+        cross_modality: Modality | None = None,
+    ) -> TransformerArgs:
+        """Build one denoise step using own-modality scale/shift and cross-modality gating."""
+        transformer_args = self.simple_preprocessor.prepare(
+            modality,
+            static_context=static_context,
+            static_mask=static_mask,
+            static_pe=static_pe,
+        )
+        if cross_modality is None:
+            return transformer_args
+        batch_size = transformer_args.x.shape[0]
+        cross_modality_sigma = cross_modality.sigma
+        if cross_modality_sigma is None:
+            raise ValueError("cross modality must provide a per-batch sigma")
+        if cross_modality_sigma.ndim > 1 or cross_modality_sigma.numel() != batch_size:
+            raise ValueError(
+                "cross modality sigma must be scalar per batch: "
+                f"got shape {tuple(cross_modality_sigma.shape)} for batch size {batch_size}"
+            )
+        cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
+            modality_timesteps=modality.timesteps,
+            cross_modality_sigma=cross_modality_sigma,
+            timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
+            batch_size=batch_size,
+            hidden_dtype=modality.latent.dtype,
+        )
+        return replace(
+            transformer_args,
+            cross_positional_embeddings=static_cross_pe,
+            cross_scale_shift_timestep=cross_scale_shift_timestep,
+            cross_gate_timestep=cross_gate_timestep,
+        )
+
+    def _prepare_cross_attention_timestep(
+        self,
+        modality_timesteps: torch.Tensor,
+        cross_modality_sigma: torch.Tensor,
+        timestep_scale_multiplier: int,
+        batch_size: int,
+        hidden_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        modality_timesteps = modality_timesteps * timestep_scale_multiplier
+        av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
+
+        scale_shift_timestep, _ = self.cross_scale_shift_adaln(
+            modality_timesteps.flatten(), hidden_dtype=hidden_dtype
+        )
+        scale_shift_timestep = scale_shift_timestep.view(
+            batch_size, -1, scale_shift_timestep.shape[-1]
+        )
+
+        gate_noise_timestep, _ = self.cross_gate_adaln(
+            (cross_modality_sigma * timestep_scale_multiplier * av_ca_factor).flatten(),
+            hidden_dtype=hidden_dtype,
+        )
+        gate_noise_timestep = gate_noise_timestep.view(
+            batch_size, -1, gate_noise_timestep.shape[-1]
+        )
+        if gate_noise_timestep.shape[1] != scale_shift_timestep.shape[1]:
+            # The upstream gate is scalar per batch and broadcasts over the
+            # modality tokens. Native fused AdaLN kernels require gate and
+            # scale/shift modulators to have the same row count, so materialize
+            # that broadcast only for masked per-token timesteps.
+            gate_noise_timestep = gate_noise_timestep.expand(
+                -1, scale_shift_timestep.shape[1], -1
+            ).contiguous()
+
+        return scale_shift_timestep, gate_noise_timestep

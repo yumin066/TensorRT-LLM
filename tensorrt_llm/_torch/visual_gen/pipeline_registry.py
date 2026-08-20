@@ -126,12 +126,14 @@ class AutoPipeline:
     def from_config(
         config: "DiffusionPipelineConfig",
         checkpoint_dir: str,
+        pipeline_name: Optional[str] = None,
     ) -> "BasePipeline":
         """
         Create pipeline instance from DiffusionPipelineConfig.
         """
+        # Explicit registry names take precedence over checkpoint auto-detection.
         # Detect pipeline type from model_index.json or from model safetensors
-        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+        class_name = pipeline_name or AutoPipeline._detect_from_checkpoint(checkpoint_dir)
 
         if class_name not in PIPELINE_REGISTRY:
             raise ValueError(
