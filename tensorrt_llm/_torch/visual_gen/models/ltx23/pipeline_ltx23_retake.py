@@ -27,6 +27,7 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, 
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.inputs.multimodal_data import AudioData
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..ltx2.ltx2_core.patchifier import get_pixel_coords
 from ..ltx2.ltx2_core.scheduler_adapter import NativeSchedulerAdapter
@@ -41,6 +42,12 @@ from ..ltx2.pipeline_ltx2 import _load_component_weights
 from .ltx23_core.audio_vae import AudioEncoderConfigurator, encode_audio
 from .ltx23_core.modality import LTX23Modality
 from .ltx23_core.video_vae_ltx23 import LTX23VideoEncoderConfigurator
+from .ltx23_core.video_vae_ltx23_nvfp4 import (
+    LTX23Nvfp4RetakeRecipe,
+    LTX23Nvfp4VideoDecoderConfigurator,
+    LTX23Nvfp4VideoEncoderConfigurator,
+    load_ltx23_nvfp4_retake_recipe,
+)
 from .media_io import (
     decode_audio_from_file,
     decode_video_by_frame,
@@ -303,7 +310,26 @@ class LTX23RetakePipeline(LTX23Pipeline):
         )
         self._fp8_step_text_cache: LTX23TextConditioning | None = None
         self._checkpoint_dir: str | None = None
+        self._retake_vae_nvfp4_recipe: LTX23Nvfp4RetakeRecipe | None = None
         super().__init__(pipeline_config)
+
+    def _uses_nvfp4_video_vae(self) -> bool:
+        return self.pipeline_config.quant_config.quant_algo == QuantAlgo.NVFP4
+
+    def _nvfp4_video_vae_recipe(self) -> LTX23Nvfp4RetakeRecipe:
+        if self._retake_vae_nvfp4_recipe is None:
+            path = self.pipeline_config.extra_attrs.get("retake_vae_nvfp4_recipe_path")
+            self._retake_vae_nvfp4_recipe = load_ltx23_nvfp4_retake_recipe(path)
+        return self._retake_vae_nvfp4_recipe
+
+    def _create_video_decoder(self, config: dict[str, Any]):
+        if not self._uses_nvfp4_video_vae():
+            return super()._create_video_decoder(config)
+        recipe = self._nvfp4_video_vae_recipe()
+        logger.info("Loading LTX-2.3 Retake video decoder with static NVFP4 VAE scales.")
+        return LTX23Nvfp4VideoDecoderConfigurator.from_config(
+            config, activation_scales=recipe.decoder
+        )
 
     @property
     def default_generation_params(self) -> dict[str, int]:
@@ -365,7 +391,14 @@ class LTX23RetakePipeline(LTX23Pipeline):
             encoder_blocks = config.get("vae", {}).get("encoder_blocks", [])
             if not encoder_blocks:
                 raise ValueError("LTX-2.3 checkpoint config has no video VAE encoder blocks.")
-            self.video_encoder = LTX23VideoEncoderConfigurator.from_config(config)
+            if self._uses_nvfp4_video_vae():
+                recipe = self._nvfp4_video_vae_recipe()
+                logger.info("Loading LTX-2.3 Retake video encoder with static NVFP4 VAE scales.")
+                self.video_encoder = LTX23Nvfp4VideoEncoderConfigurator.from_config(
+                    config, activation_scales=recipe.encoder
+                )
+            else:
+                self.video_encoder = LTX23VideoEncoderConfigurator.from_config(config)
             _load_component_weights(safetensors_paths, self.video_encoder, "vae.encoder.")
             _load_component_weights(
                 safetensors_paths,
@@ -478,6 +511,12 @@ class LTX23RetakePipeline(LTX23Pipeline):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
+        for component in (
+            getattr(self, "video_encoder", None),
+            getattr(self, "video_decoder", None),
+        ):
+            if component is not None and hasattr(component, "post_load_weights"):
+                component.post_load_weights()
         self._build_fp8_step_transformer()
 
     def _build_fp8_step_transformer(self) -> None:

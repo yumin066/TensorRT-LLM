@@ -210,6 +210,10 @@ package_data += [
     "_torch/auto_deploy/config/*.yaml",
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
+    # Fused PixelNorm/SiLU/padding/NVFP4 preprocessing for the LTX-2.3 VAE.
+    '_torch/visual_gen/models/ltx23/ltx23_core/video_vae_ltx23_nvfp4_preprocess.cu',
+    # Offline-calibrated global FP32 multipliers scoped to the Retake pipeline.
+    '_torch/visual_gen/models/ltx23/ltx23_core/video_vae_ltx23_retake_nvfp4_global_fp32_scales.json',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
     'usage/schemas/*.json',
 ]

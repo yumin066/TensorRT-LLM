@@ -216,13 +216,15 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
 class LTX23VideoDecoderConfigurator:
     """Create an LTX23VideoDecoder from the native LTX-2.3 config dict."""
 
+    model_cls = LTX23VideoDecoder
+
     @classmethod
-    def from_config(cls, config: dict) -> LTX23VideoDecoder:
+    def from_config(cls, config: dict, **model_kwargs: Any) -> LTX23VideoDecoder:
         vae = config.get("vae", {})
         padding_mode = vae.get(
             "spatial_padding_mode", vae.get("decoder_spatial_padding_mode", "reflect")
         )
-        return LTX23VideoDecoder(
+        return cls.model_cls(
             convolution_dimensions=vae.get("dims", 3),
             in_channels=vae.get("latent_channels", 128),
             out_channels=vae.get("out_channels", 3),
@@ -231,6 +233,7 @@ class LTX23VideoDecoderConfigurator:
             norm_layer=NormLayerType(vae.get("norm_layer", "pixel_norm")),
             causal=vae.get("causal_decoder", False),
             spatial_padding_mode=PaddingModeType(padding_mode),
+            **model_kwargs,
         )
 
 
@@ -367,13 +370,15 @@ class LTX23VideoEncoder(LTX2VideoEncoder):
 class LTX23VideoEncoderConfigurator:
     """Create an LTX-2.3 video encoder from the native config."""
 
+    model_cls = LTX23VideoEncoder
+
     @classmethod
-    def from_config(cls, config: dict) -> LTX23VideoEncoder:
+    def from_config(cls, config: dict, **model_kwargs: Any) -> LTX23VideoEncoder:
         vae = config.get("vae", {})
         padding_mode = vae.get(
             "spatial_padding_mode", vae.get("encoder_spatial_padding_mode", "zeros")
         )
-        return LTX23VideoEncoder(
+        return cls.model_cls(
             convolution_dimensions=vae.get("dims", 3),
             in_channels=vae.get("in_channels", vae.get("out_channels", 3)),
             out_channels=vae.get("latent_channels", 128),
@@ -382,4 +387,5 @@ class LTX23VideoEncoderConfigurator:
             norm_layer=NormLayerType(vae.get("norm_layer", "pixel_norm")),
             causal=vae.get("causal_encoder", True),
             encoder_spatial_padding_mode=PaddingModeType(padding_mode),
+            **model_kwargs,
         )

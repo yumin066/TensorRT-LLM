@@ -352,6 +352,11 @@ class LTX23Pipeline(BasePipeline):
             self.transformer.load_weights(weights.get("transformer", weights))
             logger.info("Transformer weights loaded successfully.")
 
+    def _create_video_decoder(self, config: Dict[str, Any]):
+        """Construct the decoder variant selected by this pipeline."""
+
+        return LTX23VideoDecoderConfigurator.from_config(config)
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -422,7 +427,7 @@ class LTX23Pipeline(BasePipeline):
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native video decoder...")
             self.video_decoder = _load(
-                LTX23VideoDecoderConfigurator.from_config(config),
+                self._create_video_decoder(config),
                 ["vae.decoder.", "vae."],
                 dtype,
             )
