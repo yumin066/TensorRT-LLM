@@ -64,6 +64,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Precomputed prompt conditioning safetensors path.",
     )
+    parser.add_argument(
+        "--spatial_upsampler_path",
+        default=None,
+        help="Learned 2x latent upsampler safetensors for two-stage Retake.",
+    )
+    parser.add_argument(
+        "--core_start",
+        type=float,
+        default=None,
+        help="Optional semantic edit-core start time in seconds.",
+    )
+    parser.add_argument(
+        "--core_end",
+        type=float,
+        default=None,
+        help="Optional semantic edit-core end time in seconds.",
+    )
+    parser.add_argument(
+        "--soft_margin_noise",
+        type=float,
+        default=1.0,
+        help="Denoise strength outside the edit core but inside the Retake window.",
+    )
     return parser.parse_args()
 
 
@@ -81,6 +104,17 @@ def main() -> None:
         pipeline_config["text_encoder_path"] = None
     elif args.text_encoder_path is not None:
         pipeline_config["text_encoder_path"] = args.text_encoder_path
+    if args.spatial_upsampler_path is not None:
+        pipeline_config["retake_spatial_upsampler_path"] = args.spatial_upsampler_path
+    if pipeline_config.get("retake_two_stage") and not pipeline_config.get(
+        "retake_spatial_upsampler_path"
+    ):
+        raise ValueError(
+            "Two-stage Retake requires --spatial_upsampler_path or "
+            "pipeline_config.retake_spatial_upsampler_path."
+        )
+    if (args.core_start is None) != (args.core_end is None):
+        raise ValueError("--core_start and --core_end must be provided together.")
     visual_gen_args = visual_gen_args.model_copy(update={"pipeline_config": pipeline_config})
 
     with VisualGen(model=args.model, args=visual_gen_args) as visual_gen:
@@ -92,6 +126,10 @@ def main() -> None:
             params.extra_params["retake_start_time"] = args.start
         if args.end is not None:
             params.extra_params["retake_end_time"] = args.end
+        if args.core_start is not None:
+            params.extra_params["retake_core_start_time"] = args.core_start
+            params.extra_params["retake_core_end_time"] = args.core_end
+            params.extra_params["retake_soft_margin_noise"] = args.soft_margin_noise
         output = visual_gen.generate(inputs=args.prompt, params=params)
         output.save(args.output_path)
 

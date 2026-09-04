@@ -8,7 +8,10 @@ from typing import Any, Literal
 import flashinfer
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm._torch.custom_ops import (
+    flashinfer_nvfp4_attention_sm120,
+    flashinfer_single_prefill_with_kv_cache,
+)
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention_backend.interface import PredefinedAttentionMask
@@ -50,7 +53,7 @@ class FlashInferAttention(AttentionBackend):
             attention_metadata_state if attention_metadata_state is not None else {}
         )
 
-        self._single_prefill = flashinfer.single_prefill_with_kv_cache
+        self._single_prefill = flashinfer_single_prefill_with_kv_cache
         self._batch_prefill_cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
         if quant_attention_config is not None and quant_attention_config.qk_dtype not in (
             "mxfp8",
@@ -310,30 +313,32 @@ class FlashInferAttention(AttentionBackend):
                 "and head_dim=64 or 128."
             )
         sequence_length = q.shape[1]
-        # FlashInfer 0.6.16 pads internally but cannot mask the padded K/V tokens.
-        if sequence_length % 128 != 0:
-            raise ValueError(
-                "FlashInfer SM120/SM121 NVFP4 attention requires sequence length "
-                f"to be a multiple of 128, got {sequence_length}."
-            )
+        padded_length = math.ceil(sequence_length / 128) * 128
+        padding_tokens = padded_length - sequence_length
         query = q.transpose(1, 2).contiguous()
         key = k.transpose(1, 2).contiguous()
         value = v.transpose(1, 2).contiguous()
-        quantized_qkv = flashinfer.nvfp4_attention_sm120_quantize_qkv(
+        output, lse = flashinfer_nvfp4_attention_sm120(
             query,
             key,
             value,
-            per_block_mean=False,
-        )
-        output, lse = flashinfer.nvfp4_attention_sm120_fwd(
-            *quantized_qkv,
             sm_scale=self.scale,
             causal=is_causal,
             per_block_mean=False,
             out_dtype=q.dtype,
         )
-        output = output[:, :, :sequence_length].transpose(1, 2).contiguous()
-        return output, lse[:, :, :sequence_length]
+        output = output[:, :, :sequence_length]
+        lse = lse[:, :, :sequence_length]
+        if padding_tokens and not is_causal:
+            # FlashInfer pads Q/K/V with zeros to the next 128-token boundary.
+            # Each padded key contributes exp(0) to the softmax denominator but
+            # zero to the numerator. Remove that known mass analytically so the
+            # result is equivalent to masking the internal padding tokens.
+            padded_mass = padding_tokens * torch.exp(-lse.float())
+            valid_mass = (1.0 - padded_mass).clamp_min(torch.finfo(torch.float32).tiny)
+            output = output * valid_mass.reciprocal().unsqueeze(-1).to(output.dtype)
+            lse = lse.float() + torch.log(valid_mass)
+        return output.transpose(1, 2).contiguous(), lse
 
     def forward(
         self,
@@ -410,29 +415,6 @@ class FlashInferAttention(AttentionBackend):
             and qk_dtype == "nvfp4"
             and quant_config.v_dtype == "nvfp4"
         ):
-            sequence_length = q.shape[1]
-            if sequence_length % 128 != 0:
-                logger.warning_once(
-                    "FlashInfer SM120/SM121 NVFP4 attention requires sequence length "
-                    f"to be a multiple of 128, got {sequence_length}; falling back to "
-                    "the non-quantized FlashInfer prefill path for this attention call.",
-                    key=("visual-gen-nvfp4-sm12x-seqlen-fallback", sequence_length),
-                )
-                if q.shape[0] == 1:
-                    return self._run_single_prefill(
-                        q,
-                        k,
-                        v,
-                        is_causal=is_causal,
-                        key_padding_mask=None,
-                    )
-                return self._run_batch_prefill(
-                    q,
-                    k,
-                    v,
-                    is_causal=is_causal,
-                    key_padding_mask=None,
-                )
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "

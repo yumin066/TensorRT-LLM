@@ -78,6 +78,7 @@ LTX23_RETAKE_EXPECTED_FPS = 30.0
 LTX23_RETAKE_EXPECTED_AUDIO_RATE = 48000
 LTX23_RETAKE_CHECKPOINT_ENV = "LTX23_RETAKE_CHECKPOINT"
 LTX23_RETAKE_LORA_ENV = "LTX23_RETAKE_LORA"
+LTX23_RETAKE_UPSAMPLER_ENV = "LTX23_RETAKE_UPSAMPLER"
 LTX23_RETAKE_LPIPS_FRAME_START = 89
 LTX23_RETAKE_LPIPS_FRAME_STOP = 118
 LTX23_RETAKE_LPIPS_THRESHOLD = 0.05
@@ -252,6 +253,22 @@ def _generate_ltx23_retake_video(
     with open(base_config, encoding="utf-8") as config_file:
         config_data = yaml.safe_load(config_file)
     config_data["runtime_lora_config"] = {"path": lora}
+    extra_args = []
+    if config_data.get("pipeline_config", {}).get("retake_two_stage"):
+        spatial_upsampler = os.environ.get(LTX23_RETAKE_UPSAMPLER_ENV) or os.path.join(
+            LTX23_MODEL_PATH, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+        )
+        _skip_if_missing(spatial_upsampler, "LTX-2.3 spatial upsampler")
+        extra_args = [
+            "--spatial_upsampler_path",
+            spatial_upsampler,
+            "--core_start",
+            "3.2",
+            "--core_end",
+            "3.7",
+            "--soft_margin_noise",
+            "0.85",
+        ]
     config = tmp_path / config_filename
     with open(config, "w", encoding="utf-8") as config_file:
         yaml.safe_dump(config_data, config_file, sort_keys=False)
@@ -273,7 +290,8 @@ def _generate_ltx23_retake_video(
             str(prompt_conditioning),
             "--output_path",
             str(output_path),
-        ],
+        ]
+        + extra_args,
     )
     assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
     return output_path
@@ -330,6 +348,37 @@ def test_ltx23_retake_native_bf16_smoke(ltx23_retake_bf16_video_path):
         assert audio_streams[0].codec_context.channels == 2
     finally:
         container.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="LTX-2.3 two-stage NVFP4 Retake requires an SM120 GPU",
+)
+def test_ltx23_retake_two_stage_nvfp4_smoke(
+    _ltx23_retake_deps,
+    llm_root,
+    llm_venv,
+    tmp_path,
+):
+    """Check that two-stage Retake produces video with source geometry."""
+    from tensorrt_llm._torch.visual_gen.models.ltx23.media_io import get_videostream_metadata
+
+    output_path = _visual_gen_output_path(llm_venv, "ltx23_retake_two_stage_nvfp4")
+    if not os.path.isfile(output_path):
+        _generate_ltx23_retake_video(
+            llm_root,
+            llm_venv,
+            tmp_path,
+            output_path,
+            "ltx23-retake-two-stage-fp4-1gpu.yaml",
+        )
+
+    metadata = get_videostream_metadata(output_path)
+    assert metadata.frames == LTX23_RETAKE_EXPECTED_FRAMES
+    assert (metadata.height, metadata.width) == (
+        LTX23_RETAKE_EXPECTED_HEIGHT,
+        LTX23_RETAKE_EXPECTED_WIDTH,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

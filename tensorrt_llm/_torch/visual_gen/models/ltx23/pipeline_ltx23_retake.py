@@ -15,15 +15,19 @@ and VAE decode all use TensorRT-LLM native components.
 from __future__ import annotations
 
 import copy
+import json
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import safetensors.torch
 import torch
 
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig, SharedGraphPool
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.triton_kernels import uint8_bthwc_to_normalized_ncthw
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.inputs.multimodal_data import AudioData
 from tensorrt_llm.logger import logger
@@ -37,6 +41,7 @@ from ..ltx2.ltx2_core.types import (
     VideoLatentShape,
     VideoPixelShape,
 )
+from ..ltx2.ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from ..ltx2.ltx2_core.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ..ltx2.pipeline_ltx2 import _load_component_weights
 from .ltx23_core.audio_vae import AudioEncoderConfigurator, encode_audio
@@ -54,7 +59,7 @@ from .media_io import (
     get_videostream_metadata,
     pad_audio_to_video_duration,
 )
-from .pipeline_ltx23 import LTX23Pipeline, _build_ltx23_transformer
+from .pipeline_ltx23 import LTX23Pipeline, _build_ltx23_transformer, _LTX23CUDAGraphRunner
 from .text_conditioning_ltx23 import LTX23TextConditioning
 from .transformer_ltx23 import LTX23Model
 
@@ -62,8 +67,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
 
-# Distilled retake noise schedule (8 Euler steps).
-_RETAKE_DISTILLED_SIGMA_VALUES = [
+# Distilled single-stage Retake noise schedule (8 Euler steps).
+_RETAKE_DISTILLED_SIGMA_VALUES = (
     1.0,
     0.99375,
     0.9875,
@@ -73,8 +78,25 @@ _RETAKE_DISTILLED_SIGMA_VALUES = [
     0.725,
     0.421875,
     0.0,
-]
+)
 _RETAKE_NUM_INFERENCE_STEPS = len(_RETAKE_DISTILLED_SIGMA_VALUES) - 1
+
+# Two-stage Retake first renders a half-resolution draft and then performs a
+# short full-resolution refinement.
+_TWO_STAGE_STAGE_1_SIGMA_VALUES = (
+    1.0,
+    0.965712,
+    0.921875,
+    0.863856,
+    0.783445,
+    0.664579,
+    0.471003,
+    0.1,
+    0.0,
+)
+_TWO_STAGE_STAGE_1_NUM_INFERENCE_STEPS = len(_TWO_STAGE_STAGE_1_SIGMA_VALUES) - 1
+_TWO_STAGE_STAGE_2_SIGMA_VALUES = (0.909375, 0.725, 0.421875, 0.0)
+_TWO_STAGE_STAGE_2_NUM_INFERENCE_STEPS = len(_TWO_STAGE_STAGE_2_SIGMA_VALUES) - 1
 
 _DEFAULT_MAX_SEQUENCE_LENGTH = 1024
 _PROMPT_CONDITIONING_KEYS = ("video_embeds", "audio_embeds", "connector_mask")
@@ -86,6 +108,30 @@ _RETAKE_TILING_CONFIG = TilingConfig(
     spatial_config=SpatialTilingConfig(tile_size_in_pixels=768, tile_overlap_in_pixels=64),
     temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=24),
 )
+
+_TWO_STAGE_RETAKE_TILING_CONFIG = TilingConfig(
+    spatial_config=SpatialTilingConfig(tile_size_in_pixels=384, tile_overlap_in_pixels=64),
+    temporal_config=TemporalTilingConfig(tile_size_in_frames=1_000_000, tile_overlap_in_frames=0),
+)
+
+
+@dataclass(frozen=True)
+class _RetakeStageConditioning:
+    video_embeds: torch.Tensor
+    audio_embeds: torch.Tensor | None
+    connector_mask: torch.Tensor
+    audio_clean_latents: torch.Tensor | None
+    audio_positions: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class _RetakeStage:
+    initial_latents: torch.Tensor
+    video_positions: torch.Tensor
+    denoise_mask: torch.Tensor
+    sigma_values: tuple[float, ...]
+    companion_transformer: LTX23Model | None
+    companion_steps: frozenset[int]
 
 
 def _load_prompt_conditioning(path: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -127,26 +173,28 @@ def _load_prompt_conditioning(path: str) -> tuple[torch.Tensor, torch.Tensor, to
     return video_embeds, audio_embeds, connector_mask
 
 
-def _normalize_fp8_step_indices(steps: Any) -> frozenset[int]:
-    """Validate FP8 fallback steps against the fixed Retake schedule."""
+def _normalize_fp8_step_indices(
+    steps: Any,
+    *,
+    num_steps: int = _RETAKE_NUM_INFERENCE_STEPS,
+    setting_name: str = "retake_fp8_linear_steps",
+) -> frozenset[int]:
+    """Validate FP8 companion-transformer steps against a fixed schedule."""
     if steps is None:
         return frozenset()
     if isinstance(steps, (str, bytes)):
-        raise TypeError("retake_fp8_linear_steps must be a sequence of integer step indices.")
+        raise TypeError(f"{setting_name} must be a sequence of integer step indices.")
     try:
         values = list(steps)
     except TypeError as exc:
-        raise TypeError(
-            "retake_fp8_linear_steps must be a sequence of integer step indices."
-        ) from exc
+        raise TypeError(f"{setting_name} must be a sequence of integer step indices.") from exc
     invalid_types = [step for step in values if isinstance(step, bool) or not isinstance(step, int)]
     if invalid_types:
-        raise TypeError(f"retake_fp8_linear_steps entries must be integers; got {invalid_types!r}.")
-    invalid_range = [step for step in values if not 0 <= step < _RETAKE_NUM_INFERENCE_STEPS]
+        raise TypeError(f"{setting_name} entries must be integers; got {invalid_types!r}.")
+    invalid_range = [step for step in values if not 0 <= step < num_steps]
     if invalid_range:
         raise ValueError(
-            "retake_fp8_linear_steps entries must be in "
-            f"[0, {_RETAKE_NUM_INFERENCE_STEPS}); got {invalid_range!r}."
+            f"{setting_name} entries must be in [0, {num_steps}); got {invalid_range!r}."
         )
     return frozenset(values)
 
@@ -237,6 +285,108 @@ def _retake_conditioned_latent_ranges(
     return cond_ranges
 
 
+def _retake_soft_margin_latent_ranges(
+    pixel_start: int,
+    pixel_end: int,
+    core_pixel_start: int,
+    core_pixel_end: int,
+    num_frames: int,
+    temporal_ratio: int,
+    soft_value: float,
+) -> list[tuple[int, int, float]]:
+    """Return soft-denoise latent ranges inside the edit window around its core."""
+    if temporal_ratio <= 0:
+        raise ValueError(f"temporal_ratio must be positive, got {temporal_ratio}")
+    if not math.isfinite(soft_value) or not 0.0 <= soft_value <= 1.0:
+        raise ValueError(f"retake_soft_margin_noise must be in [0, 1], got {soft_value}")
+    if pixel_end <= pixel_start:
+        return []
+    if core_pixel_start < pixel_start or core_pixel_end > pixel_end:
+        raise ValueError(
+            "The semantic edit core must be contained in the outer Retake window: "
+            f"core=[{core_pixel_start}, {core_pixel_end}), "
+            f"window=[{pixel_start}, {pixel_end})."
+        )
+
+    total_latent = _latent_frame_count(num_frames, temporal_ratio)
+    window_start = max(
+        0,
+        min(_pixel_frame_to_latent_index(pixel_start, temporal_ratio), total_latent),
+    )
+    window_end = max(
+        window_start,
+        min(
+            _pixel_frame_to_latent_index(pixel_end - 1, temporal_ratio) + 1,
+            total_latent,
+        ),
+    )
+    core_start = max(
+        window_start,
+        min(_pixel_frame_to_latent_index(core_pixel_start, temporal_ratio), window_end),
+    )
+    core_end = max(
+        core_start,
+        min(
+            _pixel_frame_to_latent_index(core_pixel_end - 1, temporal_ratio) + 1,
+            window_end,
+        ),
+    )
+
+    ranges = []
+    if core_start > window_start:
+        ranges.append((window_start, core_start, soft_value))
+    if window_end > core_end:
+        ranges.append((core_end, window_end, soft_value))
+    return ranges
+
+
+def _resolve_soft_margin_latent_ranges(
+    extra: dict[str, Any],
+    *,
+    pixel_start: int,
+    pixel_end: int,
+    fps: float,
+    num_frames: int,
+    temporal_ratio: int,
+) -> list[tuple[int, int, float]]:
+    """Resolve optional request-level core/soft-margin settings."""
+    core_start_time = extra.get("retake_core_start_time")
+    core_end_time = extra.get("retake_core_end_time")
+    if (core_start_time is None) != (core_end_time is None):
+        raise ValueError(
+            "retake_core_start_time and retake_core_end_time must be provided together."
+        )
+
+    raw_soft_value = extra.get("retake_soft_margin_noise", 1.0)
+    soft_value = 1.0 if raw_soft_value is None else float(raw_soft_value)
+    if not math.isfinite(soft_value) or not 0.0 <= soft_value <= 1.0:
+        raise ValueError(f"retake_soft_margin_noise must be in [0, 1], got {soft_value}")
+    if core_start_time is None or soft_value == 1.0:
+        return []
+
+    resolved_core_start, resolved_core_end = _resolve_retake_time_window(
+        float(core_start_time),
+        float(core_end_time),
+        fps,
+        num_frames,
+    )
+    core_pixel_start, core_pixel_end = _retake_pixel_window(
+        resolved_core_start,
+        resolved_core_end,
+        fps,
+        num_frames,
+    )
+    return _retake_soft_margin_latent_ranges(
+        pixel_start,
+        pixel_end,
+        core_pixel_start,
+        core_pixel_end,
+        num_frames,
+        temporal_ratio,
+        soft_value,
+    )
+
+
 def _init_retake_patchified_latents(
     noise_latents: torch.Tensor,
     source_latents: torch.Tensor,
@@ -302,16 +452,71 @@ class LTX23RetakePipeline(LTX23Pipeline):
             raise NotImplementedError("Parallel VAE is not supported for LTX-2.3 retake.")
         if pipeline_config.parallel.seq_parallel_size != 1 or pipeline_config.parallel.tp_size != 1:
             raise NotImplementedError("LTX-2.3 retake currently supports a single GPU only.")
-        if pipeline_config.cuda_graph.enable:
-            raise NotImplementedError("LTX-2.3 retake currently requires cuda_graph.enable=false.")
         self._fp8_step_transformer: LTX23Model | None = None
         self._fp8_step_indices = _normalize_fp8_step_indices(
             pipeline_config.extra_attrs.get("retake_fp8_linear_steps")
         )
-        self._fp8_step_text_cache: LTX23TextConditioning | None = None
         self._checkpoint_dir: str | None = None
         self._retake_vae_nvfp4_recipe: LTX23Nvfp4RetakeRecipe | None = None
+        configured_two_stage = pipeline_config.extra_attrs.get("retake_two_stage", False)
+        if not isinstance(configured_two_stage, bool):
+            raise TypeError("retake_two_stage must be a boolean in pipeline_config.")
+        self._two_stage = configured_two_stage
+        self._spatial_upsampler: torch.nn.Module | None = None
+        self._spatial_upsampler_path: str | None = None
+        self._stage2_step_transformer: LTX23Model | None = None
+        stage2_quant = pipeline_config.extra_attrs.get("retake_stage2_quant")
+        stage2_steps = pipeline_config.extra_attrs.get("retake_stage2_fp8_linear_steps")
+        if stage2_steps is not None and stage2_quant is None:
+            stage2_quant = "FP8"
+        self._stage2_quant = str(stage2_quant).upper() if stage2_quant else None
+        if self._stage2_quant not in {None, "BF16", "FP8"}:
+            raise ValueError(
+                f"retake_stage2_quant must be either 'BF16' or 'FP8'; got {stage2_quant!r}."
+            )
+        if self._stage2_quant is not None and stage2_steps is None:
+            stage2_steps = range(_TWO_STAGE_STAGE_2_NUM_INFERENCE_STEPS)
+        self._stage2_step_indices = _normalize_fp8_step_indices(
+            stage2_steps,
+            num_steps=_TWO_STAGE_STAGE_2_NUM_INFERENCE_STEPS,
+            setting_name="retake_stage2_fp8_linear_steps",
+        )
         super().__init__(pipeline_config)
+
+    def _wrap_retake_cuda_graph(self, name: str, transformer: LTX23Model) -> None:
+        graph_transformers = getattr(self, "_retake_graph_transformers", set())
+        if id(transformer) in graph_transformers:
+            return
+        graph_pool = getattr(self, "_retake_graph_pool", None)
+        if graph_pool is None:
+            graph_pool = SharedGraphPool()
+            self._retake_graph_pool = graph_pool
+        runner = _LTX23CUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True),
+            graph_pool,
+        )
+        transformer.register_cuda_graph_extra_key_fns(runner)
+        transformer.forward = runner.wrap(transformer.forward)
+        self._cuda_graph_runners[name] = runner
+        graph_transformers.add(id(transformer))
+        self._retake_graph_transformers = graph_transformers
+        logger.info(f"CUDA graph runner: wrapping LTX-2.3 Retake {name}.forward")
+
+    def _setup_cuda_graphs(self) -> None:
+        """Create one shared-pool graph runner for each resident transformer."""
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+        self._wrap_retake_cuda_graph("transformer", self.transformer)
+
+    def _setup_companion_cuda_graphs(self) -> None:
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+        for name, transformer in (
+            ("retake_fp8_transformer", self._fp8_step_transformer),
+            ("retake_stage2_transformer", self._stage2_step_transformer),
+        ):
+            if transformer is not None:
+                self._wrap_retake_cuda_graph(name, transformer)
 
     def _uses_nvfp4_video_vae(self) -> bool:
         return self.pipeline_config.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -366,6 +571,37 @@ class LTX23RetakePipeline(LTX23Pipeline):
                     "End time in seconds for the regenerated window. "
                     "Defaults to the end of the video."
                 ),
+            ),
+            "retake_core_start_time": ExtraParamSchema(
+                type="float",
+                default=None,
+                description=(
+                    "Start time in seconds of the semantic edit core. Tokens between "
+                    "the outer retake window and this core use the soft-margin value."
+                ),
+            ),
+            "retake_core_end_time": ExtraParamSchema(
+                type="float",
+                default=None,
+                description="End time in seconds of the semantic edit core.",
+            ),
+            "retake_soft_margin_noise": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description=(
+                    "Denoise-mask value for tokens between the outer window and edit "
+                    "core; 1.0 fully regenerates them and 0.0 preserves them."
+                ),
+            ),
+            "retake_two_stage": ExtraParamSchema(
+                type="bool",
+                default=None,
+                description="Override the configured two-resolution retake mode.",
+            ),
+            "retake_spatial_upsampler_path": ExtraParamSchema(
+                type="str",
+                default=None,
+                description="Path to the learned 2x latent upsampler for two-stage retake.",
             ),
         }
 
@@ -424,6 +660,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         video_shape: VideoLatentShape,
         *,
         cond_latent_frame_ranges: list[tuple[int, int]],
+        soft_latent_frame_ranges: list[tuple[int, int, float]] | None = None,
     ) -> torch.Tensor:
         patch_t = self.video_patchifier.patch_size[0]
         grid_frames = video_shape.frames // patch_t
@@ -435,6 +672,11 @@ class LTX23RetakePipeline(LTX23Pipeline):
             device=self.device,
             dtype=torch.float32,
         )
+        for start, stop, value in soft_latent_frame_ranges or []:
+            start = max(0, start)
+            stop = min(grid_frames, stop)
+            if stop > start:
+                mask[:, start * tokens_per_frame : stop * tokens_per_frame] = value
         for start, stop in cond_latent_frame_ranges:
             start = max(0, start)
             stop = min(grid_frames, stop)
@@ -455,6 +697,9 @@ class LTX23RetakePipeline(LTX23Pipeline):
         clean_latent: torch.Tensor,
         num_steps: int,
         text_cache: LTX23TextConditioning,
+        step_transformer: LTX23Model | None = None,
+        step_text_cache: LTX23TextConditioning | None = None,
+        step_indices: frozenset[int] = frozenset(),
     ) -> torch.Tensor:
         """Run one LTX-2.3 denoise step with two-sided video conditioning."""
         video_float = video_latents.float()
@@ -485,11 +730,11 @@ class LTX23RetakePipeline(LTX23Pipeline):
 
         transformer = self.transformer
         active_text_cache = text_cache
-        if step_index in self._fp8_step_indices:
-            if self._fp8_step_transformer is None or self._fp8_step_text_cache is None:
-                raise RuntimeError("The configured FP8 Retake transformer is not ready.")
-            transformer = self._fp8_step_transformer
-            active_text_cache = self._fp8_step_text_cache
+        if step_index in step_indices:
+            if step_transformer is None or step_text_cache is None:
+                raise RuntimeError("The configured Retake companion transformer is not ready.")
+            transformer = step_transformer
+            active_text_cache = step_text_cache
 
         velocity_video, _ = transformer(
             video=video,
@@ -517,42 +762,77 @@ class LTX23RetakePipeline(LTX23Pipeline):
         ):
             if component is not None and hasattr(component, "post_load_weights"):
                 component.post_load_weights()
-        self._build_fp8_step_transformer()
+        self._build_step_transformers()
+        self._setup_companion_cuda_graphs()
 
-    def _build_fp8_step_transformer(self) -> None:
-        """Build the resident FP8 transformer used by selected NVFP4 steps."""
-        if not self._fp8_step_indices or self.transformer is None:
-            return
+    def _build_step_transformer(
+        self,
+        *,
+        quant: str,
+        checkpoint_dir: str,
+        description: str,
+    ) -> LTX23Model:
+        """Build a resident companion transformer in BF16 or dynamic FP8."""
         if self._checkpoint_dir is None:
-            raise RuntimeError(
-                "The Retake checkpoint path is unavailable for FP8 fallback loading."
-            )
+            raise RuntimeError("The Retake checkpoint path is unavailable.")
 
         from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 
-        fp8_quant_config, _, dynamic_weight_quant, _ = (
-            DiffusionPipelineConfig.load_diffusion_quant_config(
-                {"quant_algo": "FP8", "dynamic": True}
-            )
+        quant_settings = (
+            {"quant_algo": "FP8", "dynamic": True} if quant == "FP8" else {"quant_algo": None}
+        )
+        quant_config, _, dynamic_weight_quant, _ = (
+            DiffusionPipelineConfig.load_diffusion_quant_config(quant_settings)
         )
         base_model_config = self.pipeline_config.model_configs["transformer"]
-        fp8_model_config = copy.deepcopy(base_model_config)
-        fp8_model_config.quant_config = fp8_quant_config
-        fp8_model_config.dynamic_weight_quant = dynamic_weight_quant
-        fp8_model_config.force_dynamic_quantization = True
-        fp8_pipeline_config = copy.copy(self.pipeline_config)
-        fp8_pipeline_config.model_configs = dict(self.pipeline_config.model_configs)
-        fp8_pipeline_config.model_configs["transformer"] = fp8_model_config
+        model_config = copy.deepcopy(base_model_config)
+        model_config.quant_config = quant_config
+        model_config.dynamic_weight_quant = dynamic_weight_quant
+        model_config.force_dynamic_quantization = quant == "FP8"
+        companion_config = copy.copy(self.pipeline_config)
+        companion_config.model_configs = dict(self.pipeline_config.model_configs)
+        companion_config.model_configs["transformer"] = model_config
 
-        logger.info(
-            "LTX-2.3 Retake: building a resident FP8 transformer for steps "
-            f"{sorted(self._fp8_step_indices)}"
-        )
-        transformer = _build_ltx23_transformer(fp8_pipeline_config)
-        transformer_weights = self.load_transformer_weights(self._checkpoint_dir)
-        transformer.load_weights(transformer_weights)
+        logger.info(f"LTX-2.3 Retake: building {description} ({quant}) from {checkpoint_dir}.")
+        transformer = _build_ltx23_transformer(companion_config)
+        transformer_weights = self.load_transformer_weights(checkpoint_dir)
+        transformer.load_weights(transformer_weights.get("transformer", transformer_weights))
         transformer.post_load_weights()
-        self._fp8_step_transformer = transformer.to(self.device)
+        return transformer.to(self.device)
+
+    def _build_step_transformers(self) -> None:
+        """Build resident alternate-precision transformers used by Retake steps."""
+        if self.transformer is None or self._checkpoint_dir is None:
+            return
+
+        if self._fp8_step_indices:
+            logger.info(f"LTX-2.3 Retake: FP8 stage-1 steps {sorted(self._fp8_step_indices)}.")
+            self._fp8_step_transformer = self._build_step_transformer(
+                quant="FP8",
+                checkpoint_dir=self._checkpoint_dir,
+                description="stage-1 companion transformer",
+            )
+
+        if not self._stage2_step_indices:
+            return
+        if self._stage2_quant is None:
+            raise RuntimeError("Stage-2 companion steps were configured without a quant mode.")
+        stage2_checkpoint = (
+            self.pipeline_config.extra_attrs.get("retake_stage2_checkpoint") or self._checkpoint_dir
+        )
+        if (
+            self._stage2_quant == "FP8"
+            and stage2_checkpoint == self._checkpoint_dir
+            and self._fp8_step_transformer is not None
+        ):
+            logger.info("LTX-2.3 Retake: reusing the FP8 companion for stage 2.")
+            self._stage2_step_transformer = self._fp8_step_transformer
+            return
+        self._stage2_step_transformer = self._build_step_transformer(
+            quant=self._stage2_quant,
+            checkpoint_dir=stage2_checkpoint,
+            description="stage-2 companion transformer",
+        )
 
     def load_standard_components(
         self,
@@ -580,6 +860,45 @@ class LTX23RetakePipeline(LTX23Pipeline):
             text_encoder_path=text_encoder_path,
             skip_components=list(dict.fromkeys(native_skip_components)),
         )
+        upsampler_path = self.pipeline_config.extra_attrs.get("retake_spatial_upsampler_path")
+        if self._two_stage and upsampler_path:
+            self._load_spatial_upsampler(upsampler_path, device, self.dtype)
+
+    def _load_spatial_upsampler(
+        self,
+        path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Load the learned 2x latent upsampler used by two-stage Retake."""
+        if not path:
+            raise ValueError("A spatial upsampler path is required for two-stage Retake.")
+        if self._spatial_upsampler is not None:
+            if self._spatial_upsampler_path != path:
+                raise ValueError(
+                    "The spatial upsampler cannot change after pipeline initialization: "
+                    f"loaded={self._spatial_upsampler_path!r}, requested={path!r}."
+                )
+            return
+
+        state_dict: dict[str, torch.Tensor] = {}
+        config: dict[str, Any] = {}
+        with safetensors.torch.safe_open(path, framework="pt") as tensors:
+            metadata = tensors.metadata() or {}
+            if "config" in metadata:
+                config = json.loads(metadata["config"])
+            for key in tensors.keys():
+                state_dict[key] = tensors.get_tensor(key)
+
+        upsampler = LatentUpsamplerConfigurator.from_config(config)
+        missing, unexpected = upsampler.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(f"LTX-2.3 spatial upsampler missing keys: {missing[:5]}")
+        if unexpected:
+            logger.warning(f"LTX-2.3 spatial upsampler unexpected keys: {unexpected[:5]}")
+        self._spatial_upsampler = upsampler.to(device=device, dtype=dtype).eval()
+        self._spatial_upsampler_path = path
+        logger.info(f"Loaded LTX-2.3 Retake spatial upsampler from {path}.")
 
     def warmup(self) -> None:
         logger.info("Skipping LTX-2.3 retake warmup; retake requires a source video request.")
@@ -590,11 +909,25 @@ class LTX23RetakePipeline(LTX23Pipeline):
         video_path = self._require_extra(extra, "retake_video_path")
         start_time = extra.get("retake_start_time")
         end_time = extra.get("retake_end_time")
+        request_two_stage = extra.get("retake_two_stage")
+        if request_two_stage is not None and not isinstance(request_two_stage, bool):
+            raise TypeError(
+                "retake_two_stage must be a boolean when supplied as a request extra parameter."
+            )
+        two_stage = self._two_stage if request_two_stage is None else bool(request_two_stage)
+        if two_stage:
+            upsampler_path = extra.get(
+                "retake_spatial_upsampler_path"
+            ) or self.pipeline_config.extra_attrs.get("retake_spatial_upsampler_path")
+            if not upsampler_path:
+                raise ValueError("retake_spatial_upsampler_path is required for two-stage Retake.")
+            self._load_spatial_upsampler(upsampler_path, self.device, self.dtype)
 
         prompt = self._single_prompt(req.prompt)
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
-        video, audio, output_shape = self._run_retake(
+        run_retake = self._run_two_stage_retake if two_stage else self._run_retake
+        video, audio, output_shape = run_retake(
             req, video_path, start_time, end_time, prompt, timer=timer
         )
         audio_tensor = audio.samples if audio is not None else None
@@ -710,6 +1043,14 @@ class LTX23RetakePipeline(LTX23Pipeline):
         conditioned_latent_ranges = _retake_conditioned_latent_ranges(
             pixel_start, pixel_end, num_frames, temporal_ratio
         )
+        soft_margin_latent_ranges = _resolve_soft_margin_latent_ranges(
+            req.params.extra_params or {},
+            pixel_start=pixel_start,
+            pixel_end=pixel_end,
+            fps=fps,
+            num_frames=num_frames,
+            temporal_ratio=temporal_ratio,
+        )
 
         # ---- 3. Native VAE encode + seed initial latents ----------------
         video_shape = VideoLatentShape.from_pixel_shape(
@@ -731,7 +1072,9 @@ class LTX23RetakePipeline(LTX23Pipeline):
             )
 
         denoise_mask = self._build_denoise_mask(
-            video_shape, cond_latent_frame_ranges=conditioned_latent_ranges
+            video_shape,
+            cond_latent_frame_ranges=conditioned_latent_ranges,
+            soft_latent_frame_ranges=soft_margin_latent_ranges,
         )
         source_patch_latents = self.video_patchifier.patchify(source_window_latents)
         noise_latents = torch.randn(
@@ -799,9 +1142,9 @@ class LTX23RetakePipeline(LTX23Pipeline):
             dtype=dtype,
         )
 
-        self._fp8_step_text_cache = None
+        fp8_step_text_cache = None
         if self._fp8_step_transformer is not None:
-            self._fp8_step_text_cache = self._fp8_step_transformer.prepare_text_cache(
+            fp8_step_text_cache = self._fp8_step_transformer.prepare_text_cache(
                 video_context=video_embeds,
                 video_context_mask=connector_mask,
                 video_positions=video_positions,
@@ -862,6 +1205,9 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 clean_latent=clean_latent,
                 num_steps=num_steps,
                 text_cache=text_cache,
+                step_transformer=self._fp8_step_transformer,
+                step_text_cache=fp8_step_text_cache,
+                step_indices=self._fp8_step_indices,
             )
             audio_prediction = {"audio": clean_audio} if clean_audio is not None else {}
             return denoised_video, audio_prediction
@@ -892,6 +1238,349 @@ class LTX23RetakePipeline(LTX23Pipeline):
         output_video = decoded.contiguous()
         timer.mark_end()
 
+        return output_video, source_audio, pixel_shape
+
+    def _retake_video_positions(
+        self,
+        video_shape: VideoLatentShape,
+        fps: float,
+    ) -> torch.Tensor:
+        positions = self.video_patchifier.get_patch_grid_bounds(video_shape, device=self.device)
+        positions = get_pixel_coords(positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True)
+        positions[:, 0, ...] = positions[:, 0, ...] / fps
+        return positions
+
+    def _prepare_retake_stage_text_caches(
+        self,
+        conditioning: _RetakeStageConditioning,
+        video_positions: torch.Tensor,
+        companion_transformer: LTX23Model | None,
+    ) -> tuple[LTX23TextConditioning, LTX23TextConditioning | None]:
+        def _prepare(transformer: LTX23Model) -> LTX23TextConditioning:
+            return transformer.prepare_text_cache(
+                video_context=conditioning.video_embeds,
+                video_context_mask=conditioning.connector_mask,
+                video_positions=video_positions,
+                audio_context=conditioning.audio_embeds,
+                audio_context_mask=(
+                    conditioning.connector_mask if conditioning.audio_embeds is not None else None
+                ),
+                audio_positions=conditioning.audio_positions,
+                dtype=self.dtype,
+            )
+
+        primary_cache = _prepare(self.transformer)
+        companion_cache = (
+            _prepare(companion_transformer) if companion_transformer is not None else None
+        )
+        return primary_cache, companion_cache
+
+    def _run_masked_retake_stage(
+        self,
+        stage: _RetakeStage,
+        conditioning: _RetakeStageConditioning,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        clean_latent = self.video_patchifier.patchify(stage.initial_latents)
+        noise_latents = torch.randn(
+            clean_latent.shape,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        initial_sigma = stage.sigma_values[0]
+        working_latents = _init_retake_patchified_latents(
+            noise_latents,
+            clean_latent,
+            stage.denoise_mask * initial_sigma,
+        ).to(self.dtype)
+
+        scheduler = NativeSchedulerAdapter()
+        scheduler.sigmas = torch.tensor(stage.sigma_values, dtype=torch.float32, device=self.device)
+        timesteps = scheduler.timesteps
+        num_steps = len(timesteps)
+        text_cache, companion_text_cache = self._prepare_retake_stage_text_caches(
+            conditioning,
+            stage.video_positions,
+            stage.companion_transformer,
+        )
+
+        extra_streams = None
+        clean_audio = None
+        if conditioning.audio_clean_latents is not None:
+            clean_audio = conditioning.audio_clean_latents.to(self.dtype)
+            audio_noise = torch.randn(
+                clean_audio.shape,
+                generator=generator,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            audio_state = (
+                audio_noise * initial_sigma + clean_audio.float() * (1.0 - initial_sigma)
+            ).to(self.dtype)
+            extra_streams = {
+                "audio": (audio_state, copy.deepcopy(scheduler)),
+            }
+
+        def _forward(
+            video_latents: torch.Tensor,
+            extra_stream_latents: dict[str, torch.Tensor] | None,
+            step_index: int,
+            timestep: torch.Tensor,
+            _encoder_hidden_states: torch.Tensor,
+            _extra_tensors: dict[str, Any],
+        ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            audio_latents = (
+                extra_stream_latents.get("audio") if extra_stream_latents is not None else None
+            )
+            denoised_video = self._masked_transformer_step(
+                video_latents,
+                audio_latents,
+                step_index,
+                timestep,
+                video_positions=stage.video_positions,
+                audio_positions=conditioning.audio_positions,
+                denoise_mask=stage.denoise_mask,
+                clean_latent=clean_latent,
+                num_steps=num_steps,
+                text_cache=text_cache,
+                step_transformer=stage.companion_transformer,
+                step_text_cache=companion_text_cache,
+                step_indices=stage.companion_steps,
+            )
+            audio_prediction = {"audio": clean_audio} if clean_audio is not None else {}
+            return denoised_video, audio_prediction
+
+        result = self.denoise(
+            latents=working_latents,
+            scheduler=scheduler,
+            prompt_embeds=conditioning.video_embeds,
+            guidance_scale=1.0,
+            forward_fn=_forward,
+            timesteps=timesteps,
+            extra_streams=extra_streams,
+        )
+        return result[0] if extra_streams is not None else result
+
+    def _run_two_stage_retake(  # noqa: PLR0915
+        self,
+        req: "DiffusionRequest",
+        video_path: str,
+        start_time: float | None,
+        end_time: float | None,
+        prompt: str,
+        timer: CudaPhaseTimer,
+    ) -> tuple[torch.Tensor, AudioData | None, VideoPixelShape]:
+        """Run a half-resolution draft followed by full-resolution refinement."""
+        if req.params.num_inference_steps != _TWO_STAGE_STAGE_1_NUM_INFERENCE_STEPS:
+            raise ValueError(
+                "LTX-2.3 two-stage Retake uses the fixed distilled "
+                f"{_TWO_STAGE_STAGE_1_NUM_INFERENCE_STEPS}-step first stage; "
+                f"got num_inference_steps={req.params.num_inference_steps}."
+            )
+        if self.video_encoder is None:
+            raise RuntimeError("LTX-2.3 two-stage Retake requires video VAE encoder weights.")
+        if self._spatial_upsampler is None:
+            raise RuntimeError("LTX-2.3 two-stage Retake spatial upsampler is not loaded.")
+
+        device = self.device
+        dtype = self.dtype
+        generator = torch.Generator(device=device).manual_seed(req.params.seed)
+
+        pixel_shape = get_videostream_metadata(video_path)
+        num_frames = int(pixel_shape.frames)
+        height = int(pixel_shape.height)
+        width = int(pixel_shape.width)
+        fps = float(pixel_shape.fps)
+        self._validate_retake_source(num_frames, height, width)
+        if height % 64 != 0 or width % 64 != 0:
+            raise ValueError(
+                "LTX-2.3 two-stage Retake requires source height and width divisible "
+                f"by 64; got {height}x{width}."
+            )
+        start_time, end_time = _resolve_retake_time_window(start_time, end_time, fps, num_frames)
+        source_norm_5d = self._read_source_video(
+            video_path, num_frames, height, width, device, dtype
+        )
+
+        batch, channels, frames, _, _ = source_norm_5d.shape
+        half_frames = source_norm_5d.permute(0, 2, 1, 3, 4).reshape(
+            batch * frames, channels, height, width
+        )
+        half_frames = torch.nn.functional.interpolate(
+            half_frames.float(),
+            size=(height // 2, width // 2),
+            mode="bilinear",
+            align_corners=False,
+            antialias=False,
+        ).to(dtype)
+        source_half_5d = (
+            half_frames.reshape(batch, frames, channels, height // 2, width // 2)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+
+        temporal_ratio = VIDEO_SCALE_FACTORS.time
+        pixel_start, pixel_end = _retake_pixel_window(start_time, end_time, fps, num_frames)
+        if pixel_start == pixel_end:
+            raise ValueError(
+                "The retake time window does not contain a source frame after "
+                f"conversion at {fps:g} FPS: [{start_time}, {end_time})."
+            )
+        conditioned_latent_ranges = _retake_conditioned_latent_ranges(
+            pixel_start, pixel_end, num_frames, temporal_ratio
+        )
+        soft_margin_latent_ranges = _resolve_soft_margin_latent_ranges(
+            req.params.extra_params or {},
+            pixel_start=pixel_start,
+            pixel_end=pixel_end,
+            fps=fps,
+            num_frames=num_frames,
+            temporal_ratio=temporal_ratio,
+        )
+        total_latent_frames = _latent_frame_count(num_frames, temporal_ratio)
+        regenerated_start = max(
+            0,
+            min(
+                _pixel_frame_to_latent_index(pixel_start, temporal_ratio),
+                total_latent_frames,
+            ),
+        )
+        regenerated_end = max(
+            regenerated_start,
+            min(
+                _pixel_frame_to_latent_index(pixel_end - 1, temporal_ratio) + 1,
+                total_latent_frames,
+            ),
+        )
+
+        full_shape = VideoLatentShape.from_pixel_shape(
+            pixel_shape, latent_channels=self.transformer_in_channels
+        )
+        half_pixel_shape = VideoPixelShape(
+            batch=1,
+            frames=num_frames,
+            height=height // 2,
+            width=width // 2,
+            fps=fps,
+        )
+        half_shape = VideoLatentShape.from_pixel_shape(
+            half_pixel_shape, latent_channels=self.transformer_in_channels
+        )
+
+        source_half_latents = self.video_encoder.tiled_encode(
+            source_half_5d, _TWO_STAGE_RETAKE_TILING_CONFIG
+        )
+        source_full_latents = self.video_encoder.tiled_encode(
+            source_norm_5d, _TWO_STAGE_RETAKE_TILING_CONFIG
+        )
+        for label, actual, expected in (
+            ("half-resolution", source_half_latents, half_shape),
+            ("full-resolution", source_full_latents, full_shape),
+        ):
+            expected_shape = tuple(expected.to_torch_shape())
+            if tuple(actual.shape) != expected_shape:
+                raise ValueError(
+                    f"LTX-2.3 two-stage Retake {label} encoded latent shape "
+                    f"{tuple(actual.shape)} != expected {expected_shape}."
+                )
+
+        max_sequence_length = (
+            getattr(req.params, "max_sequence_length", None) or _DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        conditioning_path = (req.params.extra_params or {}).get("retake_prompt_conditioning_path")
+        video_embeds, audio_embeds, connector_mask = self._prepare_prompt_conditioning(
+            prompt, max_sequence_length, conditioning_path
+        )
+
+        source_audio = decode_audio_from_file(video_path)
+        audio_latent = self._encode_source_audio_latent(source_audio, pixel_shape)
+        if audio_latent is not None:
+            audio_shape = AudioLatentShape.from_torch_shape(audio_latent.shape)
+            audio_clean_latents = self.audio_patchifier.patchify(audio_latent.float())
+            audio_positions = self.audio_patchifier.get_patch_grid_bounds(
+                audio_shape, device=device
+            )
+        else:
+            audio_clean_latents = None
+            audio_embeds = None
+            audio_positions = None
+
+        conditioning = _RetakeStageConditioning(
+            video_embeds=video_embeds,
+            audio_embeds=audio_embeds,
+            connector_mask=connector_mask,
+            audio_clean_latents=audio_clean_latents,
+            audio_positions=audio_positions,
+        )
+
+        timer.mark_denoise_start()
+        half_positions = self._retake_video_positions(half_shape, fps)
+        half_mask = self._build_denoise_mask(
+            half_shape,
+            cond_latent_frame_ranges=conditioned_latent_ranges,
+            soft_latent_frame_ranges=soft_margin_latent_ranges,
+        )
+        stage_1_tokens = self._run_masked_retake_stage(
+            _RetakeStage(
+                initial_latents=source_half_latents,
+                video_positions=half_positions,
+                denoise_mask=half_mask,
+                sigma_values=_TWO_STAGE_STAGE_1_SIGMA_VALUES,
+                companion_transformer=self._fp8_step_transformer,
+                companion_steps=self._fp8_step_indices,
+            ),
+            conditioning,
+            generator,
+        )
+        stage_1_latents = self.video_patchifier.unpatchify(stage_1_tokens, half_shape).to(dtype)
+
+        statistics = self.video_encoder.per_channel_statistics
+        upsampled_latents = upsample_video(
+            stage_1_latents,
+            statistics,
+            self._spatial_upsampler,
+        ).to(dtype)
+        if upsampled_latents.shape != source_full_latents.shape:
+            raise ValueError(
+                "LTX-2.3 two-stage Retake upsampled latent shape "
+                f"{tuple(upsampled_latents.shape)} != full-resolution source latent shape "
+                f"{tuple(source_full_latents.shape)}."
+            )
+        composite_latents = source_full_latents.clone()
+        composite_latents[:, :, regenerated_start:regenerated_end] = upsampled_latents[
+            :, :, regenerated_start:regenerated_end
+        ]
+
+        full_positions = self._retake_video_positions(full_shape, fps)
+        full_mask = self._build_denoise_mask(
+            full_shape,
+            cond_latent_frame_ranges=conditioned_latent_ranges,
+            soft_latent_frame_ranges=soft_margin_latent_ranges,
+        )
+        stage_2_tokens = self._run_masked_retake_stage(
+            _RetakeStage(
+                initial_latents=composite_latents,
+                video_positions=full_positions,
+                denoise_mask=full_mask,
+                sigma_values=_TWO_STAGE_STAGE_2_SIGMA_VALUES,
+                companion_transformer=self._stage2_step_transformer,
+                companion_steps=self._stage2_step_indices,
+            ),
+            conditioning,
+            generator,
+        )
+
+        timer.mark_post_start()
+        final_latents = self.video_patchifier.unpatchify(stage_2_tokens, full_shape).to(dtype)
+        chunks = list(
+            self.video_decoder.tiled_decode(
+                final_latents, _TWO_STAGE_RETAKE_TILING_CONFIG, generator=generator
+            )
+        )
+        decoded = torch.cat(chunks, dim=2)
+        output_video = postprocess_video_tensor(decoded).contiguous()
+        timer.mark_end()
         return output_video, source_audio, pixel_shape
 
     @staticmethod
@@ -947,10 +1636,11 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 f"retake source frame size {tuple(source_uint8.shape[2:4])} does not "
                 f"match metadata {(height, width)}."
             )
-        # uint8 [0, 255] -> [-1, 1], laid out (1, C, T, H, W) for the VAE encoder.
-        normalized = source_uint8[0].to(torch.float32) / 127.5 - 1.0  # (T, H, W, C)
-        source_norm_5d = normalized.permute(3, 0, 1, 2).unsqueeze(0).to(device=device, dtype=dtype)
-        return source_norm_5d
+        # Transfer compact uint8 pixels and fuse normalize + THWC-to-NCTHW + cast
+        # on the GPU. This avoids a full-sized CPU FP32 temporary and halves H2D
+        # traffic relative to transferring BF16 pixels.
+        source_uint8_cuda = source_uint8.to(device=device)
+        return uint8_bthwc_to_normalized_ncthw(source_uint8_cuda, dtype=dtype)
 
     def _encode_source_audio_latent(
         self,

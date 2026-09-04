@@ -74,6 +74,14 @@ class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
                 f"{prefix}.context_mask",
                 tuple(value.context_mask.shape) if value.context_mask is not None else None,
             )
+            yield (
+                f"{prefix}.cross_modality_sigma",
+                (
+                    tuple(value.cross_modality_sigma.shape)
+                    if value.cross_modality_sigma is not None
+                    else None
+                ),
+            )
             return
         if isinstance(value, LTX23TextConditioning):
             for name in ("video_context", "video_mask", "audio_context", "audio_mask"):
@@ -102,6 +110,11 @@ class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
                 enabled=value.enabled,
                 context_mask=(
                     value.context_mask.clone() if value.context_mask is not None else None
+                ),
+                cross_modality_sigma=(
+                    value.cross_modality_sigma.clone()
+                    if value.cross_modality_sigma is not None
+                    else None
                 ),
             )
         if isinstance(value, LTX23TextConditioning):
@@ -136,6 +149,9 @@ class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
             dst.positions.copy_(src.positions)
             dst.context.copy_(src.context)
             _LTX23CUDAGraphRunner._copy_optional_tensor(dst.context_mask, src.context_mask)
+            _LTX23CUDAGraphRunner._copy_optional_tensor(
+                dst.cross_modality_sigma, src.cross_modality_sigma
+            )
             return dst
         if isinstance(src, LTX23TextConditioning) and isinstance(dst, LTX23TextConditioning):
             copy_tensor = _LTX23CUDAGraphRunner._copy_optional_tensor
@@ -237,6 +253,11 @@ def _build_ltx23_transformer(pipeline_config) -> LTX23Model:
         "text_encoder_path": "google/gemma-3-12b-it",
         "workflow": "generation",
         "retake_fp8_linear_steps": None,
+        "retake_two_stage": False,
+        "retake_spatial_upsampler_path": "",
+        "retake_stage2_quant": None,
+        "retake_stage2_fp8_linear_steps": None,
+        "retake_stage2_checkpoint": "",
     },
     doc="Lightricks LTX-2.3 text-to-video generation and retake with audio.",
 )

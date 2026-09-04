@@ -31,4 +31,4 @@ parallel_config:
   cfg_size: 1
   ulysses_size: 1
 cuda_graph_config:
-  enable: false
+  enable: true

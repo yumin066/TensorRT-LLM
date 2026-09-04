@@ -50,7 +50,8 @@ if IS_FLASHINFER_AVAILABLE:
         flashinfer_apply_rope_with_cos_sin_cache_inplace,
         flashinfer_fused_add_rmsnorm, flashinfer_gelu_tanh_and_mul,
         flashinfer_gemma_fused_add_rmsnorm, flashinfer_gemma_rmsnorm,
-        flashinfer_rmsnorm, flashinfer_silu_and_mul)
+        flashinfer_nvfp4_attention_sm120, flashinfer_rmsnorm,
+        flashinfer_silu_and_mul, flashinfer_single_prefill_with_kv_cache)
     __all__ += [
         'flashinfer_gelu_tanh_and_mul',
         'flashinfer_silu_and_mul',
@@ -59,6 +60,8 @@ if IS_FLASHINFER_AVAILABLE:
         'flashinfer_apply_rope_with_cos_sin_cache_inplace',
         'flashinfer_gemma_fused_add_rmsnorm',
         'flashinfer_gemma_rmsnorm',
+        'flashinfer_nvfp4_attention_sm120',
+        'flashinfer_single_prefill_with_kv_cache',
     ]
 
 if IS_CUTLASS_DSL_AVAILABLE:

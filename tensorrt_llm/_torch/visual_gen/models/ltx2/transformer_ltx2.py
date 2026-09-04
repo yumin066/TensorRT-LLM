@@ -841,10 +841,9 @@ class BasicAVTransformerBlock(nn.Module):
         """
         num_ada_params = scale_shift_table.shape[0]
         ts_reshaped = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)
-        return tuple(
-            (scale_shift_table[i], ts_reshaped[:, :, i, :])
-            for i in range(*indices.indices(num_ada_params))
-        )
+        table_values = scale_shift_table[indices].unbind(dim=0)
+        timestep_values = ts_reshaped[:, :, indices, :].unbind(dim=2)
+        return tuple(zip(table_values, timestep_values))
 
     @staticmethod
     def _get_av_ca_ada_values(
