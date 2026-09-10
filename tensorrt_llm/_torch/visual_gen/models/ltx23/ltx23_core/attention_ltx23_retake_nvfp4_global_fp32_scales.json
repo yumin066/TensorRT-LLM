@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "model": "LTX-2.3",
+  "pipeline": "retake",
+  "recipe": "video_self_attention_qk",
+  "quantization": {
+    "activation_format": "NVFP4 E2M1",
+    "activation_block_size": 16,
+    "dynamic_block_scale_format": "E4M3",
+    "static_global_scale_format": "FP32",
+    "global_quant_max": 2688.0
+  },
+  "calibration": {
+    "reference_hardware": "NVIDIA RTX PRO 6000 Blackwell",
+    "method": "max",
+    "headroom": 1.0,
+    "activation_dtype": "bfloat16",
+    "global_fp32_scale_formula": "2688 / observed_amax"
+  },
+  "attention": {
+    "qk": {
+      "observed_amax": 168.0,
+      "global_fp32_scale": 16.0
+    }
+  }
+}

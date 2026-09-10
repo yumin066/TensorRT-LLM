@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 1-GPU LTX-2.3 two-stage Retake recipe for SM100/SM103. Dynamic NVFP4
+# transformer linears are combined with graph-safe NVFP4 Q/K and per-head-channel
+# FP8 V attention. Q/K use the Retake-scoped offline-calibrated global FP32 scale,
+# allowing the resident NVFP4 transformer and shared FP8 companion to use CUDA
+# Graph at both stage shapes. SM100 uses the BF16 VAE because the NVFP4 Conv3d
+# kernel is SM120-specific.
+pipeline_config:
+  workflow: retake
+  retake_fp8_linear_steps: [4, 7]
+  retake_two_stage: true
+  retake_spatial_upsampler_path: ""
+  retake_stage2_quant: FP8
+  retake_stage2_fp8_linear_steps: [2]
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+attention_config:
+  backend: CUTEDSL
+  quant_attention_config:
+    qk_dtype: nvfp4
+    v_dtype: fp8
+    v_block_size: 1
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: true

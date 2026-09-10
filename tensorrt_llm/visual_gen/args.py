@@ -90,6 +90,15 @@ class QuantAttentionConfig(StrictBaseModel):
             "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
         ),
     )
+    qk_global_scale: Optional[float] = Field(
+        None,
+        gt=0.0,
+        status="prototype",
+        description=(
+            "Optional offline-calibrated FP32 global multiplier for CuTe DSL NVFP4 Q/K. "
+            "None selects dynamic per-tensor scaling."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -152,6 +161,12 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         q_config = self.quant_attention_config
+        if q_config.qk_global_scale is not None and (
+            self.backend != "CUTEDSL" or q_config.qk_dtype != "nvfp4"
+        ):
+            raise ValueError(
+                "qk_global_scale is only supported for CUTEDSL attention with qk_dtype='nvfp4'."
+            )
         recipe = (
             q_config.qk_dtype,
             q_config.v_dtype,

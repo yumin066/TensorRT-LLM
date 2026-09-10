@@ -500,8 +500,10 @@ def _quantize_fp8_v(
 
 
 def _quantize_blockscaled_one(
-    x_bshd: torch.Tensor, qk_sf_vec: int
-) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    x_bshd: torch.Tensor,
+    qk_sf_vec: int,
+    qk_global_scale: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, float | torch.Tensor]:
     """Quantize a single (B, S, H, D) bf16/fp16 tensor for the block-scaled kernel.
 
     Steps:
@@ -518,7 +520,8 @@ def _quantize_blockscaled_one(
         x_sf:   swizzled SF tensor produced by the op (kept padded to S_pad).
         scale:  scalar dequant factor to fold into scale_softmax.
                 1.0 for MXFP8 (per-block SFs carry the full range);
-                amax/(448*6) for NVFP4 (the per-tensor global scale).
+                1/global_scale for NVFP4. The global scale is either supplied by
+                offline calibration or computed dynamically from amax.
     """
     if x_bshd.dim() != 4:
         raise ValueError(f"_quantize_blockscaled_one expects (B, S, H, D); got {x_bshd.shape}")
@@ -549,15 +552,20 @@ def _quantize_blockscaled_one(
     if qk_sf_vec == 16:
         # NVFP4: per-16-element block, E4M3 SFs in swizzled layout; per-tensor global scale folded
         # into the returned `scale` (caller multiplies it into scale_softmax via scale_q / scale_k).
-        amax = x_2d.float().abs().amax().clamp(min=1e-6)
-        global_sf = (_FP8_E4M3_MAX * _FP4_E2M1_MAX) / amax
-        global_sf_t = global_sf.to(torch.float32).reshape(1)
+        if qk_global_scale is None:
+            amax = x_2d.float().abs().amax().clamp(min=1e-6)
+            global_sf = (_FP8_E4M3_MAX * _FP4_E2M1_MAX) / amax
+            global_sf_t = global_sf.to(torch.float32).reshape(1)
+            dequant_scale = amax / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
+        else:
+            global_sf_t = torch.full((1,), qk_global_scale, dtype=torch.float32, device=x_2d.device)
+            dequant_scale = 1.0 / qk_global_scale
         x_q_2d, x_sf = torch.ops.trtllm.fp4_quantize(x_2d, global_sf_t, 16, False)
         # x_q_2d shape: (M, D/2) uint8 — natural packed layout (2 FP4 / byte).
         head_dim_packed = head_dim // 2
         x_q = x_q_2d.view(batch_size, num_heads, s_pad, head_dim_packed)
         x_q = x_q[:, :, :seq_len, :].transpose(1, 2).contiguous()  # (B, S, H, D/2)
-        return x_q, x_sf, amax / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
+        return x_q, x_sf, dequant_scale
 
     raise ValueError(f"Unsupported qk_sf_vec={qk_sf_vec}; expected 0, 16, or 32.")
 
@@ -691,8 +699,8 @@ class CuTeDSLAttention(AttentionBackend):
         if qac is not None:
             if qac.qk_dtype in ("mxfp8", "nvfp4"):
                 qk_sf_vec = 32 if qac.qk_dtype == "mxfp8" else 16
-                q, q_sf, gs_q = _quantize_blockscaled_one(q, qk_sf_vec)
-                k, k_sf, gs_k = _quantize_blockscaled_one(k, qk_sf_vec)
+                q, q_sf, gs_q = _quantize_blockscaled_one(q, qk_sf_vec, qac.qk_global_scale)
+                k, k_sf, gs_k = _quantize_blockscaled_one(k, qk_sf_vec, qac.qk_global_scale)
                 scale_q = scale_q * gs_q
                 scale_k = scale_k * gs_k
                 qk_cutlass_dtype = cutlass.Float4E2M1FN if qk_sf_vec == 16 else cutlass.Float8E4M3FN

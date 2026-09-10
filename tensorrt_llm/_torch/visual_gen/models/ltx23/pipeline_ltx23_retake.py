@@ -18,6 +18,7 @@ import copy
 import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import safetensors.torch
@@ -80,6 +81,25 @@ _RETAKE_DISTILLED_SIGMA_VALUES = (
     0.0,
 )
 _RETAKE_NUM_INFERENCE_STEPS = len(_RETAKE_DISTILLED_SIGMA_VALUES) - 1
+
+_RETAKE_NVFP4_ATTENTION_RECIPE = (
+    Path(__file__).with_name("ltx23_core") / "attention_ltx23_retake_nvfp4_global_fp32_scales.json"
+)
+
+
+def _load_retake_nvfp4_qk_global_scale(path: str | None = None) -> float:
+    recipe_path = Path(path) if path is not None else _RETAKE_NVFP4_ATTENTION_RECIPE
+    payload = json.loads(recipe_path.read_text(encoding="utf-8"))
+    qk = payload["attention"]["qk"]
+    observed_amax = float(qk["observed_amax"])
+    global_scale = float(qk["global_fp32_scale"])
+    quant_max = float(payload["quantization"]["global_quant_max"])
+    if observed_amax <= 0.0 or not math.isclose(
+        global_scale, quant_max / observed_amax, rel_tol=1e-6
+    ):
+        raise ValueError(f"Invalid NVFP4 attention calibration recipe: {recipe_path}")
+    return global_scale
+
 
 # Two-stage Retake first renders a half-resolution draft and then performs a
 # short full-resolution refinement.
@@ -458,6 +478,26 @@ class LTX23RetakePipeline(LTX23Pipeline):
         )
         self._checkpoint_dir: str | None = None
         self._retake_vae_nvfp4_recipe: LTX23Nvfp4RetakeRecipe | None = None
+        attention_config = pipeline_config.attention
+        quant_attention_config = attention_config.quant_attention_config
+        if (
+            attention_config.backend == "CUTEDSL"
+            and quant_attention_config is not None
+            and quant_attention_config.qk_dtype == "nvfp4"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 10
+        ):
+            recipe_path = pipeline_config.extra_attrs.get("retake_attention_nvfp4_recipe_path")
+            global_scale = _load_retake_nvfp4_qk_global_scale(recipe_path)
+            quant_attention_config.qk_global_scale = global_scale
+            model_attention_config = pipeline_config.model_configs["transformer"].attention
+            model_quant_attention_config = model_attention_config.quant_attention_config
+            if model_quant_attention_config is None:
+                raise ValueError(
+                    "The SM100 Retake transformer is missing its NVFP4 attention config."
+                )
+            model_quant_attention_config.qk_global_scale = global_scale
+            logger.info("LTX-2.3 Retake: loaded offline-calibrated NVFP4 Q/K scale.")
         configured_two_stage = pipeline_config.extra_attrs.get("retake_two_stage", False)
         if not isinstance(configured_two_stage, bool):
             raise TypeError("retake_two_stage must be a boolean in pipeline_config.")
@@ -519,7 +559,10 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 self._wrap_retake_cuda_graph(name, transformer)
 
     def _uses_nvfp4_video_vae(self) -> bool:
-        return self.pipeline_config.quant_config.quant_algo == QuantAlgo.NVFP4
+        return (
+            self.pipeline_config.quant_config.quant_algo == QuantAlgo.NVFP4
+            and torch.cuda.get_device_capability()[0] >= 12
+        )
 
     def _nvfp4_video_vae_recipe(self) -> LTX23Nvfp4RetakeRecipe:
         if self._retake_vae_nvfp4_recipe is None:

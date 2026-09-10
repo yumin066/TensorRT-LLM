@@ -508,6 +508,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             "retake_stage2_quant",
             "retake_stage2_fp8_linear_steps",
             "retake_stage2_checkpoint",
+            "retake_attention_nvfp4_recipe_path",
         ):
             if key in resolved_pipeline_config:
                 extra_attrs[key] = resolved_pipeline_config[key]
