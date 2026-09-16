@@ -788,9 +788,10 @@ class LTX23RetakePipeline(LTX23Pipeline):
         )
         if velocity_video is None:
             raise RuntimeError("LTX-2.3 retake transformer returned no video prediction.")
-        expanded_sigma = sigma.float()
-        while expanded_sigma.ndim < velocity_video.ndim:
-            expanded_sigma = expanded_sigma.unsqueeze(-1)
+        # Soft-margin tokens receive only a fraction of the global timestep.
+        # Use that same per-token sigma when reconstructing x0; using the global
+        # sigma here over-denoises the margin and causes visible colour drift.
+        expanded_sigma = video_timestep.float().unsqueeze(-1)
         denoised_video = (video_float - velocity_video.float() * expanded_sigma).to(self.dtype)
         blend = denoise_mask.unsqueeze(-1).float()
         return (denoised_video.float() * blend + clean_latent.float() * (1.0 - blend)).to(
@@ -1162,8 +1163,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
             source_audio,
             pixel_shape,
         )
-        # The frozen audio follows a noise-to-clean trajectory on the same sigma
-        # schedule as the video rather than remaining constant.
+        # Keep the encoded source audio clean throughout denoising.
         if audio_latent is not None:
             audio_shape = AudioLatentShape.from_torch_shape(audio_latent.shape)
             audio_clean_latents = self.audio_patchifier.patchify(audio_latent.float())
@@ -1209,21 +1209,16 @@ class LTX23RetakePipeline(LTX23Pipeline):
         timesteps = scheduler.timesteps
         num_steps = len(timesteps)
 
-        # Denoise frozen audio toward its clean x0 target on the video sigma
-        # schedule. This keeps cross-attention noise-matched without predicting
-        # an audio velocity with the transformer.
+        # Preserved audio is clean conditioning at every denoising step. Adding
+        # noise here weakens the audio guidance during the early steps where lip
+        # motion is formed.
         extra_streams = None
         clean_audio = None
         if audio_clean_latents is not None:
             clean_audio = audio_clean_latents.to(dtype)
-            audio_noise = torch.randn(
-                clean_audio.shape, generator=generator, device=device, dtype=dtype
-            )
-            sigma = scheduler.sigmas[0]
-            audio_state = (audio_noise * sigma + clean_audio.float() * (1.0 - sigma)).to(dtype)
             audio_scheduler = copy.deepcopy(scheduler)
             extra_streams = {
-                "audio": (audio_state, audio_scheduler),
+                "audio": (clean_audio, audio_scheduler),
             }
 
         def retake_forward_fn(
@@ -1252,8 +1247,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 step_text_cache=fp8_step_text_cache,
                 step_indices=self._fp8_step_indices,
             )
-            audio_prediction = {"audio": clean_audio} if clean_audio is not None else {}
-            return denoised_video, audio_prediction
+            return denoised_video, {}
 
         timer.mark_denoise_start()
         denoise_result = self.denoise(
@@ -1352,17 +1346,8 @@ class LTX23RetakePipeline(LTX23Pipeline):
         clean_audio = None
         if conditioning.audio_clean_latents is not None:
             clean_audio = conditioning.audio_clean_latents.to(self.dtype)
-            audio_noise = torch.randn(
-                clean_audio.shape,
-                generator=generator,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            audio_state = (
-                audio_noise * initial_sigma + clean_audio.float() * (1.0 - initial_sigma)
-            ).to(self.dtype)
             extra_streams = {
-                "audio": (audio_state, copy.deepcopy(scheduler)),
+                "audio": (clean_audio, copy.deepcopy(scheduler)),
             }
 
         def _forward(
@@ -1391,8 +1376,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 step_text_cache=companion_text_cache,
                 step_indices=stage.companion_steps,
             )
-            audio_prediction = {"audio": clean_audio} if clean_audio is not None else {}
-            return denoised_video, audio_prediction
+            return denoised_video, {}
 
         result = self.denoise(
             latents=working_latents,
