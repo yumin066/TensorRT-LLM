@@ -17,6 +17,11 @@
 # learned 2x latent upsample, and three-step full-resolution refinement.
 pipeline_config:
   workflow: retake
+  retake_vae_encoder_nvfp4: true
+  retake_vae_decoder_nvfp4: true
+  retake_vae_encoder_nvfp4_exclude:
+    - down_blocks.0.res_blocks.0.conv1
+    - down_blocks.0.res_blocks.1.conv1
   retake_fp8_linear_steps: [4, 7]
   retake_two_stage: true
   # Supply this path through a config override or request extra parameter.

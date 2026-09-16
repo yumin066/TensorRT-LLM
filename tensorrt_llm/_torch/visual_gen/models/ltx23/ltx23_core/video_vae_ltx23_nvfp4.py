@@ -332,25 +332,40 @@ class _PreparedNvfp4Conv3d(nn.Module):
 
 
 class LTX23Nvfp4ResnetBlock(nn.Module):
-    """Drop-in LTX-2.3 ResNet block with both Conv3d sites in W4A4."""
+    """Drop-in LTX-2.3 ResNet block with selected Conv3d sites in W4A4."""
 
     def __init__(
         self,
         source: ResnetBlock3D,
         scales: Sequence[float],
         name: str,
+        enabled_convs: Sequence[str] = ("conv1", "conv2"),
     ) -> None:
         super().__init__()
         if len(scales) != 2 or any(float(scale) <= 0.0 for scale in scales):
             raise ValueError(f"{name} requires two positive activation scales")
+        enabled = frozenset(enabled_convs)
+        if not enabled or not enabled <= {"conv1", "conv2"}:
+            raise ValueError(f"{name} has invalid NVFP4 Conv3d selection: {sorted(enabled)}")
         if not isinstance(source.norm1, PixelNorm) or not isinstance(source.norm2, PixelNorm):
             raise TypeError(f"{name} requires PixelNorm")
         if source.inject_noise or source.timestep_conditioning:
             raise ValueError(f"{name} cannot use noisy or conditioned blocks")
         if source.dropout.p != 0:
             raise ValueError(f"{name} requires dropout=0")
-        self.conv1 = _PreparedNvfp4Conv3d(source.conv1, float(scales[0]), f"{name}.conv1")
-        self.conv2 = _PreparedNvfp4Conv3d(source.conv2, float(scales[1]), f"{name}.conv2")
+        self.conv1 = (
+            _PreparedNvfp4Conv3d(source.conv1, float(scales[0]), f"{name}.conv1")
+            if "conv1" in enabled
+            else source.conv1
+        )
+        self.conv2 = (
+            _PreparedNvfp4Conv3d(source.conv2, float(scales[1]), f"{name}.conv2")
+            if "conv2" in enabled
+            else source.conv2
+        )
+        self.norm1 = source.norm1
+        self.norm2 = source.norm2
+        self.non_linearity = source.non_linearity
         self.conv_shortcut = source.conv_shortcut
         self.norm3 = source.norm3
         self.in_channels = source.in_channels
@@ -369,18 +384,24 @@ class LTX23Nvfp4ResnetBlock(nn.Module):
             raise ValueError("NVFP4 VAE ResNet block does not support timestep conditioning")
         del generator
         residual = self.conv_shortcut(self.norm3(input_tensor))
-        hidden = self.conv1(
-            input_tensor,
-            causal=causal,
-            eps=self.eps1,
-            normalize_and_activate=True,
-        )
-        hidden = self.conv2(
-            hidden,
-            causal=causal,
-            eps=self.eps2,
-            normalize_and_activate=True,
-        )
+        if isinstance(self.conv1, _PreparedNvfp4Conv3d):
+            hidden = self.conv1(
+                input_tensor,
+                causal=causal,
+                eps=self.eps1,
+                normalize_and_activate=True,
+            )
+        else:
+            hidden = self.conv1(self.non_linearity(self.norm1(input_tensor)), causal=causal)
+        if isinstance(self.conv2, _PreparedNvfp4Conv3d):
+            hidden = self.conv2(
+                hidden,
+                causal=causal,
+                eps=self.eps2,
+                normalize_and_activate=True,
+            )
+        else:
+            hidden = self.conv2(self.non_linearity(self.norm2(hidden)), causal=causal)
         return residual + hidden
 
 
@@ -408,21 +429,35 @@ def _validated_scales(
 
 
 def _build_nvfp4_encoder_graph(
-    encoder: LTX23VideoEncoder, activation_scales: Mapping[str, float]
+    encoder: LTX23VideoEncoder,
+    activation_scales: Mapping[str, float],
+    excluded_sites: Sequence[str] = (),
 ) -> tuple[str, ...]:
     sites = encoder_resnet_sites(encoder)
     expected = {
         conv_name for site in sites for conv_name in (f"{site.name}.conv1", f"{site.name}.conv2")
     }
     scales = _validated_scales(activation_scales, expected, "encoder")
+    excluded = frozenset(excluded_sites)
+    unexpected = sorted(excluded - expected)
+    if unexpected:
+        raise ValueError(f"unknown encoder NVFP4 Conv3d exclusions: {unexpected}")
     installed = []
     for site in sites:
+        enabled_convs = tuple(
+            conv_name
+            for conv_name in ("conv1", "conv2")
+            if f"{site.name}.{conv_name}" not in excluded
+        )
+        if not enabled_convs:
+            continue
         site.parent[site.index] = LTX23Nvfp4ResnetBlock(
             site.module,
             (scales[f"{site.name}.conv1"], scales[f"{site.name}.conv2"]),
             site.name,
+            enabled_convs,
         ).eval()
-        installed.append(site.name)
+        installed.extend(f"{site.name}.{conv_name}" for conv_name in enabled_convs)
     return tuple(installed)
 
 
@@ -472,10 +507,11 @@ class LTX23Nvfp4VideoEncoder(_LTX23Nvfp4VideoVaeMixin, LTX23VideoEncoder):
         self,
         *args,
         activation_scales: Mapping[str, float],
+        excluded_sites: Sequence[str] = (),
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.nvfp4_sites = _build_nvfp4_encoder_graph(self, activation_scales)
+        self.nvfp4_sites = _build_nvfp4_encoder_graph(self, activation_scales, excluded_sites)
 
 
 class LTX23Nvfp4VideoDecoder(_LTX23Nvfp4VideoVaeMixin, LTX23VideoDecoder):

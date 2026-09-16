@@ -258,6 +258,10 @@ def _build_ltx23_transformer(pipeline_config) -> LTX23Model:
         "retake_stage2_quant": None,
         "retake_stage2_fp8_linear_steps": None,
         "retake_stage2_checkpoint": "",
+        "retake_vae_nvfp4": True,
+        "retake_vae_encoder_nvfp4": None,
+        "retake_vae_decoder_nvfp4": None,
+        "retake_vae_encoder_nvfp4_exclude": None,
     },
     doc="Lightricks LTX-2.3 text-to-video generation and retake with audio.",
 )

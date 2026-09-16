@@ -509,6 +509,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             "retake_stage2_fp8_linear_steps",
             "retake_stage2_checkpoint",
             "retake_attention_nvfp4_recipe_path",
+            "retake_vae_nvfp4",
+            "retake_vae_encoder_nvfp4",
+            "retake_vae_decoder_nvfp4",
+            "retake_vae_encoder_nvfp4_exclude",
         ):
             if key in resolved_pipeline_config:
                 extra_attrs[key] = resolved_pipeline_config[key]

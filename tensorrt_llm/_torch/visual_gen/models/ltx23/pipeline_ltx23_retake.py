@@ -478,6 +478,31 @@ class LTX23RetakePipeline(LTX23Pipeline):
         )
         self._checkpoint_dir: str | None = None
         self._retake_vae_nvfp4_recipe: LTX23Nvfp4RetakeRecipe | None = None
+        configured_vae_nvfp4 = pipeline_config.extra_attrs.get("retake_vae_nvfp4", True)
+        if not isinstance(configured_vae_nvfp4, bool):
+            raise TypeError("retake_vae_nvfp4 must be a boolean in pipeline_config.")
+        configured_encoder_nvfp4 = pipeline_config.extra_attrs.get("retake_vae_encoder_nvfp4")
+        configured_decoder_nvfp4 = pipeline_config.extra_attrs.get("retake_vae_decoder_nvfp4")
+        for name, value in (
+            ("retake_vae_encoder_nvfp4", configured_encoder_nvfp4),
+            ("retake_vae_decoder_nvfp4", configured_decoder_nvfp4),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean in pipeline_config.")
+        self._retake_vae_encoder_nvfp4 = (
+            configured_vae_nvfp4 if configured_encoder_nvfp4 is None else configured_encoder_nvfp4
+        )
+        self._retake_vae_decoder_nvfp4 = (
+            configured_vae_nvfp4 if configured_decoder_nvfp4 is None else configured_decoder_nvfp4
+        )
+        excluded_encoder_sites = pipeline_config.extra_attrs.get("retake_vae_encoder_nvfp4_exclude")
+        if excluded_encoder_sites is None:
+            excluded_encoder_sites = ()
+        if not isinstance(excluded_encoder_sites, (list, tuple)) or not all(
+            isinstance(site, str) for site in excluded_encoder_sites
+        ):
+            raise TypeError("retake_vae_encoder_nvfp4_exclude must be a list of Conv3d site names.")
+        self._retake_vae_encoder_nvfp4_exclude = tuple(excluded_encoder_sites)
         attention_config = pipeline_config.attention
         quant_attention_config = attention_config.quant_attention_config
         if (
@@ -558,11 +583,17 @@ class LTX23RetakePipeline(LTX23Pipeline):
             if transformer is not None:
                 self._wrap_retake_cuda_graph(name, transformer)
 
-    def _uses_nvfp4_video_vae(self) -> bool:
+    def _supports_nvfp4_video_vae(self) -> bool:
         return (
             self.pipeline_config.quant_config.quant_algo == QuantAlgo.NVFP4
             and torch.cuda.get_device_capability()[0] >= 12
         )
+
+    def _uses_nvfp4_video_encoder(self) -> bool:
+        return self._retake_vae_encoder_nvfp4 and self._supports_nvfp4_video_vae()
+
+    def _uses_nvfp4_video_decoder(self) -> bool:
+        return self._retake_vae_decoder_nvfp4 and self._supports_nvfp4_video_vae()
 
     def _nvfp4_video_vae_recipe(self) -> LTX23Nvfp4RetakeRecipe:
         if self._retake_vae_nvfp4_recipe is None:
@@ -571,7 +602,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         return self._retake_vae_nvfp4_recipe
 
     def _create_video_decoder(self, config: dict[str, Any]):
-        if not self._uses_nvfp4_video_vae():
+        if not self._uses_nvfp4_video_decoder():
             return super()._create_video_decoder(config)
         recipe = self._nvfp4_video_vae_recipe()
         logger.info("Loading LTX-2.3 Retake video decoder with static NVFP4 VAE scales.")
@@ -670,11 +701,13 @@ class LTX23RetakePipeline(LTX23Pipeline):
             encoder_blocks = config.get("vae", {}).get("encoder_blocks", [])
             if not encoder_blocks:
                 raise ValueError("LTX-2.3 checkpoint config has no video VAE encoder blocks.")
-            if self._uses_nvfp4_video_vae():
+            if self._uses_nvfp4_video_encoder():
                 recipe = self._nvfp4_video_vae_recipe()
                 logger.info("Loading LTX-2.3 Retake video encoder with static NVFP4 VAE scales.")
                 self.video_encoder = LTX23Nvfp4VideoEncoderConfigurator.from_config(
-                    config, activation_scales=recipe.encoder
+                    config,
+                    activation_scales=recipe.encoder,
+                    excluded_sites=self._retake_vae_encoder_nvfp4_exclude,
                 )
             else:
                 self.video_encoder = LTX23VideoEncoderConfigurator.from_config(config)

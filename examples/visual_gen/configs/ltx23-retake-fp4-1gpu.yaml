@@ -17,6 +17,11 @@
 # FlashInfer NVFP4 self-attention on Blackwell GPUs.
 pipeline_config:
   workflow: retake
+  retake_vae_encoder_nvfp4: true
+  retake_vae_decoder_nvfp4: true
+  retake_vae_encoder_nvfp4_exclude:
+    - down_blocks.0.res_blocks.0.conv1
+    - down_blocks.0.res_blocks.1.conv1
   # Use a resident FP8 linear transformer at the two quality-sensitive steps.
   retake_fp8_linear_steps: [4, 7]
 quant_config:
