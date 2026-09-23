@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+
 from ..ltx2.ltx2_core.adaln import AdaLayerNormSingle
 from ..ltx2.ltx2_core.utils_ltx2 import (
     apply_fused_gate_resid,
@@ -82,8 +84,19 @@ class LTX23TransformerBlock(nn.Module):
             audio is None or is_fused_adaln_supported_dim(audio.dim)
         )
         dense_config = _without_quantized_attention(config)
+        visual_gen_mapping = config.visual_gen_mapping if config is not None else None
+        self._sharder = SequenceSharder.from_vgm(visual_gen_mapping)
 
-        def attn(name, query_dim, context_dim, kv, gated, model_config=dense_config):
+        def attn(
+            name,
+            query_dim,
+            context_dim,
+            kv,
+            gated,
+            model_config=dense_config,
+            *,
+            enable_sequence_parallel=False,
+        ):
             return LTX2Attention(
                 query_dim=query_dim,
                 context_dim=context_dim,
@@ -95,14 +108,22 @@ class LTX23TransformerBlock(nn.Module):
                 config=model_config,
                 layer_idx=idx,
                 module_name=f"transformer_blocks.{idx}.{name}",
-                enable_sequence_parallel=False,
+                enable_sequence_parallel=enable_sequence_parallel,
             )
 
         if video is not None:
             gated_v = video.apply_gated_attention
             # FlashInfer quantized attention requires equal Q/KV sequence
             # lengths, so only video self-attention uses the quantized path.
-            self.attn1 = attn("attn1", video.dim, None, video, gated_v, config)
+            self.attn1 = attn(
+                "attn1",
+                video.dim,
+                None,
+                video,
+                gated_v,
+                config,
+                enable_sequence_parallel=True,
+            )
             self.attn2 = attn("attn2", video.dim, video.context_dim, video, gated_v)
             self.ff = _make_mlp(video, config, idx)
             self.scale_shift_table = nn.Parameter(torch.empty(9, video.dim))
@@ -121,7 +142,11 @@ class LTX23TransformerBlock(nn.Module):
                 "audio_to_video_attn", video.dim, audio.dim, audio, video.apply_gated_attention
             )
             self.video_to_audio_attn = attn(
-                "video_to_audio_attn", audio.dim, video.dim, audio, audio.apply_gated_attention
+                "video_to_audio_attn",
+                audio.dim,
+                video.dim,
+                audio,
+                audio.apply_gated_attention,
             )
             self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, audio.dim))
             self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, video.dim))
@@ -254,13 +279,33 @@ class LTX23TransformerBlock(nn.Module):
             self.norm_eps,
             self._fuse_adaln,
         )
-        k, v = attn.project_kv(kv_norm, pe=kv_stream.cross_positional_embeddings)
-        out = attn(
-            q_norm,
-            pre_projected_kv=(k, v),
-            pe=query_stream.cross_positional_embeddings,
-            timestep=query_stream.timesteps,
-        )
+        query_pe = query_stream.cross_positional_embeddings
+        if not is_a2v and self._sharder.is_active:
+            # Audio Q stays replicated while video K/V is sequence-sharded.
+            # Project K/V locally, concatenate them, and issue ONE full-video
+            # all-gather per block. This preserves projection scaling while
+            # halving collective launch count versus separate K and V gathers.
+            # On PCIe/SYS RTX PRO 6000, using Ulysses for this asymmetric
+            # cross-attention doubled SendRecv calls and was substantially
+            # slower than a fused K/V all-gather.
+            k, v = attn.project_kv(kv_norm, pe=kv_stream.cross_positional_embeddings)
+            k_width = k.shape[-1]
+            kv = self._sharder.gather(torch.cat((k, v), dim=-1), dim=1)
+            k, v = kv.split((k_width, kv.shape[-1] - k_width), dim=-1)
+            out = attn(
+                q_norm,
+                pre_projected_kv=(k, v),
+                pe=query_pe,
+                timestep=query_stream.timesteps,
+            )
+        else:
+            k, v = attn.project_kv(kv_norm, pe=kv_stream.cross_positional_embeddings)
+            out = attn(
+                q_norm,
+                pre_projected_kv=(k, v),
+                pe=query_pe,
+                timestep=query_stream.timesteps,
+            )
         return apply_fused_gate_resid(query_x, out, gate[0], gate[1], self._fuse_adaln)
 
     def forward(
@@ -528,12 +573,26 @@ class LTX23Model(LTXModel):
         video_args, video_prompt_ts = self._prepare_stream(video, text_cache, is_audio=False)
         audio_args, audio_prompt_ts = self._prepare_stream(audio, text_cache, is_audio=True)
 
+        if self._active_sharder.is_active and video_args is not None:
+            video_args = self._shard_transformer_args(video_args)
+
         for block in self.transformer_blocks:
             video_args, audio_args = block(
                 video_args,
                 audio_args,
                 video_prompt_timestep=video_prompt_ts,
                 audio_prompt_timestep=audio_prompt_ts,
+            )
+
+        if self._active_sharder.is_active and video_args is not None:
+            gathered_video = self._gather_sequence(video_args.x)
+            embedded_timestep = video_args.embedded_timestep
+            if embedded_timestep.shape[1] == video_args.x.shape[1]:
+                embedded_timestep = self._gather_sequence(embedded_timestep)
+            video_args = replace(
+                video_args,
+                x=gathered_video,
+                embedded_timestep=embedded_timestep,
             )
 
         return (

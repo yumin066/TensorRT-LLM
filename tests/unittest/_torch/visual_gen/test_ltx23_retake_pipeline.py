@@ -132,6 +132,23 @@ def test_retake_quantizes_only_video_self_attention() -> None:
     assert model_config.attention.quant_attention_config is not None
 
 
+def test_retake_enables_parallel_vae_with_ulysses(monkeypatch) -> None:
+    pipeline = LTX23RetakePipeline.__new__(LTX23RetakePipeline)
+    torch.nn.Module.__init__(pipeline)
+    vae_group = object()
+    pipeline.pipeline_config = SimpleNamespace(
+        parallel=SimpleNamespace(ulysses_size=2, parallel_vae_size=2),
+        visual_gen_mapping=SimpleNamespace(vae_group=vae_group, vae_ranks=[0, 1]),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    pipeline.setup_parallel_vae()
+
+    assert pipeline.pipeline_config.parallel.ulysses_size == 2
+    assert pipeline._parallel_vae_enabled
+
+
 def test_retake_pipeline_registration_and_config_schema(monkeypatch) -> None:
     retake_entry = PIPELINE_REGISTRY["LTX23RetakePipeline"]
     assert retake_entry.pipeline_cls is LTX23RetakePipeline

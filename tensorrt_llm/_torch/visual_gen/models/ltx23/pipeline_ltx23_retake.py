@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import safetensors.torch
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig, SharedGraphPool
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -44,6 +45,7 @@ from ..ltx2.ltx2_core.types import (
 )
 from ..ltx2.ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from ..ltx2.ltx2_core.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
+from ..ltx2.parallel_vae import tile_parallel_decode
 from ..ltx2.pipeline_ltx2 import _load_component_weights
 from .ltx23_core.audio_vae import AudioEncoderConfigurator, encode_audio
 from .ltx23_core.modality import LTX23Modality
@@ -60,6 +62,7 @@ from .media_io import (
     get_videostream_metadata,
     pad_audio_to_video_duration,
 )
+from .parallel_vae import tile_parallel_encode
 from .pipeline_ltx23 import LTX23Pipeline, _build_ltx23_transformer, _LTX23CUDAGraphRunner
 from .text_conditioning_ltx23 import LTX23TextConditioning
 from .transformer_ltx23 import LTX23Model
@@ -81,6 +84,7 @@ _RETAKE_DISTILLED_SIGMA_VALUES = (
     0.0,
 )
 _RETAKE_NUM_INFERENCE_STEPS = len(_RETAKE_DISTILLED_SIGMA_VALUES) - 1
+
 
 _RETAKE_NVFP4_ATTENTION_RECIPE = (
     Path(__file__).with_name("ltx23_core") / "attention_ltx23_retake_nvfp4_global_fp32_scales.json"
@@ -468,10 +472,14 @@ class LTX23RetakePipeline(LTX23Pipeline):
             raise NotImplementedError("Cache acceleration is not supported for LTX-2.3 retake.")
         if pipeline_config.parallel.cfg_size != 1:
             raise NotImplementedError("LTX-2.3 retake requires parallel.cfg_size=1.")
-        if pipeline_config.parallel.parallel_vae_size != 1:
-            raise NotImplementedError("Parallel VAE is not supported for LTX-2.3 retake.")
-        if pipeline_config.parallel.seq_parallel_size != 1 or pipeline_config.parallel.tp_size != 1:
-            raise NotImplementedError("LTX-2.3 retake currently supports a single GPU only.")
+        if pipeline_config.parallel.tp_size != 1:
+            raise NotImplementedError("Tensor parallelism is not supported for LTX-2.3 retake.")
+        if pipeline_config.parallel.seq_parallel_size != pipeline_config.parallel.ulysses_size:
+            raise NotImplementedError(
+                "LTX-2.3 retake currently supports Ulysses sequence parallelism only."
+            )
+        if pipeline_config.parallel.async_ulysses:
+            raise NotImplementedError("Async Ulysses is not supported for LTX-2.3 retake.")
         self._fp8_step_transformer: LTX23Model | None = None
         self._fp8_step_indices = _normalize_fp8_step_indices(
             pipeline_config.extra_attrs.get("retake_fp8_linear_steps")
@@ -547,6 +555,63 @@ class LTX23RetakePipeline(LTX23Pipeline):
             setting_name="retake_stage2_fp8_linear_steps",
         )
         super().__init__(pipeline_config)
+
+    def setup_parallel_vae(self) -> None:
+        """Enable tile-parallel Retake VAE encode/decode on every model rank.
+
+        Retake needs the encoded source latent on every rank before denoising and
+        currently returns a decoded video from every rank. The initial supported
+        configuration therefore uses the complete model world as the VAE group.
+        """
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
+        requested = parallel_cfg.parallel_vae_size
+        self._parallel_vae_enabled = requested > 1
+        if not self._parallel_vae_enabled:
+            return
+        if not dist.is_initialized() or vgm is None or vgm.vae_group is None:
+            raise RuntimeError("LTX-2.3 Retake parallel VAE requires an initialized VAE group.")
+        world_size = dist.get_world_size()
+        if requested != world_size or vgm.vae_ranks != list(range(world_size)):
+            raise NotImplementedError(
+                "LTX-2.3 Retake initially requires parallel_vae_size == world_size; "
+                f"got parallel_vae_size={requested}, world_size={world_size}, "
+                f"vae_ranks={vgm.vae_ranks}."
+            )
+        logger.info(
+            "LTX-2.3 Retake tile-parallel VAE enabled on all ranks: parallel_vae_size=%d",
+            requested,
+        )
+
+    def _encode_video_latents(
+        self, video: torch.Tensor, tiling_config: TilingConfig
+    ) -> torch.Tensor:
+        if self.video_encoder is None:
+            raise RuntimeError("LTX-2.3 Retake requires video VAE encoder weights.")
+        if not self._parallel_vae_enabled:
+            return self.video_encoder.tiled_encode(video, tiling_config)
+        vgm = self.pipeline_config.visual_gen_mapping
+        return tile_parallel_encode(self.video_encoder, video, tiling_config, pg=vgm.vae_group)
+
+    def _decode_video_latents(
+        self,
+        latents: torch.Tensor,
+        tiling_config: TilingConfig,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        if not self._parallel_vae_enabled:
+            chunks = list(
+                self.video_decoder.tiled_decode(latents, tiling_config, generator=generator)
+            )
+            return torch.cat(chunks, dim=2)
+        vgm = self.pipeline_config.visual_gen_mapping
+        return tile_parallel_decode(
+            self.video_decoder,
+            latents,
+            tiling_config,
+            pg=vgm.vae_group,
+            generator=generator,
+        )
 
     def _wrap_retake_cuda_graph(self, name: str, transformer: LTX23Model) -> None:
         graph_transformers = getattr(self, "_retake_graph_transformers", set())
@@ -862,7 +927,15 @@ class LTX23RetakePipeline(LTX23Pipeline):
             DiffusionPipelineConfig.load_diffusion_quant_config(quant_settings)
         )
         base_model_config = self.pipeline_config.model_configs["transformer"]
-        model_config = copy.deepcopy(base_model_config)
+        # VisualGenMapping owns live distributed process groups, including the
+        # optional parallel-VAE group, and therefore must remain a shared
+        # runtime object rather than being deep-copied with the model config.
+        model_config = copy.deepcopy(
+            base_model_config,
+            memo={
+                id(base_model_config.visual_gen_mapping): base_model_config.visual_gen_mapping,
+            },
+        )
         model_config.quant_config = quant_config
         model_config.dynamic_weight_quant = dynamic_weight_quant
         model_config.force_dynamic_quantization = quant == "FP8"
@@ -1137,9 +1210,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         # blend/math path widens internally.
         if self.video_encoder is None:
             raise RuntimeError("LTX-2.3 retake requires native video VAE encoder weights.")
-        source_window_latents = self.video_encoder.tiled_encode(
-            source_norm_5d, _RETAKE_TILING_CONFIG
-        )
+        source_window_latents = self._encode_video_latents(source_norm_5d, _RETAKE_TILING_CONFIG)
         expected_latent_shape = tuple(video_shape.to_torch_shape())
         if tuple(source_window_latents.shape) != expected_latent_shape:
             raise ValueError(
@@ -1298,12 +1369,11 @@ class LTX23RetakePipeline(LTX23Pipeline):
         timer.mark_post_start()
         video_latents_5d = self.video_patchifier.unpatchify(denoised_latents, video_shape).to(dtype)
         # Encode and decode must share the retake tiling geometry.
-        chunks = list(
-            self.video_decoder.tiled_decode(
-                video_latents_5d, _RETAKE_TILING_CONFIG, generator=generator
-            )
+        decoded = self._decode_video_latents(
+            video_latents_5d,
+            _RETAKE_TILING_CONFIG,
+            generator,
         )
-        decoded = torch.cat(chunks, dim=2)  # (B, C, T, H, W)
         decoded = postprocess_video_tensor(decoded)  # (B, T, H, W, C) uint8
         output_video = decoded.contiguous()
         timer.mark_end()
@@ -1528,10 +1598,10 @@ class LTX23RetakePipeline(LTX23Pipeline):
             half_pixel_shape, latent_channels=self.transformer_in_channels
         )
 
-        source_half_latents = self.video_encoder.tiled_encode(
+        source_half_latents = self._encode_video_latents(
             source_half_5d, _TWO_STAGE_RETAKE_TILING_CONFIG
         )
-        source_full_latents = self.video_encoder.tiled_encode(
+        source_full_latents = self._encode_video_latents(
             source_norm_5d, _TWO_STAGE_RETAKE_TILING_CONFIG
         )
         for label, actual, expected in (
@@ -1633,12 +1703,11 @@ class LTX23RetakePipeline(LTX23Pipeline):
 
         timer.mark_post_start()
         final_latents = self.video_patchifier.unpatchify(stage_2_tokens, full_shape).to(dtype)
-        chunks = list(
-            self.video_decoder.tiled_decode(
-                final_latents, _TWO_STAGE_RETAKE_TILING_CONFIG, generator=generator
-            )
+        decoded = self._decode_video_latents(
+            final_latents,
+            _TWO_STAGE_RETAKE_TILING_CONFIG,
+            generator,
         )
-        decoded = torch.cat(chunks, dim=2)
         output_video = postprocess_video_tensor(decoded).contiguous()
         timer.mark_end()
         return output_video, source_audio, pixel_shape
